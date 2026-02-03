@@ -2,7 +2,7 @@
 
 pkgname=opencode
 pkgver=1.1.49
-pkgrel=3
+pkgrel=4
 pkgdesc='The open source coding agent'
 arch=('x86_64')
 url='https://github.com/anomalyco/opencode'
@@ -52,4 +52,9 @@ package() {
   cd $pkgname
   install -vDm755 -t "$pkgdir/usr/bin" packages/opencode/dist/opencode-linux-*/bin/opencode
   install -vDm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE
+
+  SHELL=/bin/bash "$pkgdir/usr/bin/opencode" completion \
+    | install -vDm644 /dev/stdin "$pkgdir/usr/share/bash-completion/completions/opencode"
+  SHELL=/bin/zsh "$pkgdir/usr/bin/opencode" completion \
+    | install -vDm644 /dev/stdin "$pkgdir/usr/share/zsh/site-functions/_opencode"
 }

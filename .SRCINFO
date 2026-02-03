@@ -1,7 +1,7 @@
 pkgbase = opencode
 	pkgdesc = The open source coding agent
 	pkgver = 1.1.49
-	pkgrel = 3
+	pkgrel = 4
 	url = https://github.com/anomalyco/opencode
 	arch = x86_64
 	license = MIT
