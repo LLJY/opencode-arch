@@ -2,7 +2,7 @@
 
 pkgname=opencode
 pkgver=1.1.49
-pkgrel=2
+pkgrel=3
 pkgdesc='The open source coding agent'
 arch=('x86_64')
 url='https://github.com/anomalyco/opencode'
@@ -23,7 +23,10 @@ optdepends=(
   'wl-clipboard: clipboard support on Wayland'
   'xclip: clipboard support on X11'
 )
-options=('!strip')
+options=(
+  '!debug'
+  '!strip'
+)
 source=("git+$url.git#tag=v$pkgver")
 b2sums=('ab2c3fc3a1182f0470551510756d4a39ca853db404033393f86cb467f8f270e8300fdd416e60564c507215484b4275e4f6a03cff60f562eb4423cd2d05e993f3')
 
