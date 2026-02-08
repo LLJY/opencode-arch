@@ -50,8 +50,12 @@ check() {
 
 package() {
   cd $pkgname
-  install -vDm755 -t "$pkgdir/usr/bin" \
-    packages/opencode/dist/opencode-linux-*-baseline/bin/opencode
+  case $CARCH in
+  aarch64) dir=opencode-linux-arm64 ;;
+  x86_64) dir=opencode-linux-x64-baseline ;;
+  esac
+  install -vDm755 -t "$pkgdir/usr/bin" "packages/opencode/dist/$dir/bin/opencode"
+
   install -vDm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE
 
   SHELL=/bin/bash "$pkgdir/usr/bin/opencode" completion \
