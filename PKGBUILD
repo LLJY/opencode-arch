@@ -2,7 +2,7 @@
 
 pkgname=opencode
 pkgver=1.1.53
-pkgrel=2
+pkgrel=3
 pkgdesc='The open source coding agent'
 arch=('x86_64')
 url='https://github.com/anomalyco/opencode'
