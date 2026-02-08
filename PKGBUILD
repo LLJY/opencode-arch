@@ -2,7 +2,7 @@
 
 pkgname=opencode
 pkgver=1.1.53
-pkgrel=1
+pkgrel=2
 pkgdesc='The open source coding agent'
 arch=('x86_64')
 url='https://github.com/anomalyco/opencode'
@@ -37,7 +37,7 @@ prepare() {
 
 build() {
   cd $pkgname/packages/opencode
-  OPENCODE_VERSION=$pkgver bun run ./script/build.ts --single
+  OPENCODE_VERSION=$pkgver bun run ./script/build.ts --single --baseline
 }
 
 check() {
@@ -50,7 +50,8 @@ check() {
 
 package() {
   cd $pkgname
-  install -vDm755 -t "$pkgdir/usr/bin" packages/opencode/dist/opencode-linux-*/bin/opencode
+  install -vDm755 -t "$pkgdir/usr/bin" \
+    packages/opencode/dist/opencode-linux-*-baseline/bin/opencode
   install -vDm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE
 
   SHELL=/bin/bash "$pkgdir/usr/bin/opencode" completion \
