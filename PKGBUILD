@@ -2,7 +2,7 @@
 # Maintainer: Sven-Hendrik Haase <svenstaro@archlinux.org>
 
 pkgname=opencode
-pkgver=1.3.0
+pkgver=1.3.3
 pkgrel=1
 pkgdesc='The open source coding agent'
 arch=('x86_64')
@@ -14,6 +14,9 @@ depends=(
   'icu'
   'ripgrep'
   'tar'
+)
+checkdepends=(
+  'nodejs-lts-jod'
 )
 makedepends=(
   'bun'
@@ -28,7 +31,7 @@ options=(
   '!strip'
 )
 source=("git+$url.git#tag=v$pkgver")
-b2sums=('2e30c4a7fbf4159843527dc5ad8b060c40c47bd5815829bf1dc1899d5b4ebffd3feb5d1b25796f400ade428fe78ef84da54bd8395cbcfb619e7df32f806ffc16')
+b2sums=('2219334ce1f1b1839e78058e4481a1a6ae782620d7947ce850e8fe6cebc4d979a00b87f58d190d257200e64deb67a74e6bf92124ab5e8d0391c1e94d7581fefb')
 
 prepare() {
   cd $pkgname
