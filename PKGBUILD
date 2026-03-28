@@ -3,7 +3,7 @@
 
 pkgname=opencode
 pkgver=1.3.3
-pkgrel=1
+pkgrel=2
 pkgdesc='The open source coding agent'
 arch=('x86_64')
 url='https://github.com/anomalyco/opencode'
@@ -30,12 +30,17 @@ options=(
   '!debug'
   '!strip'
 )
-source=("git+$url.git#tag=v$pkgver")
-b2sums=('2219334ce1f1b1839e78058e4481a1a6ae782620d7947ce850e8fe6cebc4d979a00b87f58d190d257200e64deb67a74e6bf92124ab5e8d0391c1e94d7581fefb')
+source=("git+$url.git#tag=v$pkgver"
+        $pkgname-fix-prompt.patch::https://patch-diff.githubusercontent.com/raw/anomalyco/opencode/pull/18584.patch)
+b2sums=('2219334ce1f1b1839e78058e4481a1a6ae782620d7947ce850e8fe6cebc4d979a00b87f58d190d257200e64deb67a74e6bf92124ab5e8d0391c1e94d7581fefb'
+        '83894805a7683c2bdd880167d85dc21b9a1bc881cc2a91079a2c8a93290ffdaf07b3640440f0fdfce90eb17ce00336e9e59c1da737d024361e3712ae7a467a07')
 
 prepare() {
   cd $pkgname
   bun install --frozen-lockfile
+
+  # Fix broken --prompt
+  patch -Np1 -i "$srcdir"/$pkgname-fix-prompt.patch
 }
 
 build() {
