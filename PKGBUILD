@@ -2,8 +2,8 @@
 # Maintainer: Sven-Hendrik Haase <svenstaro@archlinux.org>
 
 pkgname=opencode
-pkgver=1.3.5
-pkgrel=2
+pkgver=1.3.6
+pkgrel=1
 pkgdesc='The open source coding agent'
 arch=('x86_64')
 url='https://github.com/anomalyco/opencode'
@@ -31,7 +31,7 @@ options=(
   '!strip'
 )
 source=("git+$url.git#tag=v$pkgver")
-b2sums=('2134e1d053c0ed10573348ccc5c1ebe0495bdff2de5c38bf6d00aa82a59b963c5a8fcbff0dda8f53c78f652a214ba100ccaad3d4646eba8d9b40b7b73b071fd6')
+b2sums=('683cd65f4b970860785b2590f770cb8253d5852ad45247eaa85c92eebb8a1c601e6c716326730152ca7368aefb68d0c3a626e61be7380d2edfd2d6739c16a89b')
 
 prepare() {
   cd $pkgname
