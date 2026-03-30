@@ -2,7 +2,7 @@
 # Maintainer: Sven-Hendrik Haase <svenstaro@archlinux.org>
 
 pkgname=opencode
-pkgver=1.3.6
+pkgver=1.3.7
 pkgrel=1
 pkgdesc='The open source coding agent'
 arch=('x86_64')
@@ -31,11 +31,11 @@ options=(
   '!strip'
 )
 source=("git+$url.git#tag=v$pkgver")
-b2sums=('683cd65f4b970860785b2590f770cb8253d5852ad45247eaa85c92eebb8a1c601e6c716326730152ca7368aefb68d0c3a626e61be7380d2edfd2d6739c16a89b')
+b2sums=('b5b16fe47b200fc6d379d58773270bf27c48868d5ad9c7e09bc745e9af0a2185bd6af2fb23eb559d21739a05b2d0efe5cc2b9fa0dde90c9f1183d43e793f6ded')
 
 prepare() {
   cd $pkgname
-  bun install --frozen-lockfile
+  bun install --frozen-lockfile --ignore-scripts
 
   # Remove flaky expect, prone to filesystem options?
   # https://github.com/anomalyco/opencode/blob/a5b1dc081d589598168c0e0d9346a35aeb58548b/packages/opencode/test/plugin/meta.test.ts#L60
@@ -44,7 +44,7 @@ prepare() {
 
 build() {
   cd $pkgname/packages/opencode
-  OPENCODE_VERSION=$pkgver bun run ./script/build.ts --single --baseline
+  OPENCODE_VERSION=$pkgver bun run ./script/build.ts --single --baseline --skip-install
 }
 
 check() {
