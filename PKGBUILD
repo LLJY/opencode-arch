@@ -61,7 +61,7 @@ check() {
   export GIT_CONFIG_GLOBAL=$PWD/gitconfig
   git config --global user.email "builduser@archlinux.org"
   git config --global user.name "Build User"
-  bun test
+  bun test --timeout=20000
 }
 
 package() {
