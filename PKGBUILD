@@ -46,9 +46,6 @@ prepare() {
 
   # Skip failing session.processor effect test, probably a timing issue
   sed -i '/^it\.live("session\.processor effect tests/,/^)$/d' packages/opencode/test/session/processor-effect.test.ts
-
-  # Somehow all the agent tests fail with timeouts so let's skip them all for now
-  sed -i 's/^test("/test.skip("/' packages/opencode/test/agent/agent.test.ts
 }
 
 build() {
