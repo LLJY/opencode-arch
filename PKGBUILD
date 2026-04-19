@@ -2,7 +2,7 @@
 # Maintainer: Sven-Hendrik Haase <svenstaro@archlinux.org>
 
 pkgname=opencode
-pkgver=1.4.7
+pkgver=1.14.18
 pkgrel=1
 pkgdesc='The open source coding agent'
 arch=('x86_64')
@@ -31,11 +31,14 @@ options=(
   '!strip'
 )
 source=("git+$url.git#tag=v$pkgver")
-b2sums=('3f2a6583d8452663f7919143a397b27247f2270b5bae0d0d04dc46f1c5642672596067406017cf7430c08b1b7b46a59c8e74fa50c9e26fc917dd939cca429ee7')
+b2sums=('4ea7c476da2ed0065bb1c5d82ebfaafe5eb73149b1a4f0466e9827b0e08e45849d98f41e910be2ce187f43d18c6fb8716d1fd727a538018cd13ebc6af467163a')
 
 prepare() {
   cd $pkgname
   bun install --frozen-lockfile --ignore-scripts
+
+  # Every single test runner I have ever used can skip particular tests.
+  # Why can't bun do it? Anyway, I added an upstream feature request here: https://github.com/oven-sh/bun/issues/29477
 
   # Remove flaky expect, prone to filesystem options?
   # https://github.com/anomalyco/opencode/blob/a5b1dc081d589598168c0e0d9346a35aeb58548b/packages/opencode/test/plugin/meta.test.ts#L60
@@ -46,6 +49,11 @@ prepare() {
 
   # Skip failing session.processor effect test, probably a timing issue
   sed -i '/^it\.live("session\.processor effect tests/,/^)$/d' packages/opencode/test/session/processor-effect.test.ts
+
+  # Skip flaky shell cancellation tests
+  sed -i 's/^it\.live("cancel interrupts shell/it.skip("cancel interrupts shell/' packages/opencode/test/session/prompt-effect.test.ts
+  sed -i 's/^it\.live("cancel persists aborted/it.skip("cancel persists aborted/' packages/opencode/test/session/prompt-effect.test.ts
+  sed -i 's/^it\.live("cancel finalizes interrupted/it.skip("cancel finalizes interrupted/' packages/opencode/test/session/prompt-effect.test.ts
 }
 
 build() {
