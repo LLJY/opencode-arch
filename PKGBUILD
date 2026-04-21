@@ -2,7 +2,7 @@
 # Maintainer: Sven-Hendrik Haase <svenstaro@archlinux.org>
 
 pkgname=opencode
-pkgver=1.14.19
+pkgver=1.14.20
 pkgrel=1
 pkgdesc='The open source coding agent'
 arch=('x86_64')
@@ -31,7 +31,7 @@ options=(
   '!strip'
 )
 source=("git+$url.git#tag=v$pkgver")
-b2sums=('0db1e7fd8fdc35567b55eb2120ecc55066eb0f9d3283fa0e6dc32ddae13b8ed79516cc4140540d493a2d96759ed6c792ee83040d7d1e5c14995bb5cc52872e12')
+b2sums=('a46f6a173962f295e571770be3d5c9c94d243c0c73147b5880d43ca79b912449bec493b489236c6f947e2349e161f47ac4783c10728a470ba8efe8da9faa36da')
 
 prepare() {
   cd $pkgname
@@ -49,11 +49,6 @@ prepare() {
 
   # Skip failing session.processor effect test, probably a timing issue
   sed -i '/^it\.live("session\.processor effect tests/,/^)$/d' packages/opencode/test/session/processor-effect.test.ts
-
-  # Skip flaky shell cancellation tests
-  sed -i 's/^it\.live("cancel interrupts shell/it.skip("cancel interrupts shell/' packages/opencode/test/session/prompt-effect.test.ts
-  sed -i 's/^it\.live("cancel persists aborted/it.skip("cancel persists aborted/' packages/opencode/test/session/prompt-effect.test.ts
-  sed -i 's/^it\.live("cancel finalizes interrupted/it.skip("cancel finalizes interrupted/' packages/opencode/test/session/prompt-effect.test.ts
 }
 
 build() {
