@@ -1,0 +1,252 @@
+#!/bin/sh
+
+set -eu
+
+service=opencode-daemon.service
+config_dir="$HOME/.config/opencode-daemon"
+env_file="$config_dir/env"
+
+usage() {
+  cat <<EOF
+Usage: ${0##*/} <command> [args]
+
+Commands:
+  init [--force]  Create config, enable, and start the user service
+  start           Start the user service
+  stop            Stop the user service
+  restart         Restart the user service
+  status          Show user service status
+  logs [args]     Show daemon logs with journalctl --user
+  attach [args]   Run opencode attach against the daemon
+  run [args]      Run opencode run --attach against the daemon
+  url             Print the daemon URL
+
+To keep the daemon running after logout, enable lingering:
+  loginctl enable-linger "$USER"
+EOF
+}
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 64
+}
+
+require_no_args() {
+  if [ "$#" -ne 0 ]; then
+    usage >&2
+    exit 64
+  fi
+}
+
+load_env() {
+  if [ ! -f "$env_file" ]; then
+    die "Missing $env_file. Run 'opencode-daemon init' first."
+  fi
+
+  set -a
+  # shellcheck disable=SC1090
+  if ! . "$env_file"; then
+    set +a
+    die "Invalid shell syntax in $env_file."
+  fi
+  set +a
+
+  : "${OPENCODE_DAEMON_HOST:=127.0.0.1}"
+  : "${OPENCODE_DAEMON_PORT:=4096}"
+  : "${OPENCODE_EXPERIMENTAL_WEBSOCKETS:=true}"
+  : "${OPENCODE_SERVER_USERNAME:=opencode}"
+
+  if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ]; then
+    die "Missing OPENCODE_SERVER_PASSWORD in $env_file."
+  fi
+
+  export OPENCODE_DAEMON_HOST
+  export OPENCODE_DAEMON_PORT
+  export OPENCODE_EXPERIMENTAL_WEBSOCKETS
+  export OPENCODE_SERVER_PASSWORD
+  export OPENCODE_SERVER_USERNAME
+}
+
+daemon_reload() {
+  /usr/bin/systemctl --user daemon-reload >/dev/null
+}
+
+daemon_url() {
+  case "$OPENCODE_DAEMON_HOST" in
+  0.0.0.0) printf 'http://127.0.0.1:%s\n' "$OPENCODE_DAEMON_PORT" ;;
+  ::) printf 'http://[::1]:%s\n' "$OPENCODE_DAEMON_PORT" ;;
+  \[*\]) printf 'http://%s:%s\n' "$OPENCODE_DAEMON_HOST" "$OPENCODE_DAEMON_PORT" ;;
+  *:*) printf 'http://[%s]:%s\n' "$OPENCODE_DAEMON_HOST" "$OPENCODE_DAEMON_PORT" ;;
+  *) printf 'http://%s:%s\n' "$OPENCODE_DAEMON_HOST" "$OPENCODE_DAEMON_PORT" ;;
+  esac
+}
+
+generate_password() {
+  LC_ALL=C /usr/bin/tr -dc 'A-Za-z0-9' </dev/urandom | /usr/bin/head -c 32
+}
+
+write_env() {
+  password=$1
+
+  (
+    umask 077
+    /usr/bin/mkdir -p "$config_dir"
+    tmp=$(/usr/bin/mktemp "$config_dir/.env.XXXXXX")
+    cat >"$tmp" <<EOF
+# Local opencode daemon settings.
+OPENCODE_DAEMON_HOST=127.0.0.1
+OPENCODE_DAEMON_PORT=4096
+OPENCODE_EXPERIMENTAL_WEBSOCKETS=true
+OPENCODE_SERVER_USERNAME=opencode
+OPENCODE_SERVER_PASSWORD=$password
+EOF
+    if [ -f "$env_file" ]; then
+      /usr/bin/grep -vE '^(OPENCODE_DAEMON_HOST|OPENCODE_DAEMON_PORT|OPENCODE_EXPERIMENTAL_WEBSOCKETS|OPENCODE_SERVER_USERNAME|OPENCODE_SERVER_PASSWORD)=' "$env_file" >>"$tmp" || true
+    fi
+    /usr/bin/mv -f "$tmp" "$env_file"
+  )
+}
+
+has_dir_arg() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+    --) return 1 ;;
+    --dir|--dir=*) return 0 ;;
+    esac
+    shift
+  done
+
+  return 1
+}
+
+cmd_init() {
+  force=0
+  was_active=0
+  if /usr/bin/systemctl --user is-active --quiet "$service"; then
+    was_active=1
+  fi
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+    --force) force=1 ;;
+    *)
+      usage >&2
+      exit 64
+      ;;
+    esac
+    shift
+  done
+
+  if [ -e "$env_file" ] && [ "$force" -ne 1 ]; then
+    die "Config already exists at $env_file. Re-run with --force to replace it."
+  fi
+
+  write_env "$(generate_password)"
+  daemon_reload
+  /usr/bin/systemctl --user enable "$service" >/dev/null
+  if [ "$was_active" -eq 1 ]; then
+    /usr/bin/systemctl --user restart "$service"
+  else
+    /usr/bin/systemctl --user start "$service"
+  fi
+  load_env
+
+  printf 'Initialized %s\n' "$env_file"
+  printf 'Daemon URL: '
+  daemon_url
+  printf "Attach with: ocd\n"
+  printf "Run with:    ocd run -- 'your prompt here'\n"
+  printf 'Optional: enable lingering with loginctl enable-linger "%s"\n' "$USER"
+}
+
+cmd_start() {
+  require_no_args "$@"
+  load_env
+  daemon_reload
+  exec /usr/bin/systemctl --user start "$service"
+}
+
+cmd_stop() {
+  require_no_args "$@"
+  exec /usr/bin/systemctl --user stop "$service"
+}
+
+cmd_restart() {
+  require_no_args "$@"
+  load_env
+  daemon_reload
+  exec /usr/bin/systemctl --user restart "$service"
+}
+
+cmd_status() {
+  require_no_args "$@"
+  exec /usr/bin/systemctl --user status "$service"
+}
+
+cmd_logs() {
+  exec /usr/bin/journalctl --user -u "$service" "$@"
+}
+
+cmd_attach() {
+  load_env
+  if has_dir_arg "$@"; then
+    exec /usr/bin/opencode attach "$(daemon_url)" "$@"
+  fi
+
+  exec /usr/bin/opencode attach "$(daemon_url)" --dir "$PWD" "$@"
+}
+
+cmd_run() {
+  load_env
+  if has_dir_arg "$@"; then
+    exec /usr/bin/opencode run --attach "$(daemon_url)" "$@"
+  fi
+
+  exec /usr/bin/opencode run --attach "$(daemon_url)" --dir "$PWD" "$@"
+}
+
+cmd_url() {
+  require_no_args "$@"
+  load_env
+  daemon_url
+}
+
+cmd_exec_serve() {
+  require_no_args "$@"
+  load_env
+  exec /usr/bin/opencode serve --hostname "$OPENCODE_DAEMON_HOST" --port "$OPENCODE_DAEMON_PORT"
+}
+
+if [ "${0##*/}" = "ocd" ]; then
+  case "${1:-}" in
+  '') set -- attach ;;
+  --*) set -- attach "$@" ;;
+  init|start|stop|restart|status|logs|attach|run|url|exec-serve|help|-h|--help) ;;
+  *) exec /usr/bin/opencode "$@" ;;
+  esac
+fi
+
+command=${1:-help}
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+
+case "$command" in
+init) cmd_init "$@" ;;
+start) cmd_start "$@" ;;
+stop) cmd_stop "$@" ;;
+restart) cmd_restart "$@" ;;
+status) cmd_status "$@" ;;
+logs) cmd_logs "$@" ;;
+attach) cmd_attach "$@" ;;
+run) cmd_run "$@" ;;
+url) cmd_url "$@" ;;
+exec-serve) cmd_exec_serve "$@" ;;
+help|-h|--help)
+  usage
+  ;;
+*)
+  usage >&2
+  exit 64
+  ;;
+esac

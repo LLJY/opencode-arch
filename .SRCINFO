@@ -1,6 +1,6 @@
 pkgbase = opencode
 	pkgdesc = The open source coding agent
-	pkgver = 1.15.10
+	pkgver = 1.15.13
 	pkgrel = 1
 	url = https://github.com/anomalyco/opencode
 	arch = x86_64
@@ -8,6 +8,20 @@ pkgbase = opencode
 	checkdepends = nodejs-lts-jod
 	makedepends = bun
 	makedepends = git
+	options = !debug
+	options = !strip
+	source = git+https://github.com/anomalyco/opencode.git#tag=v1.15.13
+	source = downstream-1.15.13.patch
+	source = opencode-daemon
+	source = opencode-daemon.service
+	source = LICENSE
+	b2sums = fddf7bb60f5d3f5a0c1790798e73349934d2b12646542aa66095368293ddeff627b10a724bb06180070014929f37c53ffd2721698eea7ab689c32adb8b6f2256
+	b2sums = d33dfb2795423a39d9da4f62f362ce0245f9e536773033890660e2d9ba935d2606a569dff17846122376ac99e57bf41030a59ec158a1ede6bfbea4fc29bc501c
+	b2sums = a2e4e1d739dafced870982347c00c017c6040dd281893df6fd181090348d7dd771cbaa99065f2d27a4ec93be9aca24ca9510f6b63e704407e3d142ca3cf5f2c9
+	b2sums = e6a605c6838925a84f6cedbabf7dd02923e83e12c492db08bf58141ae08d46d1d046af5765f099d1d804aea38a84f5d563ae34abeea5d5fb3142d2894ddfe480
+	b2sums = a29664104e1ee73ca0aee1d633e9095d92a57c92787f8d8740bdb7211ba3205782ed8677f539bdb8cae3dd75a3694be3132e185fa3fc4b3f401e1f88eb776101
+
+pkgname = opencode
 	depends = curl
 	depends = glibc
 	depends = icu
@@ -15,9 +29,9 @@ pkgbase = opencode
 	depends = tar
 	optdepends = wl-clipboard: clipboard support on Wayland
 	optdepends = xclip: clipboard support on X11
-	options = !debug
-	options = !strip
-	source = git+https://github.com/anomalyco/opencode.git#tag=v1.15.10
-	b2sums = b258d532a29133ad50f3bcf60541be9facc22173568cafa2dae7698c3d32998b4d8e57eef8096c5bac2912a15aeafc3dc488ff149cb06c28122d2cfee6f86cef
 
-pkgname = opencode
+pkgname = opencode-daemon
+	pkgdesc = Systemd user service wrapper for opencode
+	license = 0BSD
+	depends = opencode=1.15.13-1
+	depends = systemd

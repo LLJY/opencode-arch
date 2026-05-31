@@ -1,0 +1,538 @@
+diff --git a/packages/opencode/src/plugin/index.ts b/packages/opencode/src/plugin/index.ts
+index 717dff8db..131312fac 100644
+--- a/packages/opencode/src/plugin/index.ts
++++ b/packages/opencode/src/plugin/index.ts
+@@ -29,7 +29,6 @@ import { parsePluginSpecifier, readPluginId, readV1Plugin, resolvePluginId } fro
+ import { registerAdapter } from "@/control-plane/adapters"
+ import type { WorkspaceAdapter } from "@/control-plane/types"
+ import { RuntimeFlags } from "@/effect/runtime-flags"
+-import { InstallationChannel } from "@opencode-ai/core/installation/version"
+ 
+ const log = Log.create({ service: "plugin" })
+ 
+@@ -58,14 +57,14 @@ export interface Interface {
+ 
+ export class Service extends Context.Service<Service, Interface>()("@opencode/Plugin") {}
+ 
+-export function experimentalWebSocketsEnabled(input: { enabled: boolean; channel?: string }) {
+-  return input.enabled || ["local", "dev", "beta"].includes(input.channel ?? InstallationChannel)
++export function experimentalWebSocketsEnabled(_input: { enabled: boolean; channel?: string }) {
++  // Downstream override: force websocket transport on all channels for local validation.
++  return true
+ }
+ 
+ // Built-in plugins that are directly imported (not installed from npm)
+ function internalPlugins(flags: RuntimeFlags.Info): PluginInstance[] {
+   return [
+-    // Temporary rollout: pre-release builds use WebSockets by default; releases require explicit opt-in.
+     (input) =>
+       CodexAuthPlugin(input, {
+         experimentalWebSockets: experimentalWebSocketsEnabled({ enabled: flags.experimentalWebSockets }),
+diff --git a/packages/opencode/src/provider/provider.ts b/packages/opencode/src/provider/provider.ts
+index 49c582e0a..c77f72cd6 100644
+--- a/packages/opencode/src/provider/provider.ts
++++ b/packages/opencode/src/provider/provider.ts
+@@ -102,6 +102,30 @@ function googleVertexAnthropicBaseURL(project: string | undefined, location: str
+   return `https://aiplatform.${location}.rep.googleapis.com/v1/projects/${project}/locations/${location}/publishers/anthropic/models`
+ }
+ 
++function isNvidiaNim(model: Model, baseURL: unknown) {
++  if (model.api.npm !== "@ai-sdk/openai-compatible") return false
++  if (model.providerID === "nvidia") return true
++  return typeof baseURL === "string" && baseURL.includes("nvidia.com")
++}
++
++function normalizeNvidiaModelID(id: string) {
++  return id.replace(/^(nvidia\/){2,}/, "nvidia/")
++}
++
++function normalizeNvidiaRequestBody(body: string) {
++  const parsed = iife(() => {
++    try {
++      return JSON.parse(body)
++    } catch {
++      return undefined
++    }
++  })
++  if (!isRecord(parsed) || typeof parsed.model !== "string") return body
++  const model = normalizeNvidiaModelID(parsed.model)
++  if (model === parsed.model) return body
++  return JSON.stringify({ ...parsed, model })
++}
++
+ type BundledSDK = {
+   languageModel(modelId: string): LanguageModelV3
+ }
+@@ -1417,15 +1441,29 @@ export const layer = Layer.effect(
+           if (!plugin.auth) continue
+           const providerID = ProviderID.make(plugin.auth.provider)
+           if (disabled.has(providerID)) continue
++          if (!plugin.auth.loader) continue
+ 
++          const data = database[plugin.auth.provider]
++          if (!data) continue
+           const stored = yield* auth.get(providerID).pipe(Effect.orDie)
+-          if (!stored) continue
+-          if (!plugin.auth.loader) continue
++          const configuredKey = iife(() => {
++            const key = providers[providerID]?.key ?? data.options.apiKey
++            return typeof key === "string" && key !== "" ? key : undefined
++          })
++          const syntheticAuth = !stored && configuredKey ? { type: "api" as const, key: configuredKey } : undefined
++          const pluginAuth = stored ?? syntheticAuth
++          if (!pluginAuth) continue
+ 
+           const options = yield* Effect.promise(() =>
+             plugin.auth!.loader!(
+-              () => bridge.promise(auth.get(providerID).pipe(Effect.orDie)) as any,
+-              toPublicInfo(database[plugin.auth!.provider]),
++              () =>
++                bridge.promise(
++                  auth.get(providerID).pipe(
++                    Effect.orDie,
++                    Effect.map((current) => current ?? syntheticAuth),
++                  ),
++                ) as any,
++              toPublicInfo(data),
+             ),
+           )
+           const opts = options ?? {}
+@@ -1650,6 +1688,10 @@ export const layer = Layer.effect(
+             }
+           }
+ 
++          if (isNvidiaNim(model, options["baseURL"]) && typeof opts.body === "string" && opts.method === "POST") {
++            opts.body = normalizeNvidiaRequestBody(opts.body)
++          }
++
+           const res = await fetchFn(input, {
+             ...opts,
+             // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
+diff --git a/packages/opencode/src/provider/transform.ts b/packages/opencode/src/provider/transform.ts
+index ea55bb2ce..4adfb9c11 100644
+--- a/packages/opencode/src/provider/transform.ts
++++ b/packages/opencode/src/provider/transform.ts
+@@ -1139,6 +1139,21 @@ export function options(input: {
+     result["enable_thinking"] = true
+   }
+ 
++  if (input.model.providerID === "nvidia" && input.model.api.npm === "@ai-sdk/openai-compatible") {
++    if (modelId.includes("deepseek-v4")) {
++      result["chat_template_kwargs"] = {
++        enable_thinking: true,
++        thinking: true,
++      }
++    }
++    if (modelId.includes("glm-5")) {
++      result["chat_template_kwargs"] = {
++        enable_thinking: true,
++        clear_thinking: false,
++      }
++    }
++  }
++
+   if (input.model.api.npm === "@ai-sdk/azure" && input.model.api.id.includes("gpt-5.5")) {
+     result["reasoningSummary"] = "auto"
+     return result
+diff --git a/packages/opencode/src/session/processor.ts b/packages/opencode/src/session/processor.ts
+index a287c3b00..bcb66493a 100644
+--- a/packages/opencode/src/session/processor.ts
++++ b/packages/opencode/src/session/processor.ts
+@@ -31,6 +31,35 @@ import { Usage, type LLMEvent } from "@opencode-ai/llm"
+ 
+ const DOOM_LOOP_THRESHOLD = 3
+ const log = Log.create({ service: "session.processor" })
++const textChunks = new WeakMap<{ text: string }, string[]>()
++
++function installChunkedText(part: { text: string }) {
++  textChunks.set(part, [part.text])
++  Object.defineProperty(part, "text", {
++    get() {
++      const chunks = textChunks.get(part)
++      if (!chunks) return ""
++      if (chunks.length === 1) return chunks[0]
++      const text = chunks.join("")
++      textChunks.set(part, [text])
++      return text
++    },
++    set(value: string) {
++      textChunks.set(part, [value])
++    },
++    enumerable: true,
++    configurable: true,
++  })
++}
++
++function appendChunkedText(part: { text: string }, text: string) {
++  const chunks = textChunks.get(part)
++  if (!chunks) {
++    part.text += text
++    return
++  }
++  chunks.push(text)
++}
+ 
+ export type Result = "compact" | "stop" | "continue"
+ 
+@@ -323,13 +352,14 @@ export const layer = Layer.effect(
+               time: { start: Date.now() },
+               metadata: value.providerMetadata,
+             }
++            installChunkedText(ctx.reasoningMap[value.id])
+             yield* session.updatePart(ctx.reasoningMap[value.id])
+             return
+ 
+           case "reasoning-delta":
+             // Match dev: silently drop orphan deltas (no preceding reasoning-start).
+             if (!(value.id in ctx.reasoningMap)) return
+-            ctx.reasoningMap[value.id].text += value.text
++            appendChunkedText(ctx.reasoningMap[value.id], value.text)
+             if (value.providerMetadata) ctx.reasoningMap[value.id].metadata = value.providerMetadata
+             yield* session.updatePartDelta({
+               sessionID: ctx.reasoningMap[value.id].sessionID,
+@@ -635,12 +665,13 @@ export const layer = Layer.effect(
+               time: { start: Date.now() },
+               metadata: value.providerMetadata,
+             }
++            installChunkedText(ctx.currentText)
+             yield* session.updatePart(ctx.currentText)
+             return
+ 
+           case "text-delta":
+             if (!ctx.currentText) return
+-            ctx.currentText.text += value.text
++            appendChunkedText(ctx.currentText, value.text)
+             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
+             yield* session.updatePartDelta({
+               sessionID: ctx.currentText.sessionID,
+diff --git a/packages/opencode/src/skill/index.ts b/packages/opencode/src/skill/index.ts
+index c1c6d0d6f..e06636fe0 100644
+--- a/packages/opencode/src/skill/index.ts
++++ b/packages/opencode/src/skill/index.ts
+@@ -1,5 +1,6 @@
+ import path from "path"
+ import { pathToFileURL } from "url"
++import { lstat } from "fs/promises"
+ import { Effect, Layer, Context, Schema } from "effect"
+ import { NamedError } from "@opencode-ai/core/util/error"
+ import type { Agent } from "@/agent/agent"
+@@ -144,7 +145,7 @@ const scan = Effect.fnUntraced(function* (
+   state: ScanState,
+   root: string,
+   pattern: string,
+-  opts?: { dot?: boolean; scope?: string },
++  opts?: { dot?: boolean; scope?: string; symlink?: boolean },
+ ) {
+   const matches = yield* Effect.tryPromise({
+     try: () =>
+@@ -152,7 +153,7 @@ const scan = Effect.fnUntraced(function* (
+         cwd: root,
+         absolute: true,
+         include: "file",
+-        symlink: true,
++        symlink: opts?.symlink ?? true,
+         dot: opts?.dot,
+       }),
+     catch: (error) => error,
+@@ -164,12 +165,28 @@ const scan = Effect.fnUntraced(function* (
+     }),
+   )
+ 
+-  for (const match of matches) {
++  const filtered = opts?.symlink === false ? yield* Effect.filter(matches, (match) => isNotInSymlink(root, match)) : matches
++
++  for (const match of filtered) {
+     state.matches.add(match)
+     state.dirs.add(path.dirname(match))
+   }
+ })
+ 
++const isNotInSymlink = Effect.fnUntraced(function* (root: string, match: string) {
++  const parts = path.relative(root, match).split(path.sep)
++  const symlink = yield* Effect.forEach(
++    [root, ...parts.map((_, index) => path.join(root, ...parts.slice(0, index + 1)))],
++    (candidate) =>
++      Effect.promise(() => lstat(candidate)).pipe(
++        Effect.map((stat) => stat.isSymbolicLink()),
++        Effect.catch(() => Effect.succeed(false)),
++      ),
++    { concurrency: "unbounded" },
++  )
++  return !symlink.some(Boolean)
++})
++
+ const discoverSkills = Effect.fnUntraced(function* (
+   config: Config.Interface,
+   discovery: Discovery.Interface,
+@@ -190,7 +207,7 @@ const discoverSkills = Effect.fnUntraced(function* (
+     for (const dir of externalDirs) {
+       const root = path.join(global.home, dir)
+       if (!(yield* fsys.isDir(root))) continue
+-      yield* scan(state, root, EXTERNAL_SKILL_PATTERN, { dot: true, scope: "global" })
++      yield* scan(state, root, EXTERNAL_SKILL_PATTERN, { dot: true, scope: "global", symlink: false })
+     }
+ 
+     const upDirs = yield* fsys
+@@ -198,7 +215,7 @@ const discoverSkills = Effect.fnUntraced(function* (
+       .pipe(Effect.catch(() => Effect.succeed([] as string[])))
+ 
+     for (const root of upDirs) {
+-      yield* scan(state, root, EXTERNAL_SKILL_PATTERN, { dot: true, scope: "project" })
++      yield* scan(state, root, EXTERNAL_SKILL_PATTERN, { dot: true, scope: "project", symlink: false })
+     }
+   }
+ 
+diff --git a/packages/opencode/test/plugin/openai-rollout.test.ts b/packages/opencode/test/plugin/openai-rollout.test.ts
+index 1278e1cfb..e6af5a412 100644
+--- a/packages/opencode/test/plugin/openai-rollout.test.ts
++++ b/packages/opencode/test/plugin/openai-rollout.test.ts
+@@ -2,15 +2,15 @@ import { describe, expect, test } from "bun:test"
+ import { experimentalWebSocketsEnabled } from "../../src/plugin"
+ 
+ describe("plugin.openai.websocket rollout", () => {
+-  test("enables websockets by default only on pre-release channels", () => {
++  test("enables websockets by default on every channel", () => {
+     expect(experimentalWebSocketsEnabled({ enabled: false, channel: "local" })).toBe(true)
+     expect(experimentalWebSocketsEnabled({ enabled: false, channel: "dev" })).toBe(true)
+     expect(experimentalWebSocketsEnabled({ enabled: false, channel: "beta" })).toBe(true)
+-    expect(experimentalWebSocketsEnabled({ enabled: false, channel: "latest" })).toBe(false)
+-    expect(experimentalWebSocketsEnabled({ enabled: false, channel: "prod" })).toBe(false)
++    expect(experimentalWebSocketsEnabled({ enabled: false, channel: "latest" })).toBe(true)
++    expect(experimentalWebSocketsEnabled({ enabled: false, channel: "prod" })).toBe(true)
+   })
+ 
+-  test("allows releases to opt in through the experimental flag", () => {
++  test("keeps the override enabled even when the flag is set", () => {
+     expect(experimentalWebSocketsEnabled({ enabled: true, channel: "latest" })).toBe(true)
+     expect(experimentalWebSocketsEnabled({ enabled: true, channel: "prod" })).toBe(true)
+   })
+diff --git a/packages/opencode/test/provider/provider.test.ts b/packages/opencode/test/provider/provider.test.ts
+index 1ea2c8242..82f9a2985 100644
+--- a/packages/opencode/test/provider/provider.test.ts
++++ b/packages/opencode/test/provider/provider.test.ts
+@@ -77,6 +77,7 @@ const languageBaseURL = (language: unknown) => (language as { config: { baseURL:
+ 
+ const it = testEffect(Layer.mergeAll(Provider.defaultLayer, Env.defaultLayer, Plugin.defaultLayer))
+ const experimentalModels = testEffect(providerLayer({ enableExperimentalModels: true }))
++const experimentalWebSockets = testEffect(providerLayer({ experimentalWebSockets: true }))
+ 
+ const alphaProviderConfig = {
+   provider: {
+@@ -121,6 +122,41 @@ it.instance(
+   { config: { provider: { anthropic: { options: { apiKey: "config-api-key" } } } } },
+ )
+ 
++experimentalWebSockets.instance(
++  "openai config apiKey installs websocket fetch without stored auth",
++  Effect.gen(function* () {
++    yield* setProcessEnv("OPENCODE_AUTH_CONTENT", "{}")
++    const providers = yield* list
++    expect(providers[ProviderID.openai]).toBeDefined()
++    expect(providers[ProviderID.openai].options.baseURL).toBe("https://api.openai.com/v1")
++    expect(providers[ProviderID.openai].options.fetch).toBeFunction()
++  }),
++  {
++    config: {
++      provider: {
++        openai: {
++          options: {
++            baseURL: "https://api.openai.com/v1",
++            apiKey: "sk-test",
++          },
++        },
++      },
++    },
++  },
++)
++
++experimentalWebSockets.instance("openai env apiKey installs websocket fetch without stored auth", () =>
++  Effect.gen(function* () {
++    yield* setProcessEnv("OPENCODE_AUTH_CONTENT", "{}")
++    yield* setProcessEnv("OPENAI_API_KEY", "test-openai-key")
++    const providers = yield* list
++    expect(providers[ProviderID.openai]).toBeDefined()
++    expect(providers[ProviderID.openai].source).toBe("env")
++    expect(providers[ProviderID.openai].key).toBe("test-openai-key")
++    expect(providers[ProviderID.openai].options.fetch).toBeFunction()
++  }),
++)
++
+ it.instance(
+   "disabled_providers excludes provider",
+   Effect.gen(function* () {
+diff --git a/packages/opencode/test/provider/transform.test.ts b/packages/opencode/test/provider/transform.test.ts
+index dad1987de..9f6ba2ad2 100644
+--- a/packages/opencode/test/provider/transform.test.ts
++++ b/packages/opencode/test/provider/transform.test.ts
+@@ -238,6 +238,79 @@ describe("ProviderTransform.options - google thinkingConfig gating", () => {
+   })
+ })
+ 
++describe("ProviderTransform.options - nvidia thinking kwargs", () => {
++  const sessionID = "test-session-123"
++
++  const createModel = (apiId: string) =>
++    ({
++      id: `nvidia/${apiId}`,
++      providerID: "nvidia",
++      api: {
++        id: apiId,
++        url: "https://integrate.api.nvidia.com/v1",
++        npm: "@ai-sdk/openai-compatible",
++      },
++      name: apiId,
++      capabilities: {
++        temperature: true,
++        reasoning: true,
++        attachment: true,
++        toolcall: true,
++        input: { text: true, audio: false, image: true, video: false, pdf: false },
++        output: { text: true, audio: false, image: false, video: false, pdf: false },
++        interleaved: false,
++      },
++      cost: {
++        input: 0.001,
++        output: 0.002,
++        cache: { read: 0.0001, write: 0.0002 },
++      },
++      limit: {
++        context: 128000,
++        output: 8192,
++      },
++      status: "active",
++      options: {},
++      headers: {},
++    }) as any
++
++  test("sets chat_template_kwargs for Nvidia DeepSeek V4 models", () => {
++    const result = ProviderTransform.options({
++      model: createModel("deepseek-ai/deepseek-v4-flash"),
++      sessionID,
++      providerOptions: {},
++    })
++
++    expect(result.chat_template_kwargs).toEqual({
++      enable_thinking: true,
++      thinking: true,
++    })
++  })
++
++  test("sets chat_template_kwargs for Nvidia GLM-5 models", () => {
++    const result = ProviderTransform.options({
++      model: createModel("z-ai/glm-5.1"),
++      sessionID,
++      providerOptions: {},
++    })
++
++    expect(result.chat_template_kwargs).toEqual({
++      enable_thinking: true,
++      clear_thinking: false,
++    })
++  })
++
++  test("does not set chat_template_kwargs for unrelated Nvidia models", () => {
++    const result = ProviderTransform.options({
++      model: createModel("meta/llama-3.1-70b-instruct"),
++      sessionID,
++      providerOptions: {},
++    })
++
++    expect(result.chat_template_kwargs).toBeUndefined()
++  })
++})
++
+ describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
+   const sessionID = "test-session-123"
+ 
+diff --git a/packages/opencode/test/skill/skill.test.ts b/packages/opencode/test/skill/skill.test.ts
+index fc1f6bff6..8bdd78d5c 100644
+--- a/packages/opencode/test/skill/skill.test.ts
++++ b/packages/opencode/test/skill/skill.test.ts
+@@ -254,6 +254,87 @@ description: A skill in the .claude/skills directory.
+     ),
+   )
+ 
++  it.live("does not follow symlinked external skill directories", () =>
++    provideTmpdirInstance(
++      (dir) =>
++        Effect.gen(function* () {
++          yield* Effect.promise(async () => {
++            await Bun.write(
++              path.join(dir, "real-skills", "linked", "SKILL.md"),
++              `---
++name: linked-skill
++description: A symlinked skill that should not load.
++---
++
++# Linked Skill
++`,
++            )
++            await fs.mkdir(path.join(dir, ".claude", "skills"), { recursive: true })
++            await fs.symlink(path.join(dir, "real-skills", "linked"), path.join(dir, ".claude", "skills", "linked"))
++          })
++
++          const skill = yield* Skill.Service
++          expect((yield* skill.all()).filter((s) => s.location !== "<built-in>")).toEqual([])
++        }),
++      { git: true },
++    ),
++  )
++
++  it.live("does not follow symlinked external skill files", () =>
++    provideTmpdirInstance(
++      (dir) =>
++        Effect.gen(function* () {
++          yield* Effect.promise(async () => {
++            await fs.mkdir(path.join(dir, "real-skills", "linked-file"), { recursive: true })
++            await Bun.write(
++              path.join(dir, "real-skills", "linked-file", "SKILL.md"),
++              `---
++name: linked-file-skill
++description: A symlinked skill file that should not load.
++---
++
++# Linked File Skill
++`,
++            )
++            await fs.mkdir(path.join(dir, ".claude", "skills", "linked-file"), { recursive: true })
++            await fs.symlink(
++              path.join(dir, "real-skills", "linked-file", "SKILL.md"),
++              path.join(dir, ".claude", "skills", "linked-file", "SKILL.md"),
++            )
++          })
++
++          const skill = yield* Skill.Service
++          expect((yield* skill.all()).filter((s) => s.location !== "<built-in>")).toEqual([])
++        }),
++      { git: true },
++    ),
++  )
++
++  it.live("does not follow symlinked external skill roots", () =>
++    provideTmpdirInstance(
++      (dir) =>
++        Effect.gen(function* () {
++          yield* Effect.promise(async () => {
++            await Bun.write(
++              path.join(dir, "real-claude", "skills", "root-skill", "SKILL.md"),
++              `---
++name: root-skill
++description: A skill behind a symlinked .claude root that should not load.
++---
++
++# Root Skill
++`,
++            )
++            await fs.symlink(path.join(dir, "real-claude"), path.join(dir, ".claude"))
++          })
++
++          const skill = yield* Skill.Service
++          expect((yield* skill.all()).filter((s) => s.location !== "<built-in>")).toEqual([])
++        }),
++      { git: true },
++    ),
++  )
++
+   it.live("discovers global skills from ~/.claude/skills/ directory", () =>
+     Effect.gen(function* () {
+       const tmp = yield* Effect.acquireRelease(

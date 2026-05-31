@@ -1,0 +1,13 @@
+[Unit]
+Description=Persistent opencode user daemon
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=/usr/bin/opencode-daemon exec-serve
+Restart=on-failure
+RestartSec=2
+RestartPreventExitStatus=64
+
+[Install]
+WantedBy=default.target
