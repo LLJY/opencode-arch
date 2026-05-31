@@ -1,7 +1,7 @@
 pkgbase = opencode
 	pkgdesc = The open source coding agent
 	pkgver = 1.15.13
-	pkgrel = 1
+	pkgrel = 2
 	url = https://github.com/anomalyco/opencode
 	arch = x86_64
 	license = MIT
@@ -16,7 +16,7 @@ pkgbase = opencode
 	source = opencode-daemon.service
 	source = LICENSE
 	b2sums = fddf7bb60f5d3f5a0c1790798e73349934d2b12646542aa66095368293ddeff627b10a724bb06180070014929f37c53ffd2721698eea7ab689c32adb8b6f2256
-	b2sums = d33dfb2795423a39d9da4f62f362ce0245f9e536773033890660e2d9ba935d2606a569dff17846122376ac99e57bf41030a59ec158a1ede6bfbea4fc29bc501c
+	b2sums = 4ed187dc4fd5528090371991b1388e59a9db14a19fd5cb2798f615d39eabb2ea9a3152dd5b47767e4958fe81a2719c44b196e0cf656b88cbd186c53bc90f3f12
 	b2sums = a2e4e1d739dafced870982347c00c017c6040dd281893df6fd181090348d7dd771cbaa99065f2d27a4ec93be9aca24ca9510f6b63e704407e3d142ca3cf5f2c9
 	b2sums = e6a605c6838925a84f6cedbabf7dd02923e83e12c492db08bf58141ae08d46d1d046af5765f099d1d804aea38a84f5d563ae34abeea5d5fb3142d2894ddfe480
 	b2sums = a29664104e1ee73ca0aee1d633e9095d92a57c92787f8d8740bdb7211ba3205782ed8677f539bdb8cae3dd75a3694be3132e185fa3fc4b3f401e1f88eb776101
@@ -33,5 +33,5 @@ pkgname = opencode
 pkgname = opencode-daemon
 	pkgdesc = Systemd user service wrapper for opencode
 	license = 0BSD
-	depends = opencode=1.15.13-1
+	depends = opencode=1.15.13-2
 	depends = systemd

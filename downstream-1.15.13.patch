@@ -1,38 +1,366 @@
-diff --git a/packages/opencode/src/plugin/index.ts b/packages/opencode/src/plugin/index.ts
-index 717dff8db..131312fac 100644
---- a/packages/opencode/src/plugin/index.ts
-+++ b/packages/opencode/src/plugin/index.ts
-@@ -29,7 +29,6 @@ import { parsePluginSpecifier, readPluginId, readV1Plugin, resolvePluginId } fro
- import { registerAdapter } from "@/control-plane/adapters"
- import type { WorkspaceAdapter } from "@/control-plane/types"
- import { RuntimeFlags } from "@/effect/runtime-flags"
--import { InstallationChannel } from "@opencode-ai/core/installation/version"
+diff --git a/packages/opencode/src/plugin/openai/ws-pool.ts b/packages/opencode/src/plugin/openai/ws-pool.ts
+index 331657097..7181ddfbe 100644
+--- a/packages/opencode/src/plugin/openai/ws-pool.ts
++++ b/packages/opencode/src/plugin/openai/ws-pool.ts
+@@ -119,11 +119,18 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
+           }
+         },
+         onConnectionInvalid: (error) => {
+-          log.warn("websocket invalidated", { key, error: error.message })
++          log.warn("websocket invalidated", {
++            key,
++            error: error.message,
++            transport: error.info.transport,
++            phase: error.info.phase,
++            autoReplaySafe: error.info.autoReplaySafe,
++          })
+           entry.busy = false
+-          if (!entry.fallback) recordStreamFailure(entry)
++          entry.lastUsedAt = Date.now()
++          entry.fallback = true
+           invalidate(entry)
+-          resolveFirstEvent(false)
++          if (error.info.autoReplaySafe) resolveFirstEvent(false)
+         },
+         onAbort: (error) => {
+           log.debug("websocket aborted", { key })
+@@ -153,18 +160,27 @@ export function createWebSocketFetch(options?: CreateWebSocketFetchOptions) {
+         throw error
+       }
  
- const log = Log.create({ service: "plugin" })
- 
-@@ -58,14 +57,14 @@ export interface Interface {
- 
- export class Service extends Context.Service<Service, Interface>()("@opencode/Plugin") {}
- 
--export function experimentalWebSocketsEnabled(input: { enabled: boolean; channel?: string }) {
--  return input.enabled || ["local", "dev", "beta"].includes(input.channel ?? InstallationChannel)
-+export function experimentalWebSocketsEnabled(_input: { enabled: boolean; channel?: string }) {
-+  // Downstream override: force websocket transport on all channels for local validation.
-+  return true
+-      recordStreamFailure(entry)
++      const streamError = toWebSocketSetupError(error)
++      if (streamError) entry.fallback = true
++      if (!streamError) recordStreamFailure(entry)
+       log.warn("websocket setup failed", {
+         key,
+-        error: error instanceof Error ? error.message : String(error),
++        error: streamError?.message ?? (error instanceof Error ? error.message : String(error)),
+         fallback: entry.fallback ? "http" : undefined,
+       })
+       invalidate(entry)
+       if (entry.fallback) return httpFetch(input, httpInit)
+       return failedResponse(
+-        new ProviderError.ResponseStreamError(error instanceof Error ? error.message : String(error), {
+-          cause: error,
+-        }),
++        streamError ??
++          new ProviderError.ResponseStreamError(
++            error instanceof Error ? error.message : String(error),
++            {
++              transport: "websocket",
++              phase: "before_first_event",
++              autoReplaySafe: false,
++            },
++            { cause: error },
++          ),
+       )
+     }
+   }
+@@ -237,6 +253,8 @@ async function socket(
+     headers,
+     timeout: connectTimeout,
+     signal: signal ?? undefined,
++  }).catch((error) => {
++    throw toWebSocketSetupError(error) ?? error
+   })
+   entry.connectedAt = Date.now()
+   return next
+@@ -251,6 +269,20 @@ function invalidate(entry: PoolEntry) {
+   entry.connectedAt = undefined
  }
  
- // Built-in plugins that are directly imported (not installed from npm)
- function internalPlugins(flags: RuntimeFlags.Info): PluginInstance[] {
-   return [
--    // Temporary rollout: pre-release builds use WebSockets by default; releases require explicit opt-in.
-     (input) =>
-       CodexAuthPlugin(input, {
-         experimentalWebSockets: experimentalWebSocketsEnabled({ enabled: flags.experimentalWebSockets }),
++function toWebSocketSetupError(error: unknown) {
++  if (error instanceof ProviderError.ResponseStreamError) return error
++  if (OpenAIWebSocket.isAbortError(error)) return
++  return new ProviderError.ResponseStreamError(
++    error instanceof Error ? error.message : String(error),
++    {
++      transport: "websocket",
++      phase: "before_first_event",
++      autoReplaySafe: true,
++    },
++    { cause: error },
++  )
++}
++
+ export function withoutInternalHeaders<T extends { headers?: HeadersInit }>(init: T | undefined): T | undefined {
+   if (!init?.headers) return init
+   if (init.headers instanceof Headers) {
+diff --git a/packages/opencode/src/plugin/openai/ws.ts b/packages/opencode/src/plugin/openai/ws.ts
+index 7ff8d7bb8..c766b3f59 100644
+--- a/packages/opencode/src/plugin/openai/ws.ts
++++ b/packages/opencode/src/plugin/openai/ws.ts
+@@ -162,17 +162,38 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
+     controller?.error(error)
+   }
+ 
++  function failure(message: string, cause?: unknown) {
++    return new ProviderError.ResponseStreamError(
++      message,
++      {
++        transport: "websocket",
++        phase: emitted ? "after_first_event" : "before_first_event",
++        autoReplaySafe: !emitted,
++      },
++      cause === undefined ? undefined : { cause },
++    )
++  }
++
++  function failTerminal(event: Record<string, unknown>, error: Error) {
++    if (completed) return
++    completed = true
++    cleanup()
++    options.onTerminal?.(event)
++    if (error instanceof ProviderError.ResponseStreamError) options.onConnectionInvalid?.(error)
++    controller?.error(error)
++  }
++
+   function resetIdleTimeout(message: string) {
+     if (completed) return
+     if (!options.idleTimeout) return
+     if (idleTimer) clearTimeout(idleTimer)
+-    idleTimer = setTimeout(() => invalidate(new ProviderError.ResponseStreamError(message)), options.idleTimeout)
++    idleTimer = setTimeout(() => invalidate(failure(message)), options.idleTimeout)
+   }
+ 
+   async function onMessage(data: WebSocket.RawData, isBinary: boolean) {
+     if (completed) return
+     if (isBinary) {
+-      invalidate(new ProviderError.ResponseStreamError("Unexpected binary WebSocket frame"))
++      invalidate(failure("Unexpected binary WebSocket frame"))
+       return
+     }
+ 
+@@ -201,15 +222,17 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
+           return
+         }
+       } catch (error) {
+-        invalidate(
+-          new ProviderError.ResponseStreamError(error instanceof Error ? error.message : String(error), {
+-            cause: error,
+-          }),
+-        )
++        invalidate(failure(error instanceof Error ? error.message : String(error), error))
+         return
+       }
+     }
+ 
++    const transportTerminalError = event && terminalTransportError(event, failure)
++    if (transportTerminalError) {
++      failTerminal(event, transportTerminalError)
++      return
++    }
++
+     if (!emitted) options.onFirstEvent?.()
+     controller?.enqueue(
+       encoder.encode(
+@@ -224,7 +247,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
+ 
+     if (!event) return
+ 
+-    if (event.type === "response.completed" || event.type === "response.done") {
++    if (event.type === "response.completed") {
+       completed = true
+       options.onComplete?.(event)
+       options.onTerminal?.(event)
+@@ -232,22 +255,50 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
+       return
+     }
+ 
+-    if (event.type === "response.failed" || event.type === "response.incomplete" || event.type === "error") {
+-      completed = true
+-      options.onTerminal?.(event)
+-      closeCompleted()
++    if (event.type === "response.done") {
++      const status = responseStatus(event)
++      if (status === "completed") {
++        completed = true
++        options.onComplete?.(event)
++        options.onTerminal?.(event)
++        closeCompleted()
++        return
++      }
++      if (status === "incomplete") {
++        failTerminal(event, failure("OpenAI response incomplete", event))
++        return
++      }
++      failTerminal(event, new Error(`OpenAI response ended with status ${status ?? "unknown"}`, { cause: event }))
++      return
++    }
++
++    if (event.type === "response.failed") {
++      failTerminal(event, new Error("OpenAI response failed", { cause: event }))
++      return
++    }
++
++    if (event.type === "response.incomplete") {
++      failTerminal(event, failure("OpenAI response incomplete", event))
++      return
++    }
++
++    if (event.type === "error") {
++      failTerminal(
++        event,
++        transportErrorEvent(event)
++          ? failure(eventErrorMessage(event), event)
++          : new Error(eventErrorMessage(event), { cause: event }),
++      )
+     }
+   }
+ 
+   function onError(error: Error) {
+-    invalidate(new ProviderError.ResponseStreamError(error.message, { cause: error }))
++    invalidate(failure(error.message, error))
+   }
+ 
+   function onClose(code: number, reason: Buffer) {
+     if (completed) return
+-    invalidate(
+-      new ProviderError.ResponseStreamError(closeMessage("WebSocket closed before response.completed", code, reason)),
+-    )
++    invalidate(failure(closeMessage("WebSocket closed before response.completed", code, reason)))
+   }
+ 
+   function onAbort() {
+@@ -284,7 +335,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
+     socket.send(JSON.stringify({ type: "response.create", ...payload }), (error) => {
+       if (completed) return
+       resetIdleTimeout("idle timeout waiting for websocket")
+-      if (error) invalidate(new ProviderError.ResponseStreamError(error.message, { cause: error }))
++      if (error) invalidate(failure(error.message, error))
+     })
+   }
+ 
+@@ -331,4 +382,49 @@ function closeMessage(message: string, code: number, reason: Buffer) {
+   return `${message} (${details.join(": ")})`
+ }
+ 
++function responseStatus(event: Record<string, unknown>) {
++  if (!("response" in event)) return
++  const response = event.response
++  if (!isRecord(response)) return
++  return typeof response.status === "string" ? response.status : undefined
++}
++
++function terminalTransportError(
++  event: Record<string, unknown>,
++  failure: (message: string, cause?: unknown) => ProviderError.ResponseStreamError,
++) {
++  if (event.type === "response.incomplete") return failure("OpenAI response incomplete", event)
++  if (event.type === "response.done" && responseStatus(event) === "incomplete") {
++    return failure("OpenAI response incomplete", event)
++  }
++  if (event.type === "error" && transportErrorEvent(event)) return failure(eventErrorMessage(event), event)
++}
++
++function eventErrorMessage(event: Record<string, unknown>) {
++  if (!("error" in event)) return "OpenAI websocket stream error"
++  const error = event.error
++  if (!isRecord(error)) return "OpenAI websocket stream error"
++  if (typeof error.message === "string" && error.message) return error.message
++  if (typeof error.code === "string" && error.code) return error.code
++  return "OpenAI websocket stream error"
++}
++
++function transportErrorEvent(event: Record<string, unknown>) {
++  const message = eventErrorMessage(event)
++  const code = eventErrorCode(event)
++  if (code === "stream_incomplete" || code === "websocket_connection_limit_reached") return true
++  return /before response\.completed/i.test(message) || /stream[_ ]incomplete/i.test(message)
++}
++
++function eventErrorCode(event: Record<string, unknown>) {
++  if (!("error" in event)) return
++  const error = event.error
++  if (!isRecord(error)) return
++  return typeof error.code === "string" ? error.code : undefined
++}
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null
++}
++
+ export * as OpenAIWebSocket from "./ws"
+diff --git a/packages/opencode/src/provider/error.ts b/packages/opencode/src/provider/error.ts
+index 06b388b48..661a2a7e3 100644
+--- a/packages/opencode/src/provider/error.ts
++++ b/packages/opencode/src/provider/error.ts
+@@ -11,10 +11,23 @@ export class HeaderTimeoutError extends Error {
+   }
+ }
+ 
++export type ResponseStreamTransport = "websocket" | "sse"
++export type ResponseStreamPhase = "before_first_event" | "after_first_event"
++
++export interface ResponseStreamInfo {
++  transport: ResponseStreamTransport
++  phase: ResponseStreamPhase
++  autoReplaySafe: boolean
++}
++
+ export class ResponseStreamError extends Error {
+   public override readonly name = "ProviderResponseStreamError"
+ 
+-  constructor(message: string, options?: ErrorOptions) {
++  constructor(
++    message: string,
++    public readonly info: ResponseStreamInfo,
++    options?: ErrorOptions,
++  ) {
+     super(message, options)
+   }
+ }
 diff --git a/packages/opencode/src/provider/provider.ts b/packages/opencode/src/provider/provider.ts
-index 49c582e0a..c77f72cd6 100644
+index 49c582e0a..e51c9b3bf 100644
 --- a/packages/opencode/src/provider/provider.ts
 +++ b/packages/opencode/src/provider/provider.ts
-@@ -102,6 +102,30 @@ function googleVertexAnthropicBaseURL(project: string | undefined, location: str
+@@ -44,11 +44,22 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
+   if (!res.headers.get("content-type")?.includes("text/event-stream")) return res
+ 
+   const reader = res.body.getReader()
++  let started = false
++  const streamError = (message: string, cause?: unknown) =>
++    new ProviderError.ResponseStreamError(
++      message,
++      {
++        transport: "sse",
++        phase: started ? "after_first_event" : "before_first_event",
++        autoReplaySafe: !started,
++      },
++      cause === undefined ? undefined : { cause },
++    )
+   const body = new ReadableStream<Uint8Array>({
+     async pull(ctrl) {
+       const part = await new Promise<Awaited<ReturnType<typeof reader.read>>>((resolve, reject) => {
+         const id = setTimeout(() => {
+-          const err = new ProviderError.ResponseStreamError("SSE read timed out")
++          const err = streamError("SSE read timed out")
+           ctl.abort(err)
+           void reader.cancel(err)
+           reject(err)
+@@ -61,7 +72,11 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
+           },
+           (err) => {
+             clearTimeout(id)
+-            reject(err)
++            if (err instanceof DOMException && err.name === "AbortError") {
++              reject(err)
++              return
++            }
++            reject(streamError(err instanceof Error ? err.message : String(err), err))
+           },
+         )
+       })
+@@ -72,6 +87,7 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
+       }
+ 
+       ctrl.enqueue(part.value)
++      started = true
+     },
+     async cancel(reason) {
+       ctl.abort(reason)
+@@ -102,6 +118,30 @@ function googleVertexAnthropicBaseURL(project: string | undefined, location: str
    return `https://aiplatform.${location}.rep.googleapis.com/v1/projects/${project}/locations/${location}/publishers/anthropic/models`
  }
  
@@ -63,7 +391,7 @@ index 49c582e0a..c77f72cd6 100644
  type BundledSDK = {
    languageModel(modelId: string): LanguageModelV3
  }
-@@ -1417,15 +1441,29 @@ export const layer = Layer.effect(
+@@ -1417,15 +1457,29 @@ export const layer = Layer.effect(
            if (!plugin.auth) continue
            const providerID = ProviderID.make(plugin.auth.provider)
            if (disabled.has(providerID)) continue
@@ -97,7 +425,7 @@ index 49c582e0a..c77f72cd6 100644
              ),
            )
            const opts = options ?? {}
-@@ -1650,6 +1688,10 @@ export const layer = Layer.effect(
+@@ -1650,6 +1704,10 @@ export const layer = Layer.effect(
              }
            }
  
@@ -134,11 +462,37 @@ index ea55bb2ce..4adfb9c11 100644
    if (input.model.api.npm === "@ai-sdk/azure" && input.model.api.id.includes("gpt-5.5")) {
      result["reasoningSummary"] = "auto"
      return result
+diff --git a/packages/opencode/src/session/message-v2.ts b/packages/opencode/src/session/message-v2.ts
+index 68157f5f4..e8fe75835 100644
+--- a/packages/opencode/src/session/message-v2.ts
++++ b/packages/opencode/src/session/message-v2.ts
+@@ -1159,9 +1159,12 @@ export function fromError(
+       return new APIError(
+         {
+           message: e.message,
+-          isRetryable: true,
++          isRetryable: e.info.autoReplaySafe,
+           metadata: {
+             code: e.name,
++            transport: e.info.transport,
++            phase: e.info.phase,
++            autoReplaySafe: String(e.info.autoReplaySafe),
+           },
+         },
+         { cause: e },
 diff --git a/packages/opencode/src/session/processor.ts b/packages/opencode/src/session/processor.ts
-index a287c3b00..bcb66493a 100644
+index a287c3b00..63d6f2b67 100644
 --- a/packages/opencode/src/session/processor.ts
 +++ b/packages/opencode/src/session/processor.ts
-@@ -31,6 +31,35 @@ import { Usage, type LLMEvent } from "@opencode-ai/llm"
+@@ -16,6 +16,7 @@ import type { SessionID } from "./schema"
+ import { SessionRetry } from "./retry"
+ import { SessionStatus } from "./status"
+ import { SessionSummary } from "./summary"
++import { ProviderError } from "@/provider/error"
+ import type { Provider } from "@/provider/provider"
+ import { Question } from "@/question"
+ import { errorMessage } from "@/util/error"
+@@ -31,6 +32,35 @@ import { Usage, type LLMEvent } from "@opencode-ai/llm"
  
  const DOOM_LOOP_THRESHOLD = 3
  const log = Log.create({ service: "session.processor" })
@@ -174,12 +528,56 @@ index a287c3b00..bcb66493a 100644
  
  export type Result = "compact" | "stop" | "continue"
  
-@@ -323,13 +352,14 @@ export const layer = Layer.effect(
+@@ -76,6 +106,10 @@ interface ProcessorContext extends Input {
+   snapshot: string | undefined
+   blocked: boolean
+   needsCompaction: boolean
++  attemptHasToolActivity: boolean
++  attemptCommitted: boolean
++  attemptHasAssistantOutput: boolean
++  attemptPartIDs: PartID[]
+   currentText: MessageV2.TextPart | undefined
+   reasoningMap: Record<string, MessageV2.ReasoningPart>
+ }
+@@ -116,6 +150,10 @@ export const layer = Layer.effect(
+         snapshot: initialSnapshot,
+         blocked: false,
+         needsCompaction: false,
++        attemptHasToolActivity: false,
++        attemptCommitted: false,
++        attemptHasAssistantOutput: false,
++        attemptPartIDs: [],
+         currentText: undefined,
+         reasoningMap: {},
+       }
+@@ -128,6 +166,20 @@ export const layer = Layer.effect(
+           aborted,
+         })
+ 
++      function rememberAttemptPart(partID: PartID) {
++        if (ctx.attemptPartIDs.includes(partID)) return
++        ctx.attemptPartIDs.push(partID)
++      }
++
++      function resetAttemptState() {
++        ctx.attemptHasToolActivity = false
++        ctx.attemptCommitted = false
++        ctx.attemptHasAssistantOutput = false
++        ctx.attemptPartIDs = []
++        ctx.currentText = undefined
++        ctx.reasoningMap = {}
++      }
++
+       const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
+         const done = ctx.toolcalls[toolCallID]?.done
+         delete ctx.toolcalls[toolCallID]
+@@ -323,13 +375,16 @@ export const layer = Layer.effect(
                time: { start: Date.now() },
                metadata: value.providerMetadata,
              }
 +            installChunkedText(ctx.reasoningMap[value.id])
              yield* session.updatePart(ctx.reasoningMap[value.id])
++            rememberAttemptPart(ctx.reasoningMap[value.id].id)
              return
  
            case "reasoning-delta":
@@ -187,24 +585,189 @@ index a287c3b00..bcb66493a 100644
              if (!(value.id in ctx.reasoningMap)) return
 -            ctx.reasoningMap[value.id].text += value.text
 +            appendChunkedText(ctx.reasoningMap[value.id], value.text)
++            ctx.attemptHasAssistantOutput = true
              if (value.providerMetadata) ctx.reasoningMap[value.id].metadata = value.providerMetadata
              yield* session.updatePartDelta({
                sessionID: ctx.reasoningMap[value.id].sessionID,
-@@ -635,12 +665,13 @@ export const layer = Layer.effect(
+@@ -344,6 +399,9 @@ export const layer = Layer.effect(
+             if (value.providerMetadata && value.id in ctx.reasoningMap) {
+               ctx.reasoningMap[value.id].metadata = value.providerMetadata
+             }
++            if (value.id in ctx.reasoningMap && ctx.reasoningMap[value.id].text.length > 0) {
++              ctx.attemptHasAssistantOutput = true
++            }
+             yield* finishReasoning(value.id)
+             return
+ 
+@@ -351,6 +409,7 @@ export const layer = Layer.effect(
+             if (ctx.assistantMessage.summary) {
+               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
+             }
++            ctx.attemptHasToolActivity = true
+             yield* ensureToolCall(value)
+             return
+ 
+@@ -360,6 +419,7 @@ export const layer = Layer.effect(
+             return
+ 
+           case "tool-input-end": {
++            ctx.attemptHasToolActivity = true
+             const toolCall = yield* ensureToolCall(value)
+             // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
+             if (flags.experimentalEventSystem) {
+@@ -378,6 +438,7 @@ export const layer = Layer.effect(
+             if (ctx.assistantMessage.summary) {
+               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
+             }
++            ctx.attemptHasToolActivity = true
+             const toolCall = yield* ensureToolCall(value)
+             const input = toolInput(value.input)
+             if (!toolCall.call.inputEnded) {
+@@ -450,6 +511,7 @@ export const layer = Layer.effect(
+           }
+ 
+           case "tool-result": {
++            ctx.attemptHasToolActivity = true
+             const toolCall = yield* readToolCall(value.id)
+             const rawOutput = toolResultOutput(value)
+             const normalized = yield* Effect.forEach(rawOutput.attachments ?? [], (attachment) =>
+@@ -502,6 +564,7 @@ export const layer = Layer.effect(
+           }
+ 
+           case "tool-error": {
++            ctx.attemptHasToolActivity = true
+             const toolCall = yield* readToolCall(value.id)
+             // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
+             if (flags.experimentalEventSystem) {
+@@ -543,16 +606,19 @@ export const layer = Layer.effect(
+                 })
+               }
+             }
++            const stepStartID = PartID.ascending()
+             yield* session.updatePart({
+-              id: PartID.ascending(),
++              id: stepStartID,
+               messageID: ctx.assistantMessage.id,
+               sessionID: ctx.sessionID,
+               snapshot: ctx.snapshot,
+               type: "step-start",
+             })
++            rememberAttemptPart(stepStartID)
+             return
+ 
+           case "step-finish": {
++            ctx.attemptCommitted = true
+             const completedSnapshot = yield* snapshot.track()
+             yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
+             const usage = Session.getUsage({
+@@ -635,12 +701,15 @@ export const layer = Layer.effect(
                time: { start: Date.now() },
                metadata: value.providerMetadata,
              }
 +            installChunkedText(ctx.currentText)
              yield* session.updatePart(ctx.currentText)
++            rememberAttemptPart(ctx.currentText.id)
              return
  
            case "text-delta":
              if (!ctx.currentText) return
 -            ctx.currentText.text += value.text
 +            appendChunkedText(ctx.currentText, value.text)
++            ctx.attemptHasAssistantOutput = true
              if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
              yield* session.updatePartDelta({
                sessionID: ctx.currentText.sessionID,
+@@ -674,6 +743,7 @@ export const layer = Layer.effect(
+                 })
+               }
+             }
++            if (ctx.currentText.text.length > 0) ctx.attemptHasAssistantOutput = true
+             {
+               const end = Date.now()
+               ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
+@@ -777,6 +847,43 @@ export const layer = Layer.effect(
+         yield* status.set(ctx.sessionID, { type: "idle" })
+       })
+ 
++      const rollbackRetryableStreamError = (error: unknown) =>
++        Effect.gen(function* () {
++          if (!(error instanceof ProviderError.ResponseStreamError)) return error
++          if (error.info.autoReplaySafe) return error
++          if (ctx.attemptHasToolActivity) return error
++          if (ctx.attemptCommitted) return error
++          if (!ctx.attemptHasAssistantOutput) return error
++          if (ctx.attemptPartIDs.length === 0) return error
++
++          yield* Effect.forEach(
++            [...ctx.attemptPartIDs].reverse(),
++            (partID) =>
++              session.removePart({
++                sessionID: ctx.sessionID,
++                messageID: ctx.assistantMessage.id,
++                partID,
++              }),
++            { discard: true },
++          )
++          resetAttemptState()
++          return new ProviderError.ResponseStreamError(
++            error.message,
++            { ...error.info, autoReplaySafe: true },
++            { cause: error },
++          )
++        }).pipe(
++          Effect.catchIf(
++            () => true,
++            (rollbackError) => {
++              slog.warn("rollback retryable stream error failed", {
++                error: errorMessage(rollbackError),
++              })
++              return Effect.succeed(error)
++            },
++          ),
++        )
++
+       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
+         slog.info("process")
+         ctx.needsCompaction = false
+@@ -784,8 +891,7 @@ export const layer = Layer.effect(
+ 
+         return yield* Effect.gen(function* () {
+           yield* Effect.gen(function* () {
+-            ctx.currentText = undefined
+-            ctx.reasoningMap = {}
++            resetAttemptState()
+             yield* status.set(ctx.sessionID, { type: "busy" })
+             const stream = llm.stream(streamInput)
+ 
+@@ -807,6 +913,11 @@ export const layer = Layer.effect(
+               (cause) => !Cause.hasInterruptsOnly(cause),
+               (cause) => Effect.fail(Cause.squash(cause)),
+             ),
++            Effect.catchIf(() => true, (error) =>
++              Effect.gen(function* () {
++                return yield* Effect.fail(yield* rollbackRetryableStreamError(error))
++              }),
++            ),
+             Effect.retry(
+               SessionRetry.policy({
+                 provider: input.model.providerID,
+diff --git a/packages/opencode/src/session/retry.ts b/packages/opencode/src/session/retry.ts
+index 463bc27a9..e4ea0cc8f 100644
+--- a/packages/opencode/src/session/retry.ts
++++ b/packages/opencode/src/session/retry.ts
+@@ -68,6 +68,12 @@ export function retryable(error: Err, provider: string) {
+   // context overflow errors should not be retried
+   if (MessageV2.ContextOverflowError.isInstance(error)) return undefined
+   if (MessageV2.APIError.isInstance(error)) {
++    const transport = error.data.metadata?.transport
++    if (transport === "websocket" || transport === "sse") {
++      if (error.data.metadata?.autoReplaySafe !== "true") return undefined
++      return { message: error.data.message }
++    }
++
+     const status = error.data.statusCode
+     // 5xx errors are transient server failures and should always be retried,
+     // even when the provider SDK doesn't explicitly mark them as retryable.
 diff --git a/packages/opencode/src/skill/index.ts b/packages/opencode/src/skill/index.ts
 index c1c6d0d6f..e06636fe0 100644
 --- a/packages/opencode/src/skill/index.ts
@@ -305,6 +868,403 @@ index 1278e1cfb..e6af5a412 100644
 +  test("keeps the override enabled even when the flag is set", () => {
      expect(experimentalWebSocketsEnabled({ enabled: true, channel: "latest" })).toBe(true)
      expect(experimentalWebSocketsEnabled({ enabled: true, channel: "prod" })).toBe(true)
+   })
+diff --git a/packages/opencode/test/plugin/openai-ws.test.ts b/packages/opencode/test/plugin/openai-ws.test.ts
+index dcb31199c..d644585a8 100644
+--- a/packages/opencode/test/plugin/openai-ws.test.ts
++++ b/packages/opencode/test/plugin/openai-ws.test.ts
+@@ -72,7 +72,7 @@ describe("plugin.openai.ws", () => {
+       socket.once("message", (data) => {
+         requestBody = JSON.parse(data.toString())
+         socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "hello" }))
+-        socket.send(JSON.stringify({ type: "response.done", response: { id: "resp_123" } }))
++        socket.send(JSON.stringify({ type: "response.done", response: { id: "resp_123", status: "completed" } }))
+         socket.close(1000, "done")
+       })
+     })
+@@ -89,13 +89,73 @@ describe("plugin.openai.ws", () => {
+     })
+ 
+     expect(await response.text()).toBe(
+-      'data: {"type":"response.output_text.delta","delta":"hello"}\n\ndata: {"type":"response.done","response":{"id":"resp_123"}}\n\ndata: [DONE]\n\n',
++      'data: {"type":"response.output_text.delta","delta":"hello"}\n\ndata: {"type":"response.done","response":{"id":"resp_123","status":"completed"}}\n\ndata: [DONE]\n\n',
+     )
+     expect(requestBody).toEqual({ type: "response.create", input: "hi" })
+     expect(completed).toHaveLength(1)
+     expect(completed[0]?.type).toBe("response.done")
+   })
+ 
++  test("treats response.incomplete as a stream failure", async () => {
++    const terminal: Record<string, unknown>[] = []
++    const invalid: ProviderError.ResponseStreamError[] = []
++    await using server = await createWebSocketServer((socket) => {
++      socket.once("message", () => {
++        socket.send(JSON.stringify({ type: "response.incomplete", response: { id: "resp_123", status: "incomplete" } }))
++      })
++    })
++
++    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
++    const response = OpenAIWebSocket.streamResponsesWebSocket({
++      socket,
++      body: { stream: true, input: "hi" },
++      onTerminal: (event) => terminal.push(event),
++      onConnectionInvalid: (error) => invalid.push(error),
++    })
++
++    expect((await readTextError(response.text())).message).toContain("OpenAI response incomplete")
++    expect(terminal.map((event) => event.type)).toEqual(["response.incomplete"])
++    expect(invalid[0]?.info).toEqual({
++      transport: "websocket",
++      phase: "before_first_event",
++      autoReplaySafe: true,
++    })
++  })
++
++  test("treats transport error frames as connection-invalid failures", async () => {
++    const terminal: Record<string, unknown>[] = []
++    const invalid: ProviderError.ResponseStreamError[] = []
++    await using server = await createWebSocketServer((socket) => {
++      socket.once("message", () => {
++        socket.send(
++          JSON.stringify({
++            type: "error",
++            error: {
++              code: "stream_incomplete",
++              message: "Upstream websocket closed before response.completed",
++            },
++          }),
++        )
++      })
++    })
++
++    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
++    const response = OpenAIWebSocket.streamResponsesWebSocket({
++      socket,
++      body: { stream: true, input: "hi" },
++      onTerminal: (event) => terminal.push(event),
++      onConnectionInvalid: (error) => invalid.push(error),
++    })
++
++    expect((await readTextError(response.text())).message).toContain("Upstream websocket closed before response.completed")
++    expect(terminal.map((event) => event.type)).toEqual(["error"])
++    expect(invalid[0]?.info).toEqual({
++      transport: "websocket",
++      phase: "before_first_event",
++      autoReplaySafe: true,
++    })
++  })
++
+   test("errors the SSE stream when the server closes before a terminal event", async () => {
+     const invalid: Error[] = []
+     await using server = await createWebSocketServer((socket) => {
+@@ -187,7 +247,7 @@ describe("plugin.openai.ws-pool", () => {
+     fetch.close()
+   })
+ 
+-  test("falls back to HTTP after websocket setup retries are exhausted", async () => {
++  test("falls back to HTTP immediately after websocket setup failure", async () => {
+     const attempts: string[] = []
+     await using server = await createRejectingWebSocketServer(() => attempts.push("websocket"))
+     const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+@@ -197,16 +257,17 @@ describe("plugin.openai.ws-pool", () => {
+     })
+ 
+     const first = await fetch(server.url, streamRequest({ [TITLE_HEADER]: "false" }))
+-    expect(await readTextError(first.text())).toBeInstanceOf(ProviderError.ResponseStreamError)
+     const second = await fetch(server.url, streamRequest({ [TITLE_HEADER]: "false" }))
+     const third = await fetch(server.url, streamRequest({ [TITLE_HEADER]: "false" }))
+ 
++    expect(await first.text()).toBe("http")
+     expect(await second.text()).toBe("http")
+     expect(await third.text()).toBe("http")
+-    expect(attempts).toEqual(["websocket", "websocket"])
+-    expect(server.httpRequests).toHaveLength(2)
++    expect(attempts).toEqual(["websocket"])
++    expect(server.httpRequests).toHaveLength(3)
+     expect(server.httpRequests[0]?.headers[TITLE_HEADER]).toBeUndefined()
+     expect(server.httpRequests[1]?.headers[TITLE_HEADER]).toBeUndefined()
++    expect(server.httpRequests[2]?.headers[TITLE_HEADER]).toBeUndefined()
+     fetch.close()
+   })
+ 
+@@ -244,7 +305,7 @@ describe("plugin.openai.ws-pool", () => {
+     })
+ 
+     const first = await fetch(server.url, streamRequest())
+-    expect(await first.text()).toContain('data: {"type":"response.failed"}')
++    expect((await readTextError(first.text())).message).toContain("OpenAI response failed")
+ 
+     const second = await fetch(server.url, streamRequest())
+     expect(await second.text()).toContain('data: {"type":"response.completed"}')
+@@ -253,28 +314,22 @@ describe("plugin.openai.ws-pool", () => {
+     fetch.close()
+   })
+ 
+-  test("retries websocket connection limit errors on the next stream attempt", async () => {
++  test("falls back to HTTP after a websocket connection limit error", async () => {
+     let connections = 0
+-    let messages = 0
+     await using server = await createWebSocketServer((socket) => {
+       connections += 1
+       socket.once("message", () => {
+-        messages += 1
+-        if (connections === 1) {
+-          socket.send(
+-            JSON.stringify({
+-              type: "error",
+-              status: 400,
+-              error: {
+-                type: "invalid_request_error",
+-                code: "websocket_connection_limit_reached",
+-                message: "Responses websocket connection limit reached",
+-              },
+-            }),
+-          )
+-          return
+-        }
+-        socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_retry" } }))
++        socket.send(
++          JSON.stringify({
++            type: "error",
++            status: 400,
++            error: {
++              type: "invalid_request_error",
++              code: "websocket_connection_limit_reached",
++              message: "Responses websocket connection limit reached",
++            },
++          }),
++        )
+       })
+     })
+     const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+@@ -282,20 +337,16 @@ describe("plugin.openai.ws-pool", () => {
+     })
+ 
+     const first = await fetch(server.url, streamRequest())
+-    expect((await readTextError(first.text())).message).toContain("Responses websocket connection limit reached")
+     const second = await fetch(server.url, streamRequest())
+-    const text = await second.text()
+ 
+-    expect(text).not.toContain("websocket_connection_limit_reached")
+-    expect(text).toContain('data: {"type":"response.completed","response":{"id":"resp_retry"}}')
+-    expect(text).toContain("data: [DONE]")
+-    expect(connections).toBe(2)
+-    expect(messages).toBe(2)
+-    expect(server.httpRequests).toHaveLength(0)
++    expect(await first.text()).toBe("http")
++    expect(await second.text()).toBe("http")
++    expect(connections).toBe(1)
++    expect(server.httpRequests).toHaveLength(2)
+     fetch.close()
+   })
+ 
+-  test("falls back to HTTP after websocket connection limit retries are exhausted", async () => {
++  test("prunes HTTP fallback after a websocket connection limit error", async () => {
+     let connections = 0
+     await using server = await createWebSocketServer((socket) => {
+       connections += 1
+@@ -315,42 +366,28 @@ describe("plugin.openai.ws-pool", () => {
+     })
+     const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+       url: server.url,
++      idleTimeout: 20,
+       streamRetries: 2,
+     })
+ 
+     const first = await fetch(server.url, streamRequest())
+-    expect((await readTextError(first.text())).message).toContain("Responses websocket connection limit reached")
++    expect(await first.text()).toBe("http")
++    await new Promise((resolve) => setTimeout(resolve, 50))
+     const second = await fetch(server.url, streamRequest())
+-    expect((await readTextError(second.text())).message).toContain("Responses websocket connection limit reached")
+-    const third = await fetch(server.url, streamRequest())
+-    const fourth = await fetch(server.url, streamRequest())
+ 
+-    expect(await third.text()).toBe("http")
+-    expect(await fourth.text()).toBe("http")
+-    expect(connections).toBe(3)
++    expect(await second.text()).toBe("http")
++    expect(connections).toBe(2)
+     expect(server.httpRequests).toHaveLength(2)
+     fetch.close()
+   })
+ 
+-  test("shares the websocket retry budget across stream and connection limit failures", async () => {
++  test("uses sticky HTTP fallback after a websocket failure mid-stream", async () => {
+     let connections = 0
+     await using server = await createWebSocketServer((socket) => {
+       connections += 1
+       socket.once("message", () => {
+-        if (connections === 1) {
+-          socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
+-          socket.terminate()
+-          return
+-        }
+-        socket.send(
+-          JSON.stringify({
+-            type: "error",
+-            error: {
+-              code: "websocket_connection_limit_reached",
+-              message: "Responses websocket connection limit reached",
+-            },
+-          }),
+-        )
++        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
++        setTimeout(() => socket.terminate(), 5)
+       })
+     })
+     const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+@@ -361,42 +398,54 @@ describe("plugin.openai.ws-pool", () => {
+     const first = await fetch(server.url, streamRequest())
+     expect((await readTextError(first.text())).message).toContain("WebSocket closed before response.completed")
+     const second = await fetch(server.url, streamRequest())
++    const third = await fetch(server.url, streamRequest())
+ 
+     expect(await second.text()).toBe("http")
+-    expect(connections).toBe(2)
+-    expect(server.httpRequests).toHaveLength(1)
++    expect(await third.text()).toBe("http")
++    expect(connections).toBe(1)
++    expect(server.httpRequests).toHaveLength(2)
+     fetch.close()
+   })
+ 
+-  test("retries websocket idle failures before first event then falls back to HTTP", async () => {
++  test("uses sticky HTTP fallback after a transport error frame mid-stream", async () => {
+     let connections = 0
+     await using server = await createWebSocketServer((socket) => {
+       connections += 1
+-      socket.once("message", () => {})
++      socket.once("message", () => {
++        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
++        socket.send(
++          JSON.stringify({
++            type: "error",
++            error: {
++              code: "stream_incomplete",
++              message: "Upstream websocket closed before response.completed",
++            },
++          }),
++        )
++      })
+     })
+     const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+       url: server.url,
+-      idleTimeout: 20,
+       streamRetries: 1,
+     })
+ 
+     const first = await fetch(server.url, streamRequest())
+-    expect((await readTextError(first.text())).message).toContain("idle timeout waiting for websocket")
++    expect((await readTextError(first.text())).message).toContain("Upstream websocket closed before response.completed")
+     const second = await fetch(server.url, streamRequest())
+     const third = await fetch(server.url, streamRequest())
+ 
+     expect(await second.text()).toBe("http")
+     expect(await third.text()).toBe("http")
+-    expect(connections).toBe(2)
++    expect(connections).toBe(1)
+     expect(server.httpRequests).toHaveLength(2)
+     fetch.close()
+   })
+ 
+-  test("retries failed websocket streams before using HTTP fallback", async () => {
++  test("falls back to HTTP when websocket idles before the first event", async () => {
++    let connections = 0
+     await using server = await createWebSocketServer((socket) => {
+-      socket.once("message", () => {
+-        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
+-      })
++      connections += 1
++      socket.once("message", () => {})
+     })
+     const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+       url: server.url,
+@@ -405,48 +454,37 @@ describe("plugin.openai.ws-pool", () => {
+     })
+ 
+     const first = await fetch(server.url, streamRequest())
+-    expect((await readTextError(first.text())).message).toContain("idle timeout waiting for websocket")
+     const second = await fetch(server.url, streamRequest())
+-    expect((await readTextError(second.text())).message).toContain("idle timeout waiting for websocket")
+     const third = await fetch(server.url, streamRequest())
+ 
++    expect(await first.text()).toBe("http")
++    expect(await second.text()).toBe("http")
+     expect(await third.text()).toBe("http")
+-    expect(server.httpRequests).toHaveLength(1)
++    expect(connections).toBe(1)
++    expect(server.httpRequests).toHaveLength(3)
+     fetch.close()
+   })
+ 
+-  test("resets websocket stream failures after a completed response", async () => {
+-    let connections = 0
+-    let requests = 0
++  test("does not replay a websocket stream after output has started", async () => {
+     await using server = await createWebSocketServer((socket) => {
+-      connections += 1
+-      socket.on("message", () => {
+-        requests += 1
+-        if (requests === 1 || requests === 3) {
+-          socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
+-          socket.terminate()
+-          return
+-        }
+-        socket.send(JSON.stringify({ type: "response.completed", response: { id: `resp_${requests}` } }))
++      socket.once("message", () => {
++        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
+       })
+     })
+     const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+       url: server.url,
++      idleTimeout: 20,
+       streamRetries: 1,
+     })
+ 
+     const first = await fetch(server.url, streamRequest())
+-    expect((await readTextError(first.text())).message).toContain("WebSocket closed before response.completed")
++    expect((await readTextError(first.text())).message).toContain("idle timeout waiting for websocket")
+     const second = await fetch(server.url, streamRequest())
+-    expect(await second.text()).toContain("data: [DONE]")
+     const third = await fetch(server.url, streamRequest())
+-    expect((await readTextError(third.text())).message).toContain("WebSocket closed before response.completed")
+-    const fourth = await fetch(server.url, streamRequest())
+ 
+-    expect(await fourth.text()).toContain("data: [DONE]")
+-    expect(connections).toBe(3)
+-    expect(requests).toBe(4)
+-    expect(server.httpRequests).toHaveLength(0)
++    expect(await second.text()).toBe("http")
++    expect(await third.text()).toBe("http")
++    expect(server.httpRequests).toHaveLength(2)
+     fetch.close()
+   })
+ 
+@@ -515,7 +553,7 @@ describe("plugin.openai.ws-pool", () => {
+     fetch.close()
+   })
+ 
+-  test("retries unexpected closes before first event then falls back to HTTP", async () => {
++  test("falls back to HTTP after an unexpected websocket close before the first event", async () => {
+     let connections = 0
+     await using server = await createWebSocketServer((socket) => {
+       connections += 1
+@@ -529,13 +567,11 @@ describe("plugin.openai.ws-pool", () => {
+     })
+ 
+     const first = await fetch(server.url, streamRequest())
+-    expect((await readTextError(first.text())).message).toContain("WebSocket closed before response.completed")
+     const second = await fetch(server.url, streamRequest())
+-    const third = await fetch(server.url, streamRequest())
+ 
++    expect(await first.text()).toBe("http")
+     expect(await second.text()).toBe("http")
+-    expect(await third.text()).toBe("http")
+-    expect(connections).toBe(2)
++    expect(connections).toBe(1)
+     expect(server.httpRequests).toHaveLength(2)
+     fetch.close()
    })
 diff --git a/packages/opencode/test/provider/provider.test.ts b/packages/opencode/test/provider/provider.test.ts
 index 1ea2c8242..82f9a2985 100644
@@ -444,6 +1404,187 @@ index dad1987de..9f6ba2ad2 100644
  describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
    const sessionID = "test-session-123"
  
+diff --git a/packages/opencode/test/session/processor-effect.test.ts b/packages/opencode/test/session/processor-effect.test.ts
+index ede122297..33a90c3b6 100644
+--- a/packages/opencode/test/session/processor-effect.test.ts
++++ b/packages/opencode/test/session/processor-effect.test.ts
+@@ -76,6 +76,10 @@ const cfg = {
+ }
+ 
+ function providerCfg(url: string) {
++  return providerCfgWithOptions(url)
++}
++
++function providerCfgWithOptions(url: string, options?: Record<string, unknown>) {
+   return {
+     ...cfg,
+     provider: {
+@@ -85,6 +89,7 @@ function providerCfg(url: string) {
+         options: {
+           ...cfg.provider.test.options,
+           baseURL: url,
++          ...options,
+         },
+       },
+     },
+@@ -620,6 +625,98 @@ it.live("session.processor effect tests publish retry status updates", () =>
+   ),
+ )
+ 
++it.live("session.processor effect tests rollback assistant-only partial output before retry", () =>
++  provideTmpdirServer(
++    ({ dir, llm }) =>
++      Effect.gen(function* () {
++        const { processors, session, provider } = yield* boot()
++
++        yield* llm.push(reply().text("partial").hang().item(), reply().text("after").stop().item())
++
++        const chat = yield* session.create({})
++        const parent = yield* user(chat.id, "retry partial output")
++        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++        const handle = yield* processors.create({
++          assistantMessage: msg,
++          sessionID: chat.id,
++          model: mdl,
++        })
++
++        const value = yield* handle.process({
++          user: {
++            id: parent.id,
++            sessionID: chat.id,
++            role: "user",
++            time: parent.time,
++            agent: parent.agent,
++            model: { providerID: ref.providerID, modelID: ref.modelID },
++          } satisfies MessageV2.User,
++          sessionID: chat.id,
++          model: mdl,
++          agent: agent(),
++          system: [],
++          messages: [{ role: "user", content: "retry partial output" }],
++          tools: {},
++        })
++
++        const parts = MessageV2.parts(msg.id)
++
++        expect(value).toBe("continue")
++        expect(yield* llm.calls).toBe(2)
++        expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
++        expect(parts.filter((part): part is MessageV2.TextPart => part.type === "text").map((part) => part.text)).toEqual([
++          "after",
++        ])
++        expect(handle.message.error).toBeUndefined()
++      }),
++    { config: (url) => providerCfgWithOptions(url, { chunkTimeout: 50 }) },
++  ),
++)
++
++it.live("session.processor effect tests do not retry partial output after tool activity", () =>
++  provideTmpdirServer(
++    ({ dir, llm }) =>
++      Effect.gen(function* () {
++        const { processors, session, provider } = yield* boot()
++
++        yield* llm.push(reply().text("partial").pendingTool("lookup", { query: "weather" }).hang().item())
++
++        const chat = yield* session.create({})
++        const parent = yield* user(chat.id, "retry tool partial output")
++        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++        const handle = yield* processors.create({
++          assistantMessage: msg,
++          sessionID: chat.id,
++          model: mdl,
++        })
++
++        const value = yield* handle.process({
++          user: {
++            id: parent.id,
++            sessionID: chat.id,
++            role: "user",
++            time: parent.time,
++            agent: parent.agent,
++            model: { providerID: ref.providerID, modelID: ref.modelID },
++          } satisfies MessageV2.User,
++          sessionID: chat.id,
++          model: mdl,
++          agent: agent(),
++          system: [],
++          messages: [{ role: "user", content: "retry tool partial output" }],
++          tools: {},
++        })
++
++        expect(value).toBe("stop")
++        expect(yield* llm.calls).toBe(1)
++        expect(handle.message.error).toBeDefined()
++      }),
++    { config: (url) => providerCfgWithOptions(url, { chunkTimeout: 50 }) },
++  ),
++)
++
+ it.live("session.processor effect tests compact on structured context overflow", () =>
+   provideTmpdirServer(
+     ({ dir, llm }) =>
+diff --git a/packages/opencode/test/session/retry.test.ts b/packages/opencode/test/session/retry.test.ts
+index e1cbec036..53f857f09 100644
+--- a/packages/opencode/test/session/retry.test.ts
++++ b/packages/opencode/test/session/retry.test.ts
+@@ -172,9 +172,16 @@ describe("session.retry.retryable", () => {
+     })
+   })
+ 
+-  test("retries websocket stream transport errors", () => {
++  test("retries websocket transport errors before the first event", () => {
+     const request = MessageV2.fromError(
+-      new ProviderError.ResponseStreamError("WebSocket closed before response.completed (code 1006: Connection ended)"),
++      new ProviderError.ResponseStreamError(
++        "WebSocket closed before response.completed (code 1006: Connection ended)",
++        {
++          transport: "websocket",
++          phase: "before_first_event",
++          autoReplaySafe: true,
++        },
++      ),
+       { providerID },
+     )
+     expect(MessageV2.APIError.isInstance(request)).toBe(true)
+@@ -183,6 +190,35 @@ describe("session.retry.retryable", () => {
+     })
+   })
+ 
++  test("does not retry websocket transport errors after output has started", () => {
++    const request = MessageV2.fromError(
++      new ProviderError.ResponseStreamError(
++        "WebSocket closed before response.completed (code 1006: Connection ended)",
++        {
++          transport: "websocket",
++          phase: "after_first_event",
++          autoReplaySafe: false,
++        },
++      ),
++      { providerID },
++    )
++    expect(MessageV2.APIError.isInstance(request)).toBe(true)
++    expect(SessionRetry.retryable(request, retryProvider)).toBeUndefined()
++  })
++
++  test("does not retry SSE transport errors after output has started", () => {
++    const request = MessageV2.fromError(
++      new ProviderError.ResponseStreamError("SSE read timed out", {
++        transport: "sse",
++        phase: "after_first_event",
++        autoReplaySafe: false,
++      }),
++      { providerID },
++    )
++    expect(MessageV2.APIError.isInstance(request)).toBe(true)
++    expect(SessionRetry.retryable(request, retryProvider)).toBeUndefined()
++  })
++
+   test("does not retry context overflow errors", () => {
+     const error = new MessageV2.ContextOverflowError({
+       message: "Input exceeds context window of this model",
 diff --git a/packages/opencode/test/skill/skill.test.ts b/packages/opencode/test/skill/skill.test.ts
 index fc1f6bff6..8bdd78d5c 100644
 --- a/packages/opencode/test/skill/skill.test.ts
