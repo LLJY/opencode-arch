@@ -1,3 +1,33 @@
+diff --git a/packages/opencode/src/plugin/index.ts b/packages/opencode/src/plugin/index.ts
+index 717dff8db..131312fac 100644
+--- a/packages/opencode/src/plugin/index.ts
++++ b/packages/opencode/src/plugin/index.ts
+@@ -29,7 +29,6 @@ import { parsePluginSpecifier, readPluginId, readV1Plugin, resolvePluginId } fro
+ import { registerAdapter } from "@/control-plane/adapters"
+ import type { WorkspaceAdapter } from "@/control-plane/types"
+ import { RuntimeFlags } from "@/effect/runtime-flags"
+-import { InstallationChannel } from "@opencode-ai/core/installation/version"
+ 
+ const log = Log.create({ service: "plugin" })
+ 
+@@ -58,14 +57,14 @@ export interface Interface {
+ 
+ export class Service extends Context.Service<Service, Interface>()("@opencode/Plugin") {}
+ 
+-export function experimentalWebSocketsEnabled(input: { enabled: boolean; channel?: string }) {
+-  return input.enabled || ["local", "dev", "beta"].includes(input.channel ?? InstallationChannel)
++export function experimentalWebSocketsEnabled(_input: { enabled: boolean; channel?: string }) {
++  // Downstream override: force websocket transport on all channels for local validation.
++  return true
+ }
+ 
+ // Built-in plugins that are directly imported (not installed from npm)
+ function internalPlugins(flags: RuntimeFlags.Info): PluginInstance[] {
+   return [
+-    // Temporary rollout: pre-release builds use WebSockets by default; releases require explicit opt-in.
+     (input) =>
+       CodexAuthPlugin(input, {
+         experimentalWebSockets: experimentalWebSocketsEnabled({ enabled: flags.experimentalWebSockets }),
 diff --git a/packages/opencode/src/plugin/openai/ws-pool.ts b/packages/opencode/src/plugin/openai/ws-pool.ts
 index 331657097..7181ddfbe 100644
 --- a/packages/opencode/src/plugin/openai/ws-pool.ts
@@ -88,20 +118,36 @@ index 331657097..7181ddfbe 100644
    if (!init?.headers) return init
    if (init.headers instanceof Headers) {
 diff --git a/packages/opencode/src/plugin/openai/ws.ts b/packages/opencode/src/plugin/openai/ws.ts
-index 7ff8d7bb8..c766b3f59 100644
+index 7ff8d7bb8..e3b34dc6d 100644
 --- a/packages/opencode/src/plugin/openai/ws.ts
 +++ b/packages/opencode/src/plugin/openai/ws.ts
-@@ -162,17 +162,38 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
+@@ -135,6 +135,8 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
+   let cleanupSocket = () => {}
+   let completed = false
+   let emitted = false
++  let emittedModelOutput = false
++  let released = false
+   let idleTimer: ReturnType<typeof setTimeout> | undefined
+ 
+   function cleanup() {
+@@ -162,17 +164,45 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
      controller?.error(error)
    }
  
-+  function failure(message: string, cause?: unknown) {
++  function release() {
++    if (released) return
++    released = true
++    options.onFirstEvent?.()
++  }
++
++  function failure(message: string, cause?: unknown, info?: Partial<ProviderError.ResponseStreamInfo>) {
 +    return new ProviderError.ResponseStreamError(
 +      message,
 +      {
 +        transport: "websocket",
-+        phase: emitted ? "after_first_event" : "before_first_event",
-+        autoReplaySafe: !emitted,
++        phase: emittedModelOutput ? "after_first_event" : "before_first_event",
++        autoReplaySafe: !emittedModelOutput,
++        ...info,
 +      },
 +      cause === undefined ? undefined : { cause },
 +    )
@@ -132,7 +178,7 @@ index 7ff8d7bb8..c766b3f59 100644
        return
      }
  
-@@ -201,15 +222,17 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
+@@ -201,16 +231,17 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
            return
          }
        } catch (error) {
@@ -146,16 +192,24 @@ index 7ff8d7bb8..c766b3f59 100644
        }
      }
  
+-    if (!emitted) options.onFirstEvent?.()
 +    const transportTerminalError = event && terminalTransportError(event, failure)
 +    if (transportTerminalError) {
 +      failTerminal(event, transportTerminalError)
 +      return
 +    }
 +
-     if (!emitted) options.onFirstEvent?.()
      controller?.enqueue(
        encoder.encode(
-@@ -224,7 +247,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
+         `${text
+@@ -219,35 +250,64 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
+           .join("\n")}\n\n`,
+       ),
+     )
++    release()
+     emitted = true
++    if (event && modelOutputEvent(event)) emittedModelOutput = true
+     resetIdleTimeout("idle timeout waiting for websocket")
  
      if (!event) return
  
@@ -164,7 +218,8 @@ index 7ff8d7bb8..c766b3f59 100644
        completed = true
        options.onComplete?.(event)
        options.onTerminal?.(event)
-@@ -232,22 +255,50 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
++      release()
+       closeCompleted()
        return
      }
  
@@ -178,6 +233,7 @@ index 7ff8d7bb8..c766b3f59 100644
 +        completed = true
 +        options.onComplete?.(event)
 +        options.onTerminal?.(event)
++        release()
 +        closeCompleted()
 +        return
 +      }
@@ -185,12 +241,8 @@ index 7ff8d7bb8..c766b3f59 100644
 +        failTerminal(event, failure("OpenAI response incomplete", event))
 +        return
 +      }
++      release()
 +      failTerminal(event, new Error(`OpenAI response ended with status ${status ?? "unknown"}`, { cause: event }))
-+      return
-+    }
-+
-+    if (event.type === "response.failed") {
-+      failTerminal(event, new Error("OpenAI response failed", { cause: event }))
 +      return
 +    }
 +
@@ -200,6 +252,7 @@ index 7ff8d7bb8..c766b3f59 100644
 +    }
 +
 +    if (event.type === "error") {
++      if (!transportErrorEvent(event)) release()
 +      failTerminal(
 +        event,
 +        transportErrorEvent(event)
@@ -223,7 +276,7 @@ index 7ff8d7bb8..c766b3f59 100644
    }
  
    function onAbort() {
-@@ -284,7 +335,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
+@@ -284,7 +344,7 @@ export function streamResponsesWebSocket(options: StreamResponsesWebSocketOption
      socket.send(JSON.stringify({ type: "response.create", ...payload }), (error) => {
        if (completed) return
        resetIdleTimeout("idle timeout waiting for websocket")
@@ -232,7 +285,7 @@ index 7ff8d7bb8..c766b3f59 100644
      })
    }
  
-@@ -331,4 +382,49 @@ function closeMessage(message: string, code: number, reason: Buffer) {
+@@ -331,4 +391,94 @@ function closeMessage(message: string, code: number, reason: Buffer) {
    return `${message} (${details.join(": ")})`
  }
  
@@ -245,13 +298,58 @@ index 7ff8d7bb8..c766b3f59 100644
 +
 +function terminalTransportError(
 +  event: Record<string, unknown>,
-+  failure: (message: string, cause?: unknown) => ProviderError.ResponseStreamError,
++  failure: (
++    message: string,
++    cause?: unknown,
++    info?: Partial<ProviderError.ResponseStreamInfo>,
++  ) => ProviderError.ResponseStreamError,
 +) {
++  if (event.type === "response.failed") return failure(responseFailedMessage(event), event, { terminalEvent: event.type })
 +  if (event.type === "response.incomplete") return failure("OpenAI response incomplete", event)
 +  if (event.type === "response.done" && responseStatus(event) === "incomplete") {
 +    return failure("OpenAI response incomplete", event)
 +  }
 +  if (event.type === "error" && transportErrorEvent(event)) return failure(eventErrorMessage(event), event)
++}
++
++function responseFailedMessage(event: Record<string, unknown>) {
++  const detail = responseFailedDetail(event)
++  const message = detail?.message
++  const code = detail?.code
++  if (message && code) return `OpenAI response failed (${code}): ${message}`
++  if (message) return `OpenAI response failed: ${message}`
++  if (code) return `OpenAI response failed (${code})`
++  return "OpenAI response failed"
++}
++
++function responseFailedDetail(event: Record<string, unknown>) {
++  const details = [event.error, isRecord(event.response) ? event.response.error : undefined]
++    .filter(isRecord)
++    .map((error) => ({
++      code: typeof error.code === "string" && error.code ? error.code : undefined,
++      message: typeof error.message === "string" && error.message ? error.message : undefined,
++    }))
++    .filter((error) => error.code || error.message)
++    .sort((a, b) => (b.message ? 2 : 0) + (b.code ? 1 : 0) - ((a.message ? 2 : 0) + (a.code ? 1 : 0)))
++  const best = details[0]
++  if (!best) return
++  return {
++    code: best.code ?? details.find((detail) => detail.code)?.code,
++    message: best.message ?? details.find((detail) => detail.message)?.message,
++  }
++}
++
++function modelOutputEvent(event: Record<string, unknown>) {
++  if (typeof event.type !== "string") return false
++  if (event.type === "response.output_text.delta") return true
++  if (event.type === "response.reasoning_text.delta") return true
++  if (event.type === "response.reasoning_summary.delta") return true
++  if (event.type === "response.reasoning_summary_text.delta") return true
++  if (event.type.endsWith(".delta") && event.type.includes("call")) return true
++  if (event.type === "response.output_item.added" || event.type === "response.output_item.done") {
++    return isRecord(event.item) && event.item.type !== "message"
++  }
++  return false
 +}
 +
 +function eventErrorMessage(event: Record<string, unknown>) {
@@ -283,10 +381,10 @@ index 7ff8d7bb8..c766b3f59 100644
 +
  export * as OpenAIWebSocket from "./ws"
 diff --git a/packages/opencode/src/provider/error.ts b/packages/opencode/src/provider/error.ts
-index 06b388b48..661a2a7e3 100644
+index 06b388b48..b1c76a9e5 100644
 --- a/packages/opencode/src/provider/error.ts
 +++ b/packages/opencode/src/provider/error.ts
-@@ -11,10 +11,23 @@ export class HeaderTimeoutError extends Error {
+@@ -11,10 +11,24 @@ export class HeaderTimeoutError extends Error {
    }
  }
  
@@ -297,6 +395,7 @@ index 06b388b48..661a2a7e3 100644
 +  transport: ResponseStreamTransport
 +  phase: ResponseStreamPhase
 +  autoReplaySafe: boolean
++  terminalEvent?: string
 +}
 +
  export class ResponseStreamError extends Error {
@@ -462,11 +561,34 @@ index ea55bb2ce..4adfb9c11 100644
    if (input.model.api.npm === "@ai-sdk/azure" && input.model.api.id.includes("gpt-5.5")) {
      result["reasoningSummary"] = "auto"
      return result
+diff --git a/packages/opencode/src/session/compaction.ts b/packages/opencode/src/session/compaction.ts
+index 4f87edf64..fcc98f1db 100644
+--- a/packages/opencode/src/session/compaction.ts
++++ b/packages/opencode/src/session/compaction.ts
+@@ -559,7 +559,8 @@ export const layer = Layer.effect(
+       }
+ 
+       if (processor.message.error) return "stop"
+-      if (result === "continue") {
++      const outcome = result === "resume" ? "continue" : result
++      if (outcome === "continue") {
+         const summary = summaryText(
+           (yield* session.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)).find(
+             (item) => item.info.id === msg.id,
+@@ -578,7 +579,7 @@ export const layer = Layer.effect(
+         }
+         yield* bus.publish(Event.Compacted, { sessionID: input.sessionID })
+       }
+-      return result
++      return outcome
+     })
+ 
+     const create = Effect.fn("SessionCompaction.create")(function* (input: {
 diff --git a/packages/opencode/src/session/message-v2.ts b/packages/opencode/src/session/message-v2.ts
-index 68157f5f4..e8fe75835 100644
+index 68157f5f4..4a11336ff 100644
 --- a/packages/opencode/src/session/message-v2.ts
 +++ b/packages/opencode/src/session/message-v2.ts
-@@ -1159,9 +1159,12 @@ export function fromError(
+@@ -1159,9 +1159,13 @@ export function fromError(
        return new APIError(
          {
            message: e.message,
@@ -477,11 +599,12 @@ index 68157f5f4..e8fe75835 100644
 +            transport: e.info.transport,
 +            phase: e.info.phase,
 +            autoReplaySafe: String(e.info.autoReplaySafe),
++            ...(e.info.terminalEvent ? { terminalEvent: e.info.terminalEvent } : {}),
            },
          },
          { cause: e },
 diff --git a/packages/opencode/src/session/processor.ts b/packages/opencode/src/session/processor.ts
-index a287c3b00..63d6f2b67 100644
+index a287c3b00..efae2365b 100644
 --- a/packages/opencode/src/session/processor.ts
 +++ b/packages/opencode/src/session/processor.ts
 @@ -16,6 +16,7 @@ import type { SessionID } from "./schema"
@@ -492,12 +615,13 @@ index a287c3b00..63d6f2b67 100644
  import type { Provider } from "@/provider/provider"
  import { Question } from "@/question"
  import { errorMessage } from "@/util/error"
-@@ -31,6 +32,35 @@ import { Usage, type LLMEvent } from "@opencode-ai/llm"
+@@ -31,8 +32,68 @@ import { Usage, type LLMEvent } from "@opencode-ai/llm"
  
  const DOOM_LOOP_THRESHOLD = 3
  const log = Log.create({ service: "session.processor" })
 +const textChunks = new WeakMap<{ text: string }, string[]>()
-+
+ 
+-export type Result = "compact" | "stop" | "continue"
 +function installChunkedText(part: { text: string }) {
 +  textChunks.set(part, [part.text])
 +  Object.defineProperty(part, "text", {
@@ -525,53 +649,153 @@ index a287c3b00..63d6f2b67 100644
 +  }
 +  chunks.push(text)
 +}
++
++function cloneTokens(tokens: MessageV2.Assistant["tokens"]): MessageV2.Assistant["tokens"] {
++  return {
++    ...tokens,
++    cache: { ...tokens.cache },
++  }
++}
++
++export type Result = "compact" | "stop" | "continue" | "resume"
++
++class ResumeFromPromptLoop extends Error {
++  public override readonly name = "SessionProcessorResumeFromPromptLoop"
++}
++
++class StopAfterBlockedToolBoundary extends Error {
++  public override readonly name = "SessionProcessorStopAfterBlockedToolBoundary"
++}
++
++class StopAfterUnsafeToolActivity extends Error {
++  public override readonly name = "SessionProcessorStopAfterUnsafeToolActivity"
++}
++
++class StopAfterRollbackFailure extends Error {
++  public override readonly name = "SessionProcessorStopAfterRollbackFailure"
++}
++
++type ReplayState = {
++  finish: MessageV2.Assistant["finish"]
++  cost: MessageV2.Assistant["cost"]
++  tokens: MessageV2.Assistant["tokens"]
++  snapshot: string | undefined
++  needsCompaction: boolean
++}
  
- export type Result = "compact" | "stop" | "continue"
- 
-@@ -76,6 +106,10 @@ interface ProcessorContext extends Input {
+ export interface Handle {
+   readonly message: MessageV2.Assistant
+@@ -76,6 +137,11 @@ interface ProcessorContext extends Input {
    snapshot: string | undefined
    blocked: boolean
    needsCompaction: boolean
++  requestHasCommittedToolBoundary: boolean
 +  attemptHasToolActivity: boolean
 +  attemptCommitted: boolean
-+  attemptHasAssistantOutput: boolean
++  attemptNeedsReset: boolean
 +  attemptPartIDs: PartID[]
    currentText: MessageV2.TextPart | undefined
    reasoningMap: Record<string, MessageV2.ReasoningPart>
  }
-@@ -116,6 +150,10 @@ export const layer = Layer.effect(
+@@ -116,11 +182,17 @@ export const layer = Layer.effect(
          snapshot: initialSnapshot,
          blocked: false,
          needsCompaction: false,
++        requestHasCommittedToolBoundary: false,
 +        attemptHasToolActivity: false,
 +        attemptCommitted: false,
-+        attemptHasAssistantOutput: false,
++        attemptNeedsReset: false,
 +        attemptPartIDs: [],
          currentText: undefined,
          reasoningMap: {},
        }
-@@ -128,6 +166,20 @@ export const layer = Layer.effect(
+       let aborted = false
+       const slog = log.clone().tag("session.id", input.sessionID).tag("messageID", input.assistantMessage.id)
++      let replayState = captureReplayState()
+ 
+       const parse = (e: unknown) =>
+         MessageV2.fromError(e, {
+@@ -128,6 +200,55 @@ export const layer = Layer.effect(
            aborted,
          })
  
++      function captureReplayState(): ReplayState {
++        return {
++          finish: ctx.assistantMessage.finish,
++          cost: ctx.assistantMessage.cost,
++          tokens: cloneTokens(ctx.assistantMessage.tokens),
++          snapshot: ctx.snapshot,
++          needsCompaction: ctx.needsCompaction,
++        }
++      }
++
++      function restoreReplayState() {
++        ctx.assistantMessage.finish = replayState.finish
++        ctx.assistantMessage.cost = replayState.cost
++        ctx.assistantMessage.tokens = cloneTokens(replayState.tokens)
++        ctx.snapshot = replayState.snapshot
++        ctx.needsCompaction = replayState.needsCompaction
++      }
++
 +      function rememberAttemptPart(partID: PartID) {
 +        if (ctx.attemptPartIDs.includes(partID)) return
 +        ctx.attemptPartIDs.push(partID)
 +      }
 +
-+      function resetAttemptState() {
++      function resetReplayGuardState() {
 +        ctx.attemptHasToolActivity = false
 +        ctx.attemptCommitted = false
-+        ctx.attemptHasAssistantOutput = false
 +        ctx.attemptPartIDs = []
++        replayState = captureReplayState()
++      }
++
++      function commitToolBoundary() {
++        ctx.requestHasCommittedToolBoundary = true
++        resetReplayGuardState()
++        ctx.attemptNeedsReset = false
++      }
++
++      function resetAttemptState() {
++        resetReplayGuardState()
++        ctx.attemptNeedsReset = false
 +        ctx.currentText = undefined
 +        ctx.reasoningMap = {}
++      }
++
++      function resetAttemptIfNeeded() {
++        if (!ctx.attemptNeedsReset) return
++        resetReplayGuardState()
++        ctx.attemptNeedsReset = false
 +      }
 +
        const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
          const done = ctx.toolcalls[toolCallID]?.done
          delete ctx.toolcalls[toolCallID]
-@@ -323,13 +375,16 @@ export const layer = Layer.effect(
+@@ -188,6 +309,7 @@ export const layer = Layer.effect(
+             attachments: output.attachments,
+           },
+         })
++        commitToolBoundary()
+         yield* settleToolCall(toolCallID)
+       })
+ 
+@@ -206,6 +328,7 @@ export const layer = Layer.effect(
+         if (error instanceof Permission.RejectedError || error instanceof Question.RejectedError) {
+           ctx.blocked = ctx.shouldBreak
+         }
++        commitToolBoundary()
+         yield* settleToolCall(toolCallID)
+         return true
+       })
+@@ -305,6 +428,7 @@ export const layer = Layer.effect(
+       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
+         switch (value.type) {
+           case "reasoning-start":
++            resetAttemptIfNeeded()
+             if (value.id in ctx.reasoningMap) return
+             // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
+             if (flags.experimentalEventSystem) {
+@@ -323,13 +447,16 @@ export const layer = Layer.effect(
                time: { start: Date.now() },
                metadata: value.providerMetadata,
              }
@@ -581,25 +805,15 @@ index a287c3b00..63d6f2b67 100644
              return
  
            case "reasoning-delta":
++            resetAttemptIfNeeded()
              // Match dev: silently drop orphan deltas (no preceding reasoning-start).
              if (!(value.id in ctx.reasoningMap)) return
 -            ctx.reasoningMap[value.id].text += value.text
 +            appendChunkedText(ctx.reasoningMap[value.id], value.text)
-+            ctx.attemptHasAssistantOutput = true
              if (value.providerMetadata) ctx.reasoningMap[value.id].metadata = value.providerMetadata
              yield* session.updatePartDelta({
                sessionID: ctx.reasoningMap[value.id].sessionID,
-@@ -344,6 +399,9 @@ export const layer = Layer.effect(
-             if (value.providerMetadata && value.id in ctx.reasoningMap) {
-               ctx.reasoningMap[value.id].metadata = value.providerMetadata
-             }
-+            if (value.id in ctx.reasoningMap && ctx.reasoningMap[value.id].text.length > 0) {
-+              ctx.attemptHasAssistantOutput = true
-+            }
-             yield* finishReasoning(value.id)
-             return
- 
-@@ -351,6 +409,7 @@ export const layer = Layer.effect(
+@@ -351,6 +478,7 @@ export const layer = Layer.effect(
              if (ctx.assistantMessage.summary) {
                throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
              }
@@ -607,7 +821,7 @@ index a287c3b00..63d6f2b67 100644
              yield* ensureToolCall(value)
              return
  
-@@ -360,6 +419,7 @@ export const layer = Layer.effect(
+@@ -360,6 +488,7 @@ export const layer = Layer.effect(
              return
  
            case "tool-input-end": {
@@ -615,7 +829,7 @@ index a287c3b00..63d6f2b67 100644
              const toolCall = yield* ensureToolCall(value)
              // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
              if (flags.experimentalEventSystem) {
-@@ -378,6 +438,7 @@ export const layer = Layer.effect(
+@@ -378,6 +507,7 @@ export const layer = Layer.effect(
              if (ctx.assistantMessage.summary) {
                throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
              }
@@ -623,7 +837,7 @@ index a287c3b00..63d6f2b67 100644
              const toolCall = yield* ensureToolCall(value)
              const input = toolInput(value.input)
              if (!toolCall.call.inputEnded) {
-@@ -450,6 +511,7 @@ export const layer = Layer.effect(
+@@ -450,6 +580,7 @@ export const layer = Layer.effect(
            }
  
            case "tool-result": {
@@ -631,7 +845,7 @@ index a287c3b00..63d6f2b67 100644
              const toolCall = yield* readToolCall(value.id)
              const rawOutput = toolResultOutput(value)
              const normalized = yield* Effect.forEach(rawOutput.attachments ?? [], (attachment) =>
-@@ -502,6 +564,7 @@ export const layer = Layer.effect(
+@@ -502,6 +633,7 @@ export const layer = Layer.effect(
            }
  
            case "tool-error": {
@@ -639,7 +853,15 @@ index a287c3b00..63d6f2b67 100644
              const toolCall = yield* readToolCall(value.id)
              // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
              if (flags.experimentalEventSystem) {
-@@ -543,16 +606,19 @@ export const layer = Layer.effect(
+@@ -526,6 +658,7 @@ export const layer = Layer.effect(
+             throw new Error(value.message)
+ 
+           case "step-start":
++            resetAttemptIfNeeded()
+             if (!ctx.snapshot) ctx.snapshot = yield* snapshot.track()
+             if (!ctx.assistantMessage.summary) {
+               // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
+@@ -543,16 +676,19 @@ export const layer = Layer.effect(
                  })
                }
              }
@@ -660,7 +882,54 @@ index a287c3b00..63d6f2b67 100644
              const completedSnapshot = yield* snapshot.track()
              yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
              const usage = Session.getUsage({
-@@ -635,12 +701,15 @@ export const layer = Layer.effect(
+@@ -576,8 +712,9 @@ export const layer = Layer.effect(
+             ctx.assistantMessage.finish = value.reason
+             ctx.assistantMessage.cost += usage.cost
+             ctx.assistantMessage.tokens = usage.tokens
++            const stepFinishID = PartID.ascending()
+             yield* session.updatePart({
+-              id: PartID.ascending(),
++              id: stepFinishID,
+               reason: value.reason,
+               snapshot: completedSnapshot,
+               messageID: ctx.assistantMessage.id,
+@@ -586,18 +723,21 @@ export const layer = Layer.effect(
+               tokens: usage.tokens,
+               cost: usage.cost,
+             })
++            rememberAttemptPart(stepFinishID)
+             yield* session.updateMessage(ctx.assistantMessage)
+             if (ctx.snapshot) {
+               const patch = yield* snapshot.patch(ctx.snapshot)
+               if (patch.files.length) {
++                const patchPartID = PartID.ascending()
+                 yield* session.updatePart({
+-                  id: PartID.ascending(),
++                  id: patchPartID,
+                   messageID: ctx.assistantMessage.id,
+                   sessionID: ctx.sessionID,
+                   type: "patch",
+                   hash: patch.hash,
+                   files: patch.files,
+                 })
++                rememberAttemptPart(patchPartID)
+               }
+               ctx.snapshot = undefined
+             }
+@@ -613,10 +753,12 @@ export const layer = Layer.effect(
+             ) {
+               ctx.needsCompaction = true
+             }
++            ctx.attemptNeedsReset = true
+             return
+           }
+ 
+           case "text-start":
++            resetAttemptIfNeeded()
+             if (!ctx.assistantMessage.summary) {
+               // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
+               if (flags.experimentalEventSystem) {
+@@ -635,12 +777,15 @@ export const layer = Layer.effect(
                time: { start: Date.now() },
                metadata: value.providerMetadata,
              }
@@ -670,87 +939,179 @@ index a287c3b00..63d6f2b67 100644
              return
  
            case "text-delta":
++            resetAttemptIfNeeded()
              if (!ctx.currentText) return
 -            ctx.currentText.text += value.text
 +            appendChunkedText(ctx.currentText, value.text)
-+            ctx.attemptHasAssistantOutput = true
              if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
              yield* session.updatePartDelta({
                sessionID: ctx.currentText.sessionID,
-@@ -674,6 +743,7 @@ export const layer = Layer.effect(
-                 })
-               }
-             }
-+            if (ctx.currentText.text.length > 0) ctx.attemptHasAssistantOutput = true
-             {
-               const end = Date.now()
-               ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
-@@ -777,6 +847,43 @@ export const layer = Layer.effect(
+@@ -750,7 +895,8 @@ export const layer = Layer.effect(
+ 
+       const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
+         slog.error("process", { error: errorMessage(e), stack: e instanceof Error ? e.stack : undefined })
+-        const error = parse(e)
++        const source = e instanceof StopAfterUnsafeToolActivity ? (e.cause ?? e) : e
++        const error = parse(source)
+         if (MessageV2.ContextOverflowError.isInstance(error)) {
+           ctx.needsCompaction = true
+           yield* bus.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
+@@ -777,15 +923,88 @@ export const layer = Layer.effect(
          yield* status.set(ctx.sessionID, { type: "idle" })
        })
  
-+      const rollbackRetryableStreamError = (error: unknown) =>
++      const rollbackCurrentAttempt = Effect.fn("SessionProcessor.rollbackCurrentAttempt")(function* () {
++        if (ctx.attemptPartIDs.length === 0) {
++          restoreReplayState()
++          yield* session.updateMessage(ctx.assistantMessage)
++          resetAttemptState()
++          return
++        }
++
++        yield* Effect.forEach(
++          [...ctx.attemptPartIDs].reverse(),
++          (partID) =>
++            session.removePart({
++              sessionID: ctx.sessionID,
++              messageID: ctx.assistantMessage.id,
++              partID,
++            }),
++          { discard: true },
++        )
++        restoreReplayState()
++        yield* session.updateMessage(ctx.assistantMessage)
++        resetAttemptState()
++      })
++
++      const recoverRetryableError = (error: unknown) =>
 +        Effect.gen(function* () {
++          const retryable =
++            error instanceof ProviderError.ResponseStreamError
++              ? { message: error.message }
++              : SessionRetry.retryable(parse(error), input.model.providerID)
++          if (!retryable) return error
++
++          if (error instanceof ProviderError.ResponseStreamError && unsafeTerminalFailure(error)) return error
++
++          if (ctx.blocked) {
++            return new StopAfterBlockedToolBoundary(retryable.message, { cause: error })
++          }
++
++          if (ctx.attemptHasToolActivity) {
++            return new StopAfterUnsafeToolActivity(retryable.message, { cause: error })
++          }
++
++          if (ctx.requestHasCommittedToolBoundary) {
++            yield* rollbackCurrentAttempt()
++            return new ResumeFromPromptLoop(retryable.message, { cause: error })
++          }
++
 +          if (!(error instanceof ProviderError.ResponseStreamError)) return error
 +          if (error.info.autoReplaySafe) return error
-+          if (ctx.attemptHasToolActivity) return error
 +          if (ctx.attemptCommitted) return error
-+          if (!ctx.attemptHasAssistantOutput) return error
 +          if (ctx.attemptPartIDs.length === 0) return error
 +
-+          yield* Effect.forEach(
-+            [...ctx.attemptPartIDs].reverse(),
-+            (partID) =>
-+              session.removePart({
-+                sessionID: ctx.sessionID,
-+                messageID: ctx.assistantMessage.id,
-+                partID,
-+              }),
-+            { discard: true },
-+          )
-+          resetAttemptState()
++          yield* rollbackCurrentAttempt()
 +          return new ProviderError.ResponseStreamError(
 +            error.message,
 +            { ...error.info, autoReplaySafe: true },
 +            { cause: error },
 +          )
 +        }).pipe(
-+          Effect.catchIf(
-+            () => true,
-+            (rollbackError) => {
-+              slog.warn("rollback retryable stream error failed", {
-+                error: errorMessage(rollbackError),
-+              })
-+              return Effect.succeed(error)
-+            },
-+          ),
++          Effect.catchCause((cause) => {
++            const rollbackError = Cause.squash(cause)
++            slog.warn("rollback retryable stream error failed", {
++              error: errorMessage(rollbackError),
++            })
++            if (ctx.requestHasCommittedToolBoundary) {
++              return Effect.succeed(
++                new StopAfterRollbackFailure(errorMessage(rollbackError), {
++                  cause: rollbackError,
++                }),
++              )
++            }
++            return Effect.succeed(error)
++          }),
 +        )
 +
        const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
          slog.info("process")
          ctx.needsCompaction = false
-@@ -784,8 +891,7 @@ export const layer = Layer.effect(
+         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
  
          return yield* Effect.gen(function* () {
-           yield* Effect.gen(function* () {
+-          yield* Effect.gen(function* () {
 -            ctx.currentText = undefined
 -            ctx.reasoningMap = {}
++          const outcome = yield* Effect.gen(function* () {
 +            resetAttemptState()
              yield* status.set(ctx.sessionID, { type: "busy" })
              const stream = llm.stream(streamInput)
  
-@@ -807,6 +913,11 @@ export const layer = Layer.effect(
+@@ -807,6 +1026,27 @@ export const layer = Layer.effect(
                (cause) => !Cause.hasInterruptsOnly(cause),
                (cause) => Effect.fail(Cause.squash(cause)),
              ),
 +            Effect.catchIf(() => true, (error) =>
 +              Effect.gen(function* () {
-+                return yield* Effect.fail(yield* rollbackRetryableStreamError(error))
++                return yield* Effect.fail(yield* recoverRetryableError(error))
 +              }),
++            ),
++            Effect.catchIf(
++              (error) => error instanceof ResumeFromPromptLoop,
++              () => Effect.succeed("resume" as const),
++            ),
++            Effect.catchIf(
++              (error) => error instanceof StopAfterBlockedToolBoundary,
++              () => Effect.succeed("stop" as const),
++            ),
++            Effect.catchIf(
++              (error) => error instanceof StopAfterUnsafeToolActivity,
++              (error) => halt(error.cause ?? error).pipe(Effect.as("stop" as const)),
++            ),
++            Effect.catchIf(
++              (error) => error instanceof StopAfterRollbackFailure,
++              (error) => halt(error.cause ?? error).pipe(Effect.as("stop" as const)),
 +            ),
              Effect.retry(
                SessionRetry.policy({
                  provider: input.model.providerID,
+@@ -838,10 +1078,12 @@ export const layer = Layer.effect(
+                 },
+               }),
+             ),
++            Effect.map((outcome) => outcome ?? ("continue" as const)),
+             Effect.catch(halt),
+             Effect.ensuring(cleanup()),
+           )
+ 
++          if (outcome === "resume") return "resume"
+           if (ctx.needsCompaction) return "compact"
+           if (ctx.blocked || ctx.assistantMessage.error) return "stop"
+           return "continue"
+@@ -862,6 +1104,10 @@ export const layer = Layer.effect(
+   }),
+ )
+ 
++function unsafeTerminalFailure(error: ProviderError.ResponseStreamError) {
++  return error.info.terminalEvent === "response.failed" && !error.info.autoReplaySafe
++}
++
+ export const defaultLayer = Layer.suspend(() =>
+   layer.pipe(
+     Layer.provide(Session.defaultLayer),
+diff --git a/packages/opencode/src/session/prompt.ts b/packages/opencode/src/session/prompt.ts
+index 22fe4d81c..0aff65340 100644
+--- a/packages/opencode/src/session/prompt.ts
++++ b/packages/opencode/src/session/prompt.ts
+@@ -1474,6 +1474,7 @@ export const layer = Layer.effect(
+             }
+ 
+             if (result === "stop") return "break" as const
++            if (result === "resume") return "continue" as const
+             if (result === "compact") {
+               yield* compaction.create({
+                 sessionID,
 diff --git a/packages/opencode/src/session/retry.ts b/packages/opencode/src/session/retry.ts
 index 463bc27a9..e4ea0cc8f 100644
 --- a/packages/opencode/src/session/retry.ts
@@ -870,7 +1231,7 @@ index 1278e1cfb..e6af5a412 100644
      expect(experimentalWebSocketsEnabled({ enabled: true, channel: "prod" })).toBe(true)
    })
 diff --git a/packages/opencode/test/plugin/openai-ws.test.ts b/packages/opencode/test/plugin/openai-ws.test.ts
-index dcb31199c..d644585a8 100644
+index dcb31199c..9379ba793 100644
 --- a/packages/opencode/test/plugin/openai-ws.test.ts
 +++ b/packages/opencode/test/plugin/openai-ws.test.ts
 @@ -72,7 +72,7 @@ describe("plugin.openai.ws", () => {
@@ -882,7 +1243,7 @@ index dcb31199c..d644585a8 100644
          socket.close(1000, "done")
        })
      })
-@@ -89,13 +89,73 @@ describe("plugin.openai.ws", () => {
+@@ -89,13 +89,278 @@ describe("plugin.openai.ws", () => {
      })
  
      expect(await response.text()).toBe(
@@ -917,6 +1278,211 @@ index dcb31199c..d644585a8 100644
 +      transport: "websocket",
 +      phase: "before_first_event",
 +      autoReplaySafe: true,
++    })
++  })
++
++  test("treats response.failed as a retryable stream failure before the first event", async () => {
++    const terminal: Record<string, unknown>[] = []
++    const invalid: ProviderError.ResponseStreamError[] = []
++    await using server = await createWebSocketServer((socket) => {
++      socket.once("message", () => {
++        socket.send(
++          JSON.stringify({
++            type: "response.failed",
++            response: {
++              id: "resp_123",
++              status: "failed",
++              error: {
++                code: "server_error",
++                message: "The model failed to generate a response.",
++              },
++            },
++          }),
++        )
++      })
++    })
++
++    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
++    const response = OpenAIWebSocket.streamResponsesWebSocket({
++      socket,
++      body: { stream: true, input: "hi" },
++      onTerminal: (event) => terminal.push(event),
++      onConnectionInvalid: (error) => invalid.push(error),
++    })
++
++    expect((await readTextError(response.text())).message).toContain(
++      "OpenAI response failed (server_error): The model failed to generate a response.",
++    )
++    expect(terminal.map((event) => event.type)).toEqual(["response.failed"])
++    expect(invalid[0]?.info).toEqual({
++      transport: "websocket",
++      phase: "before_first_event",
++      autoReplaySafe: true,
++      terminalEvent: "response.failed",
++    })
++  })
++
++  test("keeps lifecycle-only response.failed safe for replay", async () => {
++    const invalid: ProviderError.ResponseStreamError[] = []
++    await using server = await createWebSocketServer((socket) => {
++      socket.once("message", () => {
++        socket.send(
++          JSON.stringify({
++            type: "response.created",
++            response: { id: "resp_123", created_at: 1, model: "test" },
++          }),
++        )
++        socket.send(
++          JSON.stringify({
++            type: "response.failed",
++            response: {
++              id: "resp_123",
++              status: "failed",
++              error: {
++                code: "server_error",
++                message: "The model failed to generate a response.",
++              },
++            },
++          }),
++        )
++      })
++    })
++
++    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
++    const response = OpenAIWebSocket.streamResponsesWebSocket({
++      socket,
++      body: { stream: true, input: "hi" },
++      onConnectionInvalid: (error) => invalid.push(error),
++    })
++
++    expect((await readTextError(response.text())).message).toContain("OpenAI response failed")
++    expect(invalid[0]?.info).toEqual({
++      transport: "websocket",
++      phase: "before_first_event",
++      autoReplaySafe: true,
++      terminalEvent: "response.failed",
++    })
++  })
++
++  test("uses response.error details when top-level response.failed error is generic", async () => {
++    await using server = await createWebSocketServer((socket) => {
++      socket.once("message", () => {
++        socket.send(
++          JSON.stringify({
++            type: "response.failed",
++            error: { type: "server_error" },
++            response: {
++              id: "resp_123",
++              status: "failed",
++              error: {
++                code: "upstream_error",
++                message: "Upstream provider error",
++              },
++            },
++          }),
++        )
++      })
++    })
++
++    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
++    const response = OpenAIWebSocket.streamResponsesWebSocket({
++      socket,
++      body: { stream: true, input: "hi" },
++    })
++
++    expect((await readTextError(response.text())).message).toContain(
++      "OpenAI response failed (upstream_error): Upstream provider error",
++    )
++  })
++
++  test("combines split response.failed error details", async () => {
++    await using server = await createWebSocketServer((socket) => {
++      socket.once("message", () => {
++        socket.send(
++          JSON.stringify({
++            type: "response.failed",
++            error: { code: "upstream_error" },
++            response: {
++              id: "resp_123",
++              status: "failed",
++              error: { message: "Upstream provider error" },
++            },
++          }),
++        )
++      })
++    })
++
++    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
++    const response = OpenAIWebSocket.streamResponsesWebSocket({
++      socket,
++      body: { stream: true, input: "hi" },
++    })
++
++    expect((await readTextError(response.text())).message).toContain(
++      "OpenAI response failed (upstream_error): Upstream provider error",
++    )
++  })
++
++  test("marks response.failed after emitted content unsafe to replay", async () => {
++    const terminal: Record<string, unknown>[] = []
++    const invalid: ProviderError.ResponseStreamError[] = []
++    await using server = await createWebSocketServer((socket) => {
++      socket.once("message", () => {
++        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "partial" }))
++        socket.send(
++          JSON.stringify({
++            type: "response.failed",
++            error: {
++              code: "upstream_error",
++              message: "Upstream provider error",
++            },
++          }),
++        )
++      })
++    })
++
++    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
++    const response = OpenAIWebSocket.streamResponsesWebSocket({
++      socket,
++      body: { stream: true, input: "hi" },
++      onTerminal: (event) => terminal.push(event),
++      onConnectionInvalid: (error) => invalid.push(error),
++    })
++
++    expect((await readTextError(response.text())).message).toContain(
++      "OpenAI response failed (upstream_error): Upstream provider error",
++    )
++    expect(terminal.map((event) => event.type)).toEqual(["response.failed"])
++    expect(invalid[0]?.info).toEqual({
++      transport: "websocket",
++      phase: "after_first_event",
++      autoReplaySafe: false,
++      terminalEvent: "response.failed",
++    })
++  })
++
++  test("marks response.failed after reasoning output unsafe to replay", async () => {
++    const invalid: ProviderError.ResponseStreamError[] = []
++    await using server = await createWebSocketServer((socket) => {
++      socket.once("message", () => {
++        socket.send(JSON.stringify({ type: "response.reasoning_text.delta", delta: "thinking" }))
++        socket.send(JSON.stringify({ type: "response.failed" }))
++      })
++    })
++
++    const socket = await OpenAIWebSocket.connectResponsesWebSocket({ url: server.wsUrl, headers: {} })
++    const response = OpenAIWebSocket.streamResponsesWebSocket({
++      socket,
++      body: { stream: true, input: "hi" },
++      onConnectionInvalid: (error) => invalid.push(error),
++    })
++
++    expect((await readTextError(response.text())).message).toContain("OpenAI response failed")
++    expect(invalid[0]?.info).toEqual({
++      transport: "websocket",
++      phase: "after_first_event",
++      autoReplaySafe: false,
++      terminalEvent: "response.failed",
 +    })
 +  })
 +
@@ -957,7 +1523,7 @@ index dcb31199c..d644585a8 100644
    test("errors the SSE stream when the server closes before a terminal event", async () => {
      const invalid: Error[] = []
      await using server = await createWebSocketServer((socket) => {
-@@ -187,7 +247,7 @@ describe("plugin.openai.ws-pool", () => {
+@@ -187,7 +452,7 @@ describe("plugin.openai.ws-pool", () => {
      fetch.close()
    })
  
@@ -966,7 +1532,7 @@ index dcb31199c..d644585a8 100644
      const attempts: string[] = []
      await using server = await createRejectingWebSocketServer(() => attempts.push("websocket"))
      const fetch = OpenAIWebSocketPool.createWebSocketFetch({
-@@ -197,16 +257,17 @@ describe("plugin.openai.ws-pool", () => {
+@@ -197,16 +462,17 @@ describe("plugin.openai.ws-pool", () => {
      })
  
      const first = await fetch(server.url, streamRequest({ [TITLE_HEADER]: "false" }))
@@ -987,21 +1553,93 @@ index dcb31199c..d644585a8 100644
      fetch.close()
    })
  
-@@ -244,7 +305,7 @@ describe("plugin.openai.ws-pool", () => {
+@@ -231,12 +497,24 @@ describe("plugin.openai.ws-pool", () => {
+     fetch.close()
+   })
+ 
+-  test("invalidates but does not reuse a socket after terminal failure frames", async () => {
++  test("falls back to HTTP after response.failed before the first event", async () => {
+     let connections = 0
+     await using server = await createWebSocketServer((socket) => {
+       connections += 1
+       socket.once("message", () => {
+-        socket.send(JSON.stringify({ type: connections === 1 ? "response.failed" : "response.completed" }))
++        socket.send(
++          JSON.stringify({
++            type: "response.failed",
++            response: {
++              id: "resp_123",
++              status: "failed",
++              error: {
++                code: "server_error",
++                message: "The model failed to generate a response.",
++              },
++            },
++          }),
++        )
+       })
+     })
+     const fetch = OpenAIWebSocketPool.createWebSocketFetch({
+@@ -244,37 +522,75 @@ describe("plugin.openai.ws-pool", () => {
      })
  
      const first = await fetch(server.url, streamRequest())
 -    expect(await first.text()).toContain('data: {"type":"response.failed"}')
++    const second = await fetch(server.url, streamRequest())
++
++    expect(await first.text()).toBe("http")
++    expect(await second.text()).toBe("http")
++    expect(connections).toBe(1)
++    expect(server.httpRequests).toHaveLength(2)
++    fetch.close()
++  })
++
++  test("activates HTTP fallback after lifecycle-only response.failed", async () => {
++    let connections = 0
++    await using server = await createWebSocketServer((socket) => {
++      connections += 1
++      socket.once("message", () => {
++        socket.send(
++          JSON.stringify({
++            type: "response.created",
++            response: { id: "resp_123", created_at: 1, model: "test" },
++          }),
++        )
++        socket.send(
++          JSON.stringify({
++            type: "response.failed",
++            response: {
++              id: "resp_123",
++              status: "failed",
++              error: {
++                code: "server_error",
++                message: "The model failed to generate a response.",
++              },
++            },
++          }),
++        )
++      })
++    })
++    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
++      url: server.url,
++    })
++
++    const first = await fetch(server.url, streamRequest())
 +    expect((await readTextError(first.text())).message).toContain("OpenAI response failed")
  
      const second = await fetch(server.url, streamRequest())
-     expect(await second.text()).toContain('data: {"type":"response.completed"}')
-@@ -253,28 +314,22 @@ describe("plugin.openai.ws-pool", () => {
+-    expect(await second.text()).toContain('data: {"type":"response.completed"}')
+-    expect(connections).toBe(2)
+-    expect(server.httpRequests).toHaveLength(0)
++
++    expect(await second.text()).toBe("http")
++    expect(connections).toBe(1)
++    expect(server.httpRequests).toHaveLength(1)
      fetch.close()
    })
  
 -  test("retries websocket connection limit errors on the next stream attempt", async () => {
-+  test("falls back to HTTP after a websocket connection limit error", async () => {
++  test("does not fall back to HTTP for the current response after output response.failed", async () => {
      let connections = 0
 -    let messages = 0
      await using server = await createWebSocketServer((socket) => {
@@ -1013,35 +1651,38 @@ index dcb31199c..d644585a8 100644
 -            JSON.stringify({
 -              type: "error",
 -              status: 400,
--              error: {
++        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "partial" }))
++        socket.send(
++          JSON.stringify({
++            type: "response.failed",
++            response: {
++              id: "resp_123",
++              status: "failed",
+               error: {
 -                type: "invalid_request_error",
 -                code: "websocket_connection_limit_reached",
 -                message: "Responses websocket connection limit reached",
--              },
++                code: "server_error",
++                message: "The model failed to generate a response.",
+               },
 -            }),
 -          )
 -          return
 -        }
 -        socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_retry" } }))
-+        socket.send(
-+          JSON.stringify({
-+            type: "error",
-+            status: 400,
-+            error: {
-+              type: "invalid_request_error",
-+              code: "websocket_connection_limit_reached",
-+              message: "Responses websocket connection limit reached",
 +            },
 +          }),
 +        )
        })
      })
      const fetch = OpenAIWebSocketPool.createWebSocketFetch({
-@@ -282,20 +337,16 @@ describe("plugin.openai.ws-pool", () => {
+@@ -282,20 +598,17 @@ describe("plugin.openai.ws-pool", () => {
      })
  
      const first = await fetch(server.url, streamRequest())
 -    expect((await readTextError(first.text())).message).toContain("Responses websocket connection limit reached")
++    expect((await readTextError(first.text())).message).toContain("OpenAI response failed")
++
      const second = await fetch(server.url, streamRequest())
 -    const text = await second.text()
  
@@ -1051,30 +1692,26 @@ index dcb31199c..d644585a8 100644
 -    expect(connections).toBe(2)
 -    expect(messages).toBe(2)
 -    expect(server.httpRequests).toHaveLength(0)
-+    expect(await first.text()).toBe("http")
 +    expect(await second.text()).toBe("http")
 +    expect(connections).toBe(1)
-+    expect(server.httpRequests).toHaveLength(2)
++    expect(server.httpRequests).toHaveLength(1)
      fetch.close()
    })
  
 -  test("falls back to HTTP after websocket connection limit retries are exhausted", async () => {
-+  test("prunes HTTP fallback after a websocket connection limit error", async () => {
++  test("falls back to HTTP after a websocket connection limit error", async () => {
      let connections = 0
      await using server = await createWebSocketServer((socket) => {
        connections += 1
-@@ -315,42 +366,28 @@ describe("plugin.openai.ws-pool", () => {
+@@ -315,37 +628,29 @@ describe("plugin.openai.ws-pool", () => {
      })
      const fetch = OpenAIWebSocketPool.createWebSocketFetch({
        url: server.url,
-+      idleTimeout: 20,
-       streamRetries: 2,
+-      streamRetries: 2,
      })
  
      const first = await fetch(server.url, streamRequest())
 -    expect((await readTextError(first.text())).message).toContain("Responses websocket connection limit reached")
-+    expect(await first.text()).toBe("http")
-+    await new Promise((resolve) => setTimeout(resolve, 50))
      const second = await fetch(server.url, streamRequest())
 -    expect((await readTextError(second.text())).message).toContain("Responses websocket connection limit reached")
 -    const third = await fetch(server.url, streamRequest())
@@ -1083,14 +1720,15 @@ index dcb31199c..d644585a8 100644
 -    expect(await third.text()).toBe("http")
 -    expect(await fourth.text()).toBe("http")
 -    expect(connections).toBe(3)
++    expect(await first.text()).toBe("http")
 +    expect(await second.text()).toBe("http")
-+    expect(connections).toBe(2)
++    expect(connections).toBe(1)
      expect(server.httpRequests).toHaveLength(2)
      fetch.close()
    })
  
 -  test("shares the websocket retry budget across stream and connection limit failures", async () => {
-+  test("uses sticky HTTP fallback after a websocket failure mid-stream", async () => {
++  test("prunes HTTP fallback after a websocket connection limit error", async () => {
      let connections = 0
      await using server = await createWebSocketServer((socket) => {
        connections += 1
@@ -1100,52 +1738,46 @@ index dcb31199c..d644585a8 100644
 -          socket.terminate()
 -          return
 -        }
--        socket.send(
--          JSON.stringify({
--            type: "error",
--            error: {
--              code: "websocket_connection_limit_reached",
--              message: "Responses websocket connection limit reached",
--            },
--          }),
--        )
-+        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
-+        setTimeout(() => socket.terminate(), 5)
-       })
+         socket.send(
+           JSON.stringify({
+             type: "error",
++            status: 400,
+             error: {
++              type: "invalid_request_error",
+               code: "websocket_connection_limit_reached",
+               message: "Responses websocket connection limit reached",
+             },
+@@ -355,98 +660,125 @@ describe("plugin.openai.ws-pool", () => {
      })
      const fetch = OpenAIWebSocketPool.createWebSocketFetch({
-@@ -361,42 +398,54 @@ describe("plugin.openai.ws-pool", () => {
+       url: server.url,
+-      streamRetries: 1,
++      idleTimeout: 20,
++      streamRetries: 2,
+     })
+ 
      const first = await fetch(server.url, streamRequest())
-     expect((await readTextError(first.text())).message).toContain("WebSocket closed before response.completed")
+-    expect((await readTextError(first.text())).message).toContain("WebSocket closed before response.completed")
++    expect(await first.text()).toBe("http")
++    await new Promise((resolve) => setTimeout(resolve, 50))
      const second = await fetch(server.url, streamRequest())
-+    const third = await fetch(server.url, streamRequest())
  
      expect(await second.text()).toBe("http")
--    expect(connections).toBe(2)
+     expect(connections).toBe(2)
 -    expect(server.httpRequests).toHaveLength(1)
-+    expect(await third.text()).toBe("http")
-+    expect(connections).toBe(1)
 +    expect(server.httpRequests).toHaveLength(2)
      fetch.close()
    })
  
 -  test("retries websocket idle failures before first event then falls back to HTTP", async () => {
-+  test("uses sticky HTTP fallback after a transport error frame mid-stream", async () => {
++  test("uses sticky HTTP fallback after a websocket failure mid-stream", async () => {
      let connections = 0
      await using server = await createWebSocketServer((socket) => {
        connections += 1
 -      socket.once("message", () => {})
 +      socket.once("message", () => {
 +        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
-+        socket.send(
-+          JSON.stringify({
-+            type: "error",
-+            error: {
-+              code: "stream_incomplete",
-+              message: "Upstream websocket closed before response.completed",
-+            },
-+          }),
-+        )
++        setTimeout(() => socket.terminate(), 5)
 +      })
      })
      const fetch = OpenAIWebSocketPool.createWebSocketFetch({
@@ -1156,7 +1788,7 @@ index dcb31199c..d644585a8 100644
  
      const first = await fetch(server.url, streamRequest())
 -    expect((await readTextError(first.text())).message).toContain("idle timeout waiting for websocket")
-+    expect((await readTextError(first.text())).message).toContain("Upstream websocket closed before response.completed")
++    expect((await readTextError(first.text())).message).toContain("WebSocket closed before response.completed")
      const second = await fetch(server.url, streamRequest())
      const third = await fetch(server.url, streamRequest())
  
@@ -1169,41 +1801,50 @@ index dcb31199c..d644585a8 100644
    })
  
 -  test("retries failed websocket streams before using HTTP fallback", async () => {
-+  test("falls back to HTTP when websocket idles before the first event", async () => {
++  test("uses sticky HTTP fallback after a transport error frame mid-stream", async () => {
 +    let connections = 0
      await using server = await createWebSocketServer((socket) => {
--      socket.once("message", () => {
--        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
--      })
 +      connections += 1
-+      socket.once("message", () => {})
+       socket.once("message", () => {
+         socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
++        socket.send(
++          JSON.stringify({
++            type: "error",
++            error: {
++              code: "stream_incomplete",
++              message: "Upstream websocket closed before response.completed",
++            },
++          }),
++        )
+       })
      })
      const fetch = OpenAIWebSocketPool.createWebSocketFetch({
        url: server.url,
-@@ -405,48 +454,37 @@ describe("plugin.openai.ws-pool", () => {
+-      idleTimeout: 20,
+       streamRetries: 1,
      })
  
      const first = await fetch(server.url, streamRequest())
 -    expect((await readTextError(first.text())).message).toContain("idle timeout waiting for websocket")
++    expect((await readTextError(first.text())).message).toContain("Upstream websocket closed before response.completed")
      const second = await fetch(server.url, streamRequest())
 -    expect((await readTextError(second.text())).message).toContain("idle timeout waiting for websocket")
      const third = await fetch(server.url, streamRequest())
  
-+    expect(await first.text()).toBe("http")
 +    expect(await second.text()).toBe("http")
      expect(await third.text()).toBe("http")
 -    expect(server.httpRequests).toHaveLength(1)
 +    expect(connections).toBe(1)
-+    expect(server.httpRequests).toHaveLength(3)
++    expect(server.httpRequests).toHaveLength(2)
      fetch.close()
    })
  
 -  test("resets websocket stream failures after a completed response", async () => {
--    let connections = 0
++  test("falls back to HTTP when websocket idles before the first event", async () => {
+     let connections = 0
 -    let requests = 0
-+  test("does not replay a websocket stream after output has started", async () => {
      await using server = await createWebSocketServer((socket) => {
--      connections += 1
+       connections += 1
 -      socket.on("message", () => {
 -        requests += 1
 -        if (requests === 1 || requests === 3) {
@@ -1212,6 +1853,28 @@ index dcb31199c..d644585a8 100644
 -          return
 -        }
 -        socket.send(JSON.stringify({ type: "response.completed", response: { id: `resp_${requests}` } }))
++      socket.once("message", () => {})
++    })
++    const fetch = OpenAIWebSocketPool.createWebSocketFetch({
++      url: server.url,
++      idleTimeout: 20,
++      streamRetries: 1,
++    })
++
++    const first = await fetch(server.url, streamRequest())
++    const second = await fetch(server.url, streamRequest())
++    const third = await fetch(server.url, streamRequest())
++
++    expect(await first.text()).toBe("http")
++    expect(await second.text()).toBe("http")
++    expect(await third.text()).toBe("http")
++    expect(connections).toBe(1)
++    expect(server.httpRequests).toHaveLength(3)
++    fetch.close()
++  })
++
++  test("does not replay a websocket stream after output has started", async () => {
++    await using server = await createWebSocketServer((socket) => {
 +      socket.once("message", () => {
 +        socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "started" }))
        })
@@ -1241,7 +1904,7 @@ index dcb31199c..d644585a8 100644
      fetch.close()
    })
  
-@@ -515,7 +553,7 @@ describe("plugin.openai.ws-pool", () => {
+@@ -515,7 +847,7 @@ describe("plugin.openai.ws-pool", () => {
      fetch.close()
    })
  
@@ -1250,7 +1913,7 @@ index dcb31199c..d644585a8 100644
      let connections = 0
      await using server = await createWebSocketServer((socket) => {
        connections += 1
-@@ -529,13 +567,11 @@ describe("plugin.openai.ws-pool", () => {
+@@ -529,13 +861,11 @@ describe("plugin.openai.ws-pool", () => {
      })
  
      const first = await fetch(server.url, streamRequest())
@@ -1405,10 +2068,38 @@ index dad1987de..9f6ba2ad2 100644
    const sessionID = "test-session-123"
  
 diff --git a/packages/opencode/test/session/processor-effect.test.ts b/packages/opencode/test/session/processor-effect.test.ts
-index ede122297..33a90c3b6 100644
+index ede122297..71c72b120 100644
 --- a/packages/opencode/test/session/processor-effect.test.ts
 +++ b/packages/opencode/test/session/processor-effect.test.ts
-@@ -76,6 +76,10 @@ const cfg = {
+@@ -1,7 +1,8 @@
+ import { NodeFileSystem } from "@effect/platform-node"
+ import { expect } from "bun:test"
+-import { tool } from "ai"
+-import { Cause, Effect, Exit, Fiber, Layer } from "effect"
++import { APICallError, tool } from "ai"
++import { LLMEvent } from "@opencode-ai/llm"
++import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
+ import path from "path"
+ import z from "zod"
+ import type { Agent } from "../../src/agent/agent"
+@@ -11,6 +12,7 @@ import { Config } from "@/config/config"
+ import { Image } from "@/image/image"
+ import { Permission } from "../../src/permission"
+ import { Plugin } from "../../src/plugin"
++import { ProviderError } from "../../src/provider/error"
+ import { Provider } from "@/provider/provider"
+ import { ModelID, ProviderID } from "../../src/provider/schema"
+ import { Session } from "@/session/session"
+@@ -23,7 +25,7 @@ import { SessionSummary } from "../../src/session/summary"
+ import { Snapshot } from "../../src/snapshot"
+ import * as Log from "@opencode-ai/core/util/log"
+ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+-import { provideTmpdirServer } from "../fixture/fixture"
++import { provideTmpdirInstance, provideTmpdirServer } from "../fixture/fixture"
+ import { testEffect } from "../lib/effect"
+ import { raw, reply, TestLLMServer } from "../lib/llm-server"
+ import { SyncEvent } from "@/sync"
+@@ -76,6 +78,10 @@ const cfg = {
  }
  
  function providerCfg(url: string) {
@@ -1419,7 +2110,7 @@ index ede122297..33a90c3b6 100644
    return {
      ...cfg,
      provider: {
-@@ -85,6 +89,7 @@ function providerCfg(url: string) {
+@@ -85,6 +91,7 @@ function providerCfg(url: string) {
          options: {
            ...cfg.provider.test.options,
            baseURL: url,
@@ -1427,7 +2118,103 @@ index ede122297..33a90c3b6 100644
          },
        },
      },
-@@ -620,6 +625,98 @@ it.live("session.processor effect tests publish retry status updates", () =>
+@@ -172,30 +179,56 @@ const assistant = Effect.fn("TestSession.assistant")(function* (
+ 
+ const status = SessionStatus.layer.pipe(Layer.provideMerge(Bus.layer))
+ const infra = Layer.mergeAll(NodeFileSystem.layer, CrossSpawnSpawner.defaultLayer)
+-const deps = Layer.mergeAll(
+-  Session.defaultLayer,
++const baseDepsWithoutSession = Layer.mergeAll(
+   Snapshot.defaultLayer,
+   AgentSvc.defaultLayer,
+   Permission.defaultLayer,
+   Plugin.defaultLayer,
+   Config.defaultLayer,
+-  LLM.defaultLayer,
+   Provider.defaultLayer,
+   status,
+   SyncEvent.defaultLayer,
+   EventV2Bridge.defaultLayer,
+ ).pipe(Layer.provideMerge(infra))
+-const env = Layer.mergeAll(
+-  TestLLMServer.layer,
+-  SessionProcessor.layer.pipe(
++
++const baseDeps = Layer.mergeAll(Session.defaultLayer, baseDepsWithoutSession)
++
++function processorLayer(
++  llmLayer: Layer.Layer<LLM.Service>,
++  sessionLayer: Layer.Layer<Session.Service> = Session.defaultLayer,
++) {
++  return SessionProcessor.layer.pipe(
+     Layer.provide(summary),
+     Layer.provide(Image.defaultLayer),
+     Layer.provide(RuntimeFlags.layer({ experimentalEventSystem: true })),
+-    Layer.provideMerge(deps),
+-  ),
+-)
++    Layer.provideMerge(Layer.mergeAll(sessionLayer, baseDepsWithoutSession, llmLayer)),
++  )
++}
++
++function rollbackFailureSessionLayer() {
++  let failed = false
++  return Layer.effect(
++    Session.Service,
++    Effect.gen(function* () {
++      const session = yield* Session.Service
++      return Session.Service.of({
++        ...session,
++        removePart: (input: Parameters<Session.Interface["removePart"]>[0]) =>
++          failed
++            ? session.removePart(input)
++            : Effect.sync(() => {
++                failed = true
++                throw new Error("rollback remove failed")
++              }),
++      })
++    }),
++  ).pipe(Layer.provide(Session.defaultLayer), Layer.provideMerge(baseDepsWithoutSession))
++}
++
++const env = Layer.mergeAll(TestLLMServer.layer, processorLayer(LLM.defaultLayer))
+ 
+ const it = testEffect(env)
++const isolatedIt = testEffect(CrossSpawnSpawner.defaultLayer)
+ 
+ const boot = Effect.fn("test.boot")(function* () {
+   const processors = yield* SessionProcessor.Service
+@@ -204,6 +237,29 @@ const boot = Effect.fn("test.boot")(function* () {
+   return { processors, session, provider }
+ })
+ 
++function llmStub() {
++  const queue: Array<Stream.Stream<LLMEvent, unknown>> = []
++  let calls = 0
++
++  return {
++    push(...streams: Array<Stream.Stream<LLMEvent, unknown>>) {
++      queue.push(...streams)
++    },
++    get calls() {
++      return calls
++    },
++    layer: Layer.succeed(
++      LLM.Service,
++      LLM.Service.of({
++        stream: () => {
++          calls += 1
++          return queue.shift() ?? Stream.empty
++        },
++      }),
++    ),
++  }
++}
++
+ // ---------------------------------------------------------------------------
+ // Tests
+ // ---------------------------------------------------------------------------
+@@ -620,6 +676,1109 @@ it.live("session.processor effect tests publish retry status updates", () =>
    ),
  )
  
@@ -1480,7 +2267,1018 @@ index ede122297..33a90c3b6 100644
 +  ),
 +)
 +
-+it.live("session.processor effect tests do not retry partial output after tool activity", () =>
++isolatedIt.live("session.processor effect tests resume from rebuilt history after a post-tool stream failure", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
++            LLMEvent.toolResult({
++              id: "call_1",
++              name: "lookup",
++              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
++            }),
++            LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }),
++            LLMEvent.stepStart({ index: 1 }),
++            LLMEvent.textStart({ id: "text_1" }),
++            LLMEvent.textDelta({ id: "text_1", text: "partial" }),
++          ).pipe(
++            Stream.concat(
++              Stream.fail(
++                new ProviderError.ResponseStreamError("Upstream websocket closed before response.completed", {
++                  transport: "websocket",
++                  phase: "after_first_event",
++                  autoReplaySafe: false,
++                }),
++              ),
++            ),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "retry after tool step")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const input = {
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies MessageV2.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "retry after tool step" }],
++            tools: {},
++          } satisfies LLM.StreamInput
++
++          const value = yield* handle.process(input)
++
++          expect(value).toBe("resume")
++          expect(llm.calls).toBe(1)
++          expect(handle.message.error).toBeUndefined()
++          expect(handle.message.finish).toBe("tool-calls")
++
++          const resumed = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const history = yield* MessageV2.filterCompactedEffect(chat.id)
++          const resumedHandle = yield* processors.create({
++            assistantMessage: resumed,
++            sessionID: chat.id,
++            model: mdl,
++          })
++          const resumedValue = yield* resumedHandle.process({
++            ...input,
++            messages: yield* MessageV2.toModelMessagesEffect(history, mdl),
++          })
++
++          const firstParts = MessageV2.parts(msg.id)
++          const resumedParts = MessageV2.parts(resumed.id)
++          const toolParts = (yield* MessageV2.filterCompactedEffect(chat.id))
++            .flatMap((entry) => entry.parts)
++            .filter((part): part is MessageV2.ToolPart => part.type === "tool")
++
++          expect(resumedValue).toBe("continue")
++          expect(llm.calls).toBe(2)
++          expect(firstParts.filter((part) => part.type === "step-start")).toHaveLength(1)
++          expect(firstParts.filter((part): part is MessageV2.TextPart => part.type === "text").map((part) => part.text)).toEqual([])
++          expect(resumedParts.filter((part) => part.type === "tool")).toHaveLength(0)
++          expect(toolParts).toHaveLength(1)
++          expect(toolParts[0]?.state.status).toBe("completed")
++          expect(resumedHandle.message.error).toBeUndefined()
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests do not resume unsafe response.failed after model output", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
++            LLMEvent.toolResult({
++              id: "call_1",
++              name: "lookup",
++              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
++            }),
++            LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }),
++            LLMEvent.stepStart({ index: 1 }),
++            LLMEvent.textStart({ id: "text_1" }),
++            LLMEvent.textDelta({ id: "text_1", text: "partial" }),
++          ).pipe(
++            Stream.concat(
++              Stream.fail(
++                new ProviderError.ResponseStreamError("OpenAI response failed (server_error): failed", {
++                  transport: "websocket",
++                  phase: "after_first_event",
++                  autoReplaySafe: false,
++                  terminalEvent: "response.failed",
++                }),
++              ),
++            ),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "do not retry response.failed after output")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies MessageV2.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "do not retry response.failed after output" }],
++            tools: {},
++          })
++
++          const parts = MessageV2.parts(msg.id)
++          const text = parts.find((part): part is MessageV2.TextPart => part.type === "text")
++
++          expect(value).toBe("stop")
++          expect(llm.calls).toBe(1)
++          expect(text?.text).toBe("partial")
++          expect(MessageV2.APIError.isInstance(handle.message.error)).toBe(true)
++          if (MessageV2.APIError.isInstance(handle.message.error)) {
++            expect(handle.message.error.data.metadata?.terminalEvent).toBe("response.failed")
++            expect(handle.message.error.data.metadata?.autoReplaySafe).toBe("false")
++          }
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests resume immediately after a completed tool result", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
++            LLMEvent.toolResult({
++              id: "call_1",
++              name: "lookup",
++              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
++            }),
++          ).pipe(
++            Stream.concat(
++              Stream.fail(
++                new ProviderError.ResponseStreamError("Upstream websocket closed before response.completed", {
++                  transport: "websocket",
++                  phase: "after_first_event",
++                  autoReplaySafe: false,
++                }),
++              ),
++            ),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "retry immediately after tool result")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies MessageV2.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "retry immediately after tool result" }],
++            tools: {},
++          })
++
++          const parts = MessageV2.parts(msg.id)
++          const toolPart = parts.find((part): part is MessageV2.ToolPart => part.type === "tool")
++
++          expect(value).toBe("resume")
++          expect(llm.calls).toBe(1)
++          expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
++          expect(parts.filter((part): part is MessageV2.TextPart => part.type === "text").map((part) => part.text)).toEqual([])
++          expect(toolPart?.state.status).toBe("completed")
++          expect(handle.message.error).toBeUndefined()
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests do not retry plain-text rate limit errors after a completed tool boundary", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
++            LLMEvent.toolResult({
++              id: "call_1",
++              name: "lookup",
++              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
++            }),
++          ).pipe(Stream.concat(Stream.fail(new Error("Too many requests")))),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "retry plain text after tool result")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies MessageV2.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "retry plain text after tool result" }],
++            tools: {},
++          })
++
++          expect(value).toBe("resume")
++          expect(llm.calls).toBe(1)
++          expect(handle.message.error).toBeUndefined()
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests resume immediately after a completed tool result on retryable HTTP failure", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
++            LLMEvent.toolResult({
++              id: "call_1",
++              name: "lookup",
++              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
++            }),
++          ).pipe(
++            Stream.concat(
++              Stream.fail(
++                new APICallError({
++                  message: "boom",
++                  url: "https://example.com/v1/chat/completions",
++                  requestBodyValues: {},
++                  statusCode: 500,
++                  responseHeaders: { "content-type": "application/json" },
++                  responseBody: '{"error":"boom"}',
++                  isRetryable: true,
++                }),
++              ),
++            ),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "retry http after tool result")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies MessageV2.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "retry http after tool result" }],
++            tools: {},
++          })
++
++          const parts = MessageV2.parts(msg.id)
++          const toolPart = parts.find((part): part is MessageV2.ToolPart => part.type === "tool")
++
++          expect(value).toBe("resume")
++          expect(llm.calls).toBe(1)
++          expect(toolPart?.state.status).toBe("completed")
++          expect(parts.filter((part): part is MessageV2.TextPart => part.type === "text").map((part) => part.text)).toEqual([])
++          expect(handle.message.error).toBeUndefined()
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests resume after post-finish tool results", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
++            LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }),
++            LLMEvent.toolResult({
++              id: "call_1",
++              name: "lookup",
++              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
++            }),
++            LLMEvent.stepStart({ index: 1 }),
++            LLMEvent.textStart({ id: "text_1" }),
++            LLMEvent.textDelta({ id: "text_1", text: "partial" }),
++          ).pipe(
++            Stream.concat(
++              Stream.fail(
++                new ProviderError.ResponseStreamError("Upstream websocket closed before response.completed", {
++                  transport: "websocket",
++                  phase: "after_first_event",
++                  autoReplaySafe: false,
++                }),
++              ),
++            ),
++          ),
++          Stream.make(
++            LLMEvent.stepStart({ index: 1 }),
++            LLMEvent.textStart({ id: "text_2" }),
++            LLMEvent.textDelta({ id: "text_2", text: "after" }),
++            LLMEvent.textEnd({ id: "text_2" }),
++            LLMEvent.stepFinish({ index: 1, reason: "stop", usage: { inputTokens: 5, outputTokens: 8, totalTokens: 13 } }),
++            LLMEvent.finish({ reason: "stop", usage: { inputTokens: 5, outputTokens: 8, totalTokens: 13 } }),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "retry after post-finish tool result")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies MessageV2.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "retry after post-finish tool result" }],
++            tools: {},
++          })
++
++          const parts = MessageV2.parts(msg.id)
++
++          expect(value).toBe("resume")
++          expect(llm.calls).toBe(1)
++          expect(parts.filter((part): part is MessageV2.TextPart => part.type === "text").map((part) => part.text)).toEqual([])
++          expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
++          expect(parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
++          expect(handle.message.error).toBeUndefined()
++          expect(handle.message.finish).toBe("tool-calls")
++          expect(handle.message.tokens).toEqual({
++            input: 1,
++            output: 1,
++            total: 2,
++            reasoning: 0,
++            cache: { read: 0, write: 0 },
++          })
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests stop when committed-boundary rollback fails", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
++            LLMEvent.toolResult({
++              id: "call_1",
++              name: "lookup",
++              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
++            }),
++            LLMEvent.stepStart({ index: 1 }),
++            LLMEvent.textStart({ id: "text_1" }),
++            LLMEvent.textDelta({ id: "text_1", text: "partial" }),
++          ).pipe(Stream.concat(Stream.fail(new Error("Too many requests")))),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "rollback failure after tool")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies MessageV2.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "rollback failure after tool" }],
++            tools: {},
++          })
++
++          expect(value).toBe("stop")
++          expect(llm.calls).toBe(1)
++          expect(handle.message.error).toBeDefined()
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer, rollbackFailureSessionLayer())))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests resume after a durable tool error boundary", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
++            LLMEvent.toolError({
++              id: "call_1",
++              name: "lookup",
++              message: "lookup failed",
++              error: new Error("lookup failed"),
++            }),
++          ).pipe(
++            Stream.concat(
++              Stream.fail(
++                new ProviderError.ResponseStreamError("Upstream websocket closed before response.completed", {
++                  transport: "websocket",
++                  phase: "after_first_event",
++                  autoReplaySafe: false,
++                }),
++              ),
++            ),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "retry after tool error")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies MessageV2.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "retry after tool error" }],
++            tools: {},
++          })
++
++          const parts = MessageV2.parts(msg.id)
++          const toolPart = parts.find((part): part is MessageV2.ToolPart => part.type === "tool")
++
++          expect(value).toBe("resume")
++          expect(llm.calls).toBe(1)
++          expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
++          expect(parts.filter((part): part is MessageV2.TextPart => part.type === "text").map((part) => part.text)).toEqual([])
++          expect(toolPart?.state.status).toBe("error")
++          expect(handle.message.error).toBeUndefined()
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests do not resume when a new tool step is in flight after a committed boundary", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
++            LLMEvent.toolResult({
++              id: "call_1",
++              name: "lookup",
++              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
++            }),
++            LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }),
++            LLMEvent.stepStart({ index: 1 }),
++            LLMEvent.toolCall({ id: "call_2", name: "lookup", input: { query: "forecast" } }),
++          ).pipe(
++            Stream.concat(
++              Stream.fail(
++                new ProviderError.ResponseStreamError("Upstream websocket closed before response.completed", {
++                  transport: "websocket",
++                  phase: "after_first_event",
++                  autoReplaySafe: false,
++                }),
++              ),
++            ),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "retry during new tool step")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies MessageV2.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "retry during new tool step" }],
++            tools: {},
++          })
++
++          const parts = MessageV2.parts(msg.id)
++          const completed = parts.find(
++            (part): part is MessageV2.ToolPart =>
++              part.type === "tool" && part.callID === "call_1" && part.state.status === "completed",
++          )
++          const interrupted = parts.find(
++            (part): part is MessageV2.ToolPart =>
++              part.type === "tool" && part.callID === "call_2" && part.state.status === "error",
++          )
++
++          expect(value).toBe("stop")
++          expect(llm.calls).toBe(1)
++          expect(completed?.state.status).toBe("completed")
++          expect(interrupted?.state.status).toBe("error")
++          if (interrupted?.state.status === "error") {
++            expect(interrupted.state.error).toBe("Tool execution aborted")
++            expect(interrupted.state.metadata?.interrupted).toBe(true)
++          }
++          expect(handle.message.error).toBeDefined()
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests do not retry API failures during a new tool step after a committed boundary", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
++            LLMEvent.toolResult({
++              id: "call_1",
++              name: "lookup",
++              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
++            }),
++            LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }),
++            LLMEvent.stepStart({ index: 1 }),
++            LLMEvent.toolCall({ id: "call_2", name: "lookup", input: { query: "forecast" } }),
++          ).pipe(
++            Stream.concat(
++              Stream.fail(
++                new APICallError({
++                  message: "boom",
++                  url: "https://example.com/v1/chat/completions",
++                  requestBodyValues: {},
++                  statusCode: 500,
++                  responseHeaders: { "content-type": "application/json" },
++                  responseBody: '{"error":"boom"}',
++                  isRetryable: true,
++                }),
++              ),
++            ),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "retry api during new tool step")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies MessageV2.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "retry api during new tool step" }],
++            tools: {},
++          })
++
++          const parts = MessageV2.parts(msg.id)
++          const completed = parts.find(
++            (part): part is MessageV2.ToolPart =>
++              part.type === "tool" && part.callID === "call_1" && part.state.status === "completed",
++          )
++          const interrupted = parts.find(
++            (part): part is MessageV2.ToolPart =>
++              part.type === "tool" && part.callID === "call_2" && part.state.status === "error",
++          )
++
++          expect(value).toBe("stop")
++          expect(llm.calls).toBe(1)
++          expect(completed?.state.status).toBe("completed")
++          expect(interrupted?.state.status).toBe("error")
++          if (interrupted?.state.status === "error") {
++            expect(interrupted.state.error).toBe("Tool execution aborted")
++            expect(interrupted.state.metadata?.interrupted).toBe(true)
++          }
++          expect(handle.message.error?.name).toBe("APIError")
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests do not retry plain-text rate limit errors during a new tool step", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
++            LLMEvent.toolResult({
++              id: "call_1",
++              name: "lookup",
++              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
++            }),
++            LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }),
++            LLMEvent.stepStart({ index: 1 }),
++            LLMEvent.toolCall({ id: "call_2", name: "lookup", input: { query: "forecast" } }),
++          ).pipe(Stream.concat(Stream.fail(new Error("Too many requests")))),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "retry plain text during new tool step")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies MessageV2.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "retry plain text during new tool step" }],
++            tools: {},
++          })
++
++          expect(value).toBe("stop")
++          expect(llm.calls).toBe(1)
++          expect(handle.message.error).toBeDefined()
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests stop after denied tool boundary even when a retryable failure follows", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
++            LLMEvent.toolResult({
++              id: "call_1",
++              name: "lookup",
++              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
++            }),
++            LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }),
++            LLMEvent.stepStart({ index: 1 }),
++            LLMEvent.toolCall({ id: "call_2", name: "lookup", input: { query: "forecast" } }),
++            LLMEvent.toolError({
++              id: "call_2",
++              name: "lookup",
++              message: "permission denied",
++              error: new Permission.RejectedError(),
++            }),
++          ).pipe(
++            Stream.concat(
++              Stream.fail(
++                new ProviderError.ResponseStreamError("Upstream websocket closed before response.completed", {
++                  transport: "websocket",
++                  phase: "after_first_event",
++                  autoReplaySafe: false,
++                }),
++              ),
++            ),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "retry after denied tool")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies MessageV2.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "retry after denied tool" }],
++            tools: {},
++          })
++
++          const parts = MessageV2.parts(msg.id)
++          const denied = parts.find(
++            (part): part is MessageV2.ToolPart =>
++              part.type === "tool" && part.callID === "call_2" && part.state.status === "error",
++          )
++
++          expect(value).toBe("stop")
++          expect(llm.calls).toBe(1)
++          expect(denied?.state.status).toBe("error")
++          expect(handle.message.error).toBeUndefined()
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests do not retry plain-text rate limit errors after a denied tool", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
++            LLMEvent.toolResult({
++              id: "call_1",
++              name: "lookup",
++              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
++            }),
++            LLMEvent.stepFinish({ index: 0, reason: "tool-calls", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } }),
++            LLMEvent.stepStart({ index: 1 }),
++            LLMEvent.toolCall({ id: "call_2", name: "lookup", input: { query: "forecast" } }),
++            LLMEvent.toolError({
++              id: "call_2",
++              name: "lookup",
++              message: "permission denied",
++              error: new Permission.RejectedError(),
++            }),
++          ).pipe(Stream.concat(Stream.fail(new Error("Too many requests")))),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "retry plain text after denied tool")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies MessageV2.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "retry plain text after denied tool" }],
++            tools: {},
++          })
++
++          expect(value).toBe("stop")
++          expect(llm.calls).toBe(1)
++          expect(handle.message.error).toBeUndefined()
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++it.live("session.processor effect tests do not retry partial output after tool activity in the current step", () =>
 +  provideTmpdirServer(
 +    ({ dir, llm }) =>
 +      Effect.gen(function* () {
@@ -1526,6 +3324,62 @@ index ede122297..33a90c3b6 100644
  it.live("session.processor effect tests compact on structured context overflow", () =>
    provideTmpdirServer(
      ({ dir, llm }) =>
+diff --git a/packages/opencode/test/session/prompt.test.ts b/packages/opencode/test/session/prompt.test.ts
+index 4c4647457..8d4ac3b43 100644
+--- a/packages/opencode/test/session/prompt.test.ts
++++ b/packages/opencode/test/session/prompt.test.ts
+@@ -51,7 +51,7 @@ import { Reference } from "../../src/reference/reference"
+ import { RepositoryCache } from "../../src/reference/repository-cache"
+ import { TestInstance } from "../fixture/fixture"
+ import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
+-import { reply, TestLLMServer } from "../lib/llm-server"
++import { httpError, reply, TestLLMServer } from "../lib/llm-server"
+ import { SyncEvent } from "@/sync"
+ import { RuntimeFlags } from "@/effect/runtime-flags"
+ import { EventV2Bridge } from "@/event-v2-bridge"
+@@ -715,6 +715,42 @@ it.instance("loop continues when finish is stop but assistant has tool parts", (
+   }),
+ )
+ 
++it.instance("loop continues after a retryable follow-up HTTP failure without re-running the tool", () =>
++  Effect.gen(function* () {
++    const { llm } = yield* useServerConfig(providerCfg)
++    const prompt = yield* SessionPrompt.Service
++    const sessions = yield* Session.Service
++    const session = yield* sessions.create({
++      title: "Pinned",
++      permission: [{ permission: "*", pattern: "*", action: "allow" }],
++    })
++    yield* prompt.prompt({
++      sessionID: session.id,
++      agent: "build",
++      noReply: true,
++      parts: [{ type: "text", text: "hello" }],
++    })
++    yield* llm.push(
++      reply().tool("first", { value: "first" }).item(),
++      httpError(500, { type: "error", error: { message: "Internal server error" } }),
++      reply().text("second").stop().item(),
++    )
++
++    const result = yield* prompt.loop({ sessionID: session.id })
++    const msgs = yield* MessageV2.filterCompactedEffect(session.id)
++    const toolParts = msgs.flatMap((msg) => msg.parts).filter((part): part is MessageV2.ToolPart => part.type === "tool")
++
++    expect(yield* llm.calls).toBe(3)
++    expect(result.info.role).toBe("assistant")
++    if (result.info.role === "assistant") {
++      expect(result.parts.some((part) => part.type === "text" && part.text === "second")).toBe(true)
++      expect(result.info.finish).toBe("stop")
++    }
++    expect(toolParts).toHaveLength(1)
++    expect(toolParts[0]?.state.status).toBe("completed")
++  }),
++)
++
+ it.instance("failed subtask preserves metadata on error tool state", () =>
+   Effect.gen(function* () {
+     const { llm } = yield* useServerConfig((url) => ({
 diff --git a/packages/opencode/test/session/retry.test.ts b/packages/opencode/test/session/retry.test.ts
 index e1cbec036..53f857f09 100644
 --- a/packages/opencode/test/session/retry.test.ts
