@@ -1,3 +1,135 @@
+diff --git a/packages/llm/src/protocols/openai-responses.ts b/packages/llm/src/protocols/openai-responses.ts
+index ad673a263..09651393b 100644
+--- a/packages/llm/src/protocols/openai-responses.ts
++++ b/packages/llm/src/protocols/openai-responses.ts
+@@ -193,11 +193,11 @@ const OpenAIResponsesStreamItem = Schema.Struct({
+ })
+ type OpenAIResponsesStreamItem = Schema.Schema.Type<typeof OpenAIResponsesStreamItem>
+ 
+-// OpenAI Responses surfaces provider failures in two related shapes. The
+-// streaming `error` event carries the details at the top level
+-// (`{ type: "error", code, message, param, sequence_number }`), while
+-// `response.failed` carries them under `response.error`. We capture both so
+-// the parser can surface a useful provider-error message in either path.
++// OpenAI Responses surfaces provider failures in several related shapes. The
++// streaming `error` event can carry the details at the top level
++// (`{ type: "error", code, message, param }`) or under `error`, while
++// `response.failed` carries them under `response.error`. We capture all three
++// so the parser can surface a useful provider-error message in each path.
+ const OpenAIResponsesErrorPayload = Schema.Struct({
+   code: optionalNull(Schema.String),
+   message: optionalNull(Schema.String),
+@@ -222,6 +222,7 @@ const OpenAIResponsesEvent = Schema.Struct({
+       [Schema.Record(Schema.String, Schema.Unknown)],
+     ),
+   ),
++  error: optionalNull(OpenAIResponsesErrorPayload),
+   code: Schema.optional(Schema.String),
+   message: Schema.optional(Schema.String),
+   param: Schema.optional(Schema.String),
+@@ -837,13 +838,25 @@ const onResponseFinish = (state: ParserState, event: OpenAIResponsesEvent): Step
+ // the bare message — production rate limits and context-length failures used
+ // to be indistinguishable from generic stream drops.
+ const providerErrorMessage = (event: OpenAIResponsesEvent, fallback: string): string => {
++  const direct = event.error ?? undefined
+   const nested = event.response?.error ?? undefined
+-  const message = event.message || nested?.message || undefined
+-  const code = event.code || nested?.code || undefined
++  const message = event.message || direct?.message || nested?.message || undefined
++  const code = event.code || direct?.code || nested?.code || undefined
+   if (message && code) return `${code}: ${message}`
+   return message || code || fallback
+ }
+ 
++const isStreamIncompleteProviderError = (event: OpenAIResponsesEvent) => {
++  const direct = event.error ?? undefined
++  const nested = event.response?.error ?? undefined
++  const code = event.code || direct?.code || nested?.code || undefined
++  const message = event.message || direct?.message || nested?.message || undefined
++  return [code, message].some(
++    (value) =>
++      typeof value === "string" && (/stream[_ ]incomplete/i.test(value) || /before\s+response\.completed/i.test(value)),
++  )
++}
++
+ const onResponseFailed = (state: ParserState, event: OpenAIResponsesEvent): StepResult => [
+   state,
+   [LLMEvent.providerError({ message: providerErrorMessage(event, "OpenAI Responses response failed") })],
+@@ -851,7 +864,12 @@ const onResponseFailed = (state: ParserState, event: OpenAIResponsesEvent): Step
+ 
+ const onError = (state: ParserState, event: OpenAIResponsesEvent): StepResult => [
+   state,
+-  [LLMEvent.providerError({ message: providerErrorMessage(event, "OpenAI Responses stream error") })],
++  [
++    LLMEvent.providerError({
++      message: providerErrorMessage(event, "OpenAI Responses stream error"),
++      ...(isStreamIncompleteProviderError(event) ? { retryable: true } : {}),
++    }),
++  ],
+ ]
+ 
+ const step = (state: ParserState, event: OpenAIResponsesEvent) => {
+diff --git a/packages/llm/test/provider/openai-responses.test.ts b/packages/llm/test/provider/openai-responses.test.ts
+index dd57d00a9..29c52d127 100644
+--- a/packages/llm/test/provider/openai-responses.test.ts
++++ b/packages/llm/test/provider/openai-responses.test.ts
+@@ -1137,6 +1137,56 @@ describe("OpenAI Responses route", () => {
+     }),
+   )
+ 
++  it.effect("marks stream_incomplete error events retryable", () =>
++    Effect.gen(function* () {
++      const response = yield* LLMClient.generate(request).pipe(
++        Effect.provide(
++          fixedResponse(
++            sseEvents({
++              type: "error",
++              code: "stream_incomplete",
++              message: "Upstream websocket closed before response.completed",
++            }),
++          ),
++        ),
++      )
++
++      expect(response.events).toEqual([
++        {
++          type: "provider-error",
++          message: "stream_incomplete: Upstream websocket closed before response.completed",
++          retryable: true,
++        },
++      ])
++    }),
++  )
++
++  it.effect("marks websocket-shaped stream_incomplete error objects retryable", () =>
++    Effect.gen(function* () {
++      const response = yield* LLMClient.generate(request).pipe(
++        Effect.provide(
++          fixedResponse(
++            sseEvents({
++              type: "error",
++              error: {
++                code: "stream_incomplete",
++                message: "Upstream websocket closed before response.completed",
++              },
++            }),
++          ),
++        ),
++      )
++
++      expect(response.events).toEqual([
++        {
++          type: "provider-error",
++          message: "stream_incomplete: Upstream websocket closed before response.completed",
++          retryable: true,
++        },
++      ])
++    }),
++  )
++
+   it.effect("falls back to error code when no message is present", () =>
+     Effect.gen(function* () {
+       const response = yield* LLMClient.generate(request).pipe(
 diff --git a/packages/opencode/src/plugin/index.ts b/packages/opencode/src/plugin/index.ts
 index 717dff8db..131312fac 100644
 --- a/packages/opencode/src/plugin/index.ts
@@ -562,10 +694,34 @@ index ea55bb2ce..4adfb9c11 100644
      result["reasoningSummary"] = "auto"
      return result
 diff --git a/packages/opencode/src/session/compaction.ts b/packages/opencode/src/session/compaction.ts
-index 4f87edf64..fcc98f1db 100644
+index 4f87edf64..c7dfe7344 100644
 --- a/packages/opencode/src/session/compaction.ts
 +++ b/packages/opencode/src/session/compaction.ts
-@@ -559,7 +559,8 @@ export const layer = Layer.effect(
+@@ -195,6 +195,7 @@ export interface Interface {
+     sessionID: SessionID
+     auto: boolean
+     overflow?: boolean
++    wasCancelled?: Effect.Effect<boolean>
+   }) => Effect.Effect<"continue" | "stop">
+   readonly create: (input: {
+     sessionID: SessionID
+@@ -347,6 +348,7 @@ export const layer = Layer.effect(
+       sessionID: SessionID
+       auto: boolean
+       overflow?: boolean
++      wasCancelled?: Effect.Effect<boolean>
+     }) {
+       const parent = input.messages.findLast((m) => m.info.id === input.parentID)
+       if (!parent || parent.info.role !== "user") {
+@@ -439,6 +441,7 @@ export const layer = Layer.effect(
+         assistantMessage: msg,
+         sessionID: input.sessionID,
+         model,
++        wasCancelled: input.wasCancelled,
+       })
+       const result = yield* processor.process({
+         user: userMessage,
+@@ -559,7 +562,8 @@ export const layer = Layer.effect(
        }
  
        if (processor.message.error) return "stop"
@@ -575,7 +731,7 @@ index 4f87edf64..fcc98f1db 100644
          const summary = summaryText(
            (yield* session.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)).find(
              (item) => item.info.id === msg.id,
-@@ -578,7 +579,7 @@ export const layer = Layer.effect(
+@@ -578,7 +582,7 @@ export const layer = Layer.effect(
          }
          yield* bus.publish(Event.Compacted, { sessionID: input.sessionID })
        }
@@ -585,10 +741,154 @@ index 4f87edf64..fcc98f1db 100644
  
      const create = Effect.fn("SessionCompaction.create")(function* (input: {
 diff --git a/packages/opencode/src/session/message-v2.ts b/packages/opencode/src/session/message-v2.ts
-index 68157f5f4..4a11336ff 100644
+index 68157f5f4..fe8007bbb 100644
 --- a/packages/opencode/src/session/message-v2.ts
 +++ b/packages/opencode/src/session/message-v2.ts
-@@ -1159,9 +1159,13 @@ export function fromError(
+@@ -741,15 +741,13 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
+ 
+     if (msg.info.role === "assistant") {
+       const differentModel = `${model.providerID}/${model.id}` !== `${msg.info.providerID}/${msg.info.modelID}`
++      const aborted = msg.info.error && AbortedError.isInstance(msg.info.error)
+       const media: Array<{ mime: string; url: string; filename?: string }> = []
+ 
+-      if (
+-        msg.info.error &&
+-        !(
+-          AbortedError.isInstance(msg.info.error) &&
+-          msg.parts.some((part) => part.type !== "step-start" && part.type !== "reasoning")
+-        )
+-      ) {
++      if (msg.info.error && !aborted) {
++        continue
++      }
++      if (aborted && !msg.parts.some(replayableAbortedToolPart)) {
+         continue
+       }
+       const assistantMessage: UIMessage = {
+@@ -774,6 +772,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
+       })
+       for (const part of msg.parts) {
+         if (part.type === "text") {
++          if (aborted) continue
+           const text = part.text === "" && hasSignedReasoning ? " " : part.text
+           assistantMessage.parts.push({
+             type: "text",
+@@ -781,7 +780,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
+             ...(differentModel ? {} : { providerMetadata: part.metadata }),
+           })
+         }
+-        if (part.type === "step-start")
++        if (part.type === "step-start" && !aborted)
+           assistantMessage.parts.push({
+             type: "step-start",
+           })
+@@ -821,6 +820,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
+             })
+           }
+           if (part.state.status === "error") {
++            if (aborted && part.state.metadata?.interrupted === true) continue
+             const output = part.state.metadata?.interrupted === true ? part.state.metadata.output : undefined
+             if (typeof output === "string") {
+               assistantMessage.parts.push({
+@@ -846,7 +846,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
+           }
+           // Handle pending/running tool calls to prevent dangling tool_use blocks
+           // Anthropic/Claude APIs require every tool_use to have a corresponding tool_result
+-          if (part.state.status === "pending" || part.state.status === "running")
++          if (!aborted && (part.state.status === "pending" || part.state.status === "running"))
+             assistantMessage.parts.push({
+               type: ("tool-" + part.tool) as `tool-${string}`,
+               state: "output-error",
+@@ -858,6 +858,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
+             })
+         }
+         if (part.type === "reasoning") {
++          if (aborted) continue
+           if (differentModel) {
+             if (part.text.trim().length > 0)
+               assistantMessage.parts.push({
+@@ -920,6 +921,13 @@ export function toModelMessages(
+   return Effect.runPromise(toModelMessagesEffect(input, model, options).pipe(Effect.provide(EffectLogger.layer)))
+ }
+ 
++function replayableAbortedToolPart(part: Part) {
++  return (
++    part.type === "tool" &&
++    (part.state.status === "completed" || (part.state.status === "error" && part.state.metadata?.interrupted !== true))
++  )
++}
++
+ export const page = Effect.fn("MessageV2.page")(function* (input: {
+   sessionID: SessionID
+   limit: number
+@@ -1093,10 +1101,49 @@ export function latest(msgs: WithParts[]) {
+   return { user, assistant, finished, tasks }
+ }
+ 
++function headerTimeoutError(error: unknown) {
++  if (error instanceof ProviderError.HeaderTimeoutError) {
++    return {
++      message: error.message,
++      code: error.name,
++      timeoutMs: error.ms,
++    }
++  }
++  if (error instanceof Error && error.name === "AbortError") {
++    const match = error.message.match(/^Provider response headers timed out after (\d+)ms$/)
++    if (match) {
++      return {
++        message: error.message,
++        code: error.name,
++        timeoutMs: Number(match[1]),
++      }
++    }
++  }
++  return undefined
++}
++
+ export function fromError(
+   e: unknown,
+-  ctx: { providerID: ProviderID; aborted?: boolean },
++  ctx: { providerID: ProviderID; aborted?: boolean; userCancelled?: boolean },
+ ): NonNullable<Assistant["error"]> {
++  const headerTimeout = headerTimeoutError(e)
++  if (headerTimeout) {
++    if (ctx.userCancelled === true) {
++      return new AbortedError({ message: headerTimeout.message }, { cause: e }).toObject()
++    }
++    return new APIError(
++      {
++        message: headerTimeout.message,
++        isRetryable: true,
++        metadata: {
++          code: headerTimeout.code,
++          ...(headerTimeout.timeoutMs === undefined ? {} : { timeoutMs: String(headerTimeout.timeoutMs) }),
++        },
++      },
++      { cause: e },
++    ).toObject()
++  }
++
+   switch (true) {
+     case e instanceof DOMException && e.name === "AbortError":
+       return new AbortedError(
+@@ -1143,25 +1190,17 @@ export function fromError(
+         },
+         { cause: e },
+       ).toObject()
+-    case e instanceof ProviderError.HeaderTimeoutError:
+-      return new APIError(
+-        {
+-          message: e.message,
+-          isRetryable: true,
+-          metadata: {
+-            code: e.name,
+-            timeoutMs: String(e.ms),
+-          },
+-        },
+-        { cause: e },
+-      ).toObject()
+     case e instanceof ProviderError.ResponseStreamError:
        return new APIError(
          {
            message: e.message,
@@ -604,7 +904,7 @@ index 68157f5f4..4a11336ff 100644
          },
          { cause: e },
 diff --git a/packages/opencode/src/session/processor.ts b/packages/opencode/src/session/processor.ts
-index a287c3b00..efae2365b 100644
+index a287c3b00..d9170fb14 100644
 --- a/packages/opencode/src/session/processor.ts
 +++ b/packages/opencode/src/session/processor.ts
 @@ -16,6 +16,7 @@ import type { SessionID } from "./schema"
@@ -615,7 +915,12 @@ index a287c3b00..efae2365b 100644
  import type { Provider } from "@/provider/provider"
  import { Question } from "@/question"
  import { errorMessage } from "@/util/error"
-@@ -31,8 +32,68 @@ import { Usage, type LLMEvent } from "@opencode-ai/llm"
+@@ -27,12 +28,72 @@ import { ModelV2 } from "@opencode-ai/core/model"
+ import { ProviderV2 } from "@opencode-ai/core/provider"
+ import * as DateTime from "effect/DateTime"
+ import { RuntimeFlags } from "@/effect/runtime-flags"
+-import { Usage, type LLMEvent } from "@opencode-ai/llm"
++import { LLMError, Usage, type LLMEvent } from "@opencode-ai/llm"
  
  const DOOM_LOOP_THRESHOLD = 3
  const log = Log.create({ service: "session.processor" })
@@ -685,7 +990,15 @@ index a287c3b00..efae2365b 100644
  
  export interface Handle {
    readonly message: MessageV2.Assistant
-@@ -76,6 +137,11 @@ interface ProcessorContext extends Input {
+@@ -56,6 +117,7 @@ type Input = {
+   assistantMessage: MessageV2.Assistant
+   sessionID: SessionID
+   model: Provider.Model
++  wasCancelled?: Effect.Effect<boolean>
+ }
+ 
+ export interface Interface {
+@@ -76,6 +138,11 @@ interface ProcessorContext extends Input {
    snapshot: string | undefined
    blocked: boolean
    needsCompaction: boolean
@@ -697,7 +1010,7 @@ index a287c3b00..efae2365b 100644
    currentText: MessageV2.TextPart | undefined
    reasoningMap: Record<string, MessageV2.ReasoningPart>
  }
-@@ -116,11 +182,17 @@ export const layer = Layer.effect(
+@@ -116,18 +183,115 @@ export const layer = Layer.effect(
          snapshot: initialSnapshot,
          blocked: false,
          needsCompaction: false,
@@ -710,15 +1023,22 @@ index a287c3b00..efae2365b 100644
          reasoningMap: {},
        }
        let aborted = false
++      let cancelledByUser = false
        const slog = log.clone().tag("session.id", input.sessionID).tag("messageID", input.assistantMessage.id)
 +      let replayState = captureReplayState()
  
        const parse = (e: unknown) =>
          MessageV2.fromError(e, {
-@@ -128,6 +200,55 @@ export const layer = Layer.effect(
+           providerID: input.model.providerID,
            aborted,
++          userCancelled: cancelledByUser,
          })
  
++      const refreshCancelledByUser = Effect.fn("SessionProcessor.refreshCancelledByUser")(function* () {
++        cancelledByUser = cancelledByUser || (yield* (input.wasCancelled ?? Effect.succeed(false)))
++        return cancelledByUser
++      })
++
 +      function captureReplayState(): ReplayState {
 +        return {
 +          finish: ctx.assistantMessage.finish,
@@ -768,10 +1088,45 @@ index a287c3b00..efae2365b 100644
 +        ctx.attemptNeedsReset = false
 +      }
 +
++      function currentResponseStreamInfo(
++        message: string,
++        transport?: ProviderError.ResponseStreamInfo["transport"],
++      ): ProviderError.ResponseStreamInfo {
++        const beforeFirstEvent =
++          ctx.attemptPartIDs.length === 0 &&
++          !ctx.attemptHasToolActivity &&
++          !ctx.attemptCommitted &&
++          !ctx.requestHasCommittedToolBoundary
++        return {
++          transport: transport ?? (/websocket/i.test(message) ? "websocket" : "sse"),
++          phase: beforeFirstEvent ? "before_first_event" : "after_first_event",
++          autoReplaySafe: beforeFirstEvent,
++        }
++      }
++
++      function normalizeNativeResponseStreamError(error: unknown): ProviderError.ResponseStreamError | undefined {
++        if (error instanceof ProviderError.ResponseStreamError) return error
++        const message = nativeOpenAIResponseStreamMessage(error)
++        if (!message) return undefined
++        return new ProviderError.ResponseStreamError(message, currentResponseStreamInfo(message, nativeOpenAIResponseTransport(error)), {
++          cause: error,
++        })
++      }
++
++      function normalizeRetryableProviderStreamError(
++        message: string,
++        error: Error,
++      ): ProviderError.ResponseStreamError | undefined {
++        if (!responseStreamErrorMessage(message)) return undefined
++        return new ProviderError.ResponseStreamError(message, currentResponseStreamInfo(message), {
++          cause: error,
++        })
++      }
++
        const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
          const done = ctx.toolcalls[toolCallID]?.done
          delete ctx.toolcalls[toolCallID]
-@@ -188,6 +309,7 @@ export const layer = Layer.effect(
+@@ -188,6 +352,7 @@ export const layer = Layer.effect(
              attachments: output.attachments,
            },
          })
@@ -779,7 +1134,7 @@ index a287c3b00..efae2365b 100644
          yield* settleToolCall(toolCallID)
        })
  
-@@ -206,6 +328,7 @@ export const layer = Layer.effect(
+@@ -206,6 +371,7 @@ export const layer = Layer.effect(
          if (error instanceof Permission.RejectedError || error instanceof Question.RejectedError) {
            ctx.blocked = ctx.shouldBreak
          }
@@ -787,7 +1142,7 @@ index a287c3b00..efae2365b 100644
          yield* settleToolCall(toolCallID)
          return true
        })
-@@ -305,6 +428,7 @@ export const layer = Layer.effect(
+@@ -305,6 +471,7 @@ export const layer = Layer.effect(
        const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
          switch (value.type) {
            case "reasoning-start":
@@ -795,7 +1150,7 @@ index a287c3b00..efae2365b 100644
              if (value.id in ctx.reasoningMap) return
              // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
              if (flags.experimentalEventSystem) {
-@@ -323,13 +447,16 @@ export const layer = Layer.effect(
+@@ -323,13 +490,16 @@ export const layer = Layer.effect(
                time: { start: Date.now() },
                metadata: value.providerMetadata,
              }
@@ -813,7 +1168,7 @@ index a287c3b00..efae2365b 100644
              if (value.providerMetadata) ctx.reasoningMap[value.id].metadata = value.providerMetadata
              yield* session.updatePartDelta({
                sessionID: ctx.reasoningMap[value.id].sessionID,
-@@ -351,6 +478,7 @@ export const layer = Layer.effect(
+@@ -351,6 +521,7 @@ export const layer = Layer.effect(
              if (ctx.assistantMessage.summary) {
                throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
              }
@@ -821,7 +1176,7 @@ index a287c3b00..efae2365b 100644
              yield* ensureToolCall(value)
              return
  
-@@ -360,6 +488,7 @@ export const layer = Layer.effect(
+@@ -360,6 +531,7 @@ export const layer = Layer.effect(
              return
  
            case "tool-input-end": {
@@ -829,7 +1184,7 @@ index a287c3b00..efae2365b 100644
              const toolCall = yield* ensureToolCall(value)
              // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
              if (flags.experimentalEventSystem) {
-@@ -378,6 +507,7 @@ export const layer = Layer.effect(
+@@ -378,6 +550,7 @@ export const layer = Layer.effect(
              if (ctx.assistantMessage.summary) {
                throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
              }
@@ -837,7 +1192,7 @@ index a287c3b00..efae2365b 100644
              const toolCall = yield* ensureToolCall(value)
              const input = toolInput(value.input)
              if (!toolCall.call.inputEnded) {
-@@ -450,6 +580,7 @@ export const layer = Layer.effect(
+@@ -450,6 +623,7 @@ export const layer = Layer.effect(
            }
  
            case "tool-result": {
@@ -845,7 +1200,7 @@ index a287c3b00..efae2365b 100644
              const toolCall = yield* readToolCall(value.id)
              const rawOutput = toolResultOutput(value)
              const normalized = yield* Effect.forEach(rawOutput.attachments ?? [], (attachment) =>
-@@ -502,6 +633,7 @@ export const layer = Layer.effect(
+@@ -502,6 +676,7 @@ export const layer = Layer.effect(
            }
  
            case "tool-error": {
@@ -853,15 +1208,23 @@ index a287c3b00..efae2365b 100644
              const toolCall = yield* readToolCall(value.id)
              // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
              if (flags.experimentalEventSystem) {
-@@ -526,6 +658,7 @@ export const layer = Layer.effect(
-             throw new Error(value.message)
+@@ -522,10 +697,13 @@ export const layer = Layer.effect(
+             return
+           }
+ 
+-          case "provider-error":
+-            throw new Error(value.message)
++          case "provider-error": {
++            const error = new Error(value.message)
++            throw value.retryable === true ? (normalizeRetryableProviderStreamError(value.message, error) ?? error) : error
++          }
  
            case "step-start":
 +            resetAttemptIfNeeded()
              if (!ctx.snapshot) ctx.snapshot = yield* snapshot.track()
              if (!ctx.assistantMessage.summary) {
                // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
-@@ -543,16 +676,19 @@ export const layer = Layer.effect(
+@@ -543,16 +721,19 @@ export const layer = Layer.effect(
                  })
                }
              }
@@ -882,7 +1245,7 @@ index a287c3b00..efae2365b 100644
              const completedSnapshot = yield* snapshot.track()
              yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
              const usage = Session.getUsage({
-@@ -576,8 +712,9 @@ export const layer = Layer.effect(
+@@ -576,8 +757,9 @@ export const layer = Layer.effect(
              ctx.assistantMessage.finish = value.reason
              ctx.assistantMessage.cost += usage.cost
              ctx.assistantMessage.tokens = usage.tokens
@@ -893,7 +1256,7 @@ index a287c3b00..efae2365b 100644
                reason: value.reason,
                snapshot: completedSnapshot,
                messageID: ctx.assistantMessage.id,
-@@ -586,18 +723,21 @@ export const layer = Layer.effect(
+@@ -586,18 +768,21 @@ export const layer = Layer.effect(
                tokens: usage.tokens,
                cost: usage.cost,
              })
@@ -916,7 +1279,7 @@ index a287c3b00..efae2365b 100644
                }
                ctx.snapshot = undefined
              }
-@@ -613,10 +753,12 @@ export const layer = Layer.effect(
+@@ -613,10 +798,12 @@ export const layer = Layer.effect(
              ) {
                ctx.needsCompaction = true
              }
@@ -929,7 +1292,7 @@ index a287c3b00..efae2365b 100644
              if (!ctx.assistantMessage.summary) {
                // TODO(v2): Temporary dual-write while migrating session messages to v2 events.
                if (flags.experimentalEventSystem) {
-@@ -635,12 +777,15 @@ export const layer = Layer.effect(
+@@ -635,12 +822,15 @@ export const layer = Layer.effect(
                time: { start: Date.now() },
                metadata: value.providerMetadata,
              }
@@ -946,7 +1309,7 @@ index a287c3b00..efae2365b 100644
              if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
              yield* session.updatePartDelta({
                sessionID: ctx.currentText.sessionID,
-@@ -750,7 +895,8 @@ export const layer = Layer.effect(
+@@ -750,7 +940,8 @@ export const layer = Layer.effect(
  
        const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
          slog.error("process", { error: errorMessage(e), stack: e instanceof Error ? e.stack : undefined })
@@ -956,7 +1319,7 @@ index a287c3b00..efae2365b 100644
          if (MessageV2.ContextOverflowError.isInstance(error)) {
            ctx.needsCompaction = true
            yield* bus.publish(Session.Event.Error, { sessionID: ctx.sessionID, error })
-@@ -777,15 +923,88 @@ export const layer = Layer.effect(
+@@ -777,15 +968,94 @@ export const layer = Layer.effect(
          yield* status.set(ctx.sessionID, { type: "idle" })
        })
  
@@ -983,39 +1346,45 @@ index a287c3b00..efae2365b 100644
 +        resetAttemptState()
 +      })
 +
-+      const recoverRetryableError = (error: unknown) =>
++      const recoverRetryableError = (error: unknown): Effect.Effect<unknown> =>
 +        Effect.gen(function* () {
++          const candidate = normalizeNativeResponseStreamError(error) ?? error
++          yield* refreshCancelledByUser()
++          if (cancelledByUser && cancelInducedTransportCandidate(candidate)) {
++            aborted = true
++            return abortFromCandidate(candidate)
++          }
 +          const retryable =
-+            error instanceof ProviderError.ResponseStreamError
-+              ? { message: error.message }
-+              : SessionRetry.retryable(parse(error), input.model.providerID)
-+          if (!retryable) return error
++            candidate instanceof ProviderError.ResponseStreamError
++              ? { message: candidate.message }
++              : SessionRetry.retryable(parse(candidate), input.model.providerID)
++          if (!retryable) return candidate
 +
-+          if (error instanceof ProviderError.ResponseStreamError && unsafeTerminalFailure(error)) return error
++          if (candidate instanceof ProviderError.ResponseStreamError && unsafeTerminalFailure(candidate)) return candidate
 +
 +          if (ctx.blocked) {
-+            return new StopAfterBlockedToolBoundary(retryable.message, { cause: error })
++            return new StopAfterBlockedToolBoundary(retryable.message, { cause: candidate })
 +          }
 +
 +          if (ctx.attemptHasToolActivity) {
-+            return new StopAfterUnsafeToolActivity(retryable.message, { cause: error })
++            return new StopAfterUnsafeToolActivity(retryable.message, { cause: candidate })
 +          }
 +
 +          if (ctx.requestHasCommittedToolBoundary) {
 +            yield* rollbackCurrentAttempt()
-+            return new ResumeFromPromptLoop(retryable.message, { cause: error })
++            return new ResumeFromPromptLoop(retryable.message, { cause: candidate })
 +          }
 +
-+          if (!(error instanceof ProviderError.ResponseStreamError)) return error
-+          if (error.info.autoReplaySafe) return error
-+          if (ctx.attemptCommitted) return error
-+          if (ctx.attemptPartIDs.length === 0) return error
++          if (!(candidate instanceof ProviderError.ResponseStreamError)) return candidate
++          if (candidate.info.autoReplaySafe) return candidate
++          if (ctx.attemptCommitted) return candidate
++          if (ctx.attemptPartIDs.length === 0) return candidate
 +
 +          yield* rollbackCurrentAttempt()
 +          return new ProviderError.ResponseStreamError(
-+            error.message,
-+            { ...error.info, autoReplaySafe: true },
-+            { cause: error },
++            candidate.message,
++            { ...candidate.info, autoReplaySafe: true },
++            { cause: candidate },
 +          )
 +        }).pipe(
 +          Effect.catchCause((cause) => {
@@ -1048,7 +1417,15 @@ index a287c3b00..efae2365b 100644
              yield* status.set(ctx.sessionID, { type: "busy" })
              const stream = llm.stream(streamInput)
  
-@@ -807,6 +1026,27 @@ export const layer = Layer.effect(
+@@ -798,6 +1068,7 @@ export const layer = Layer.effect(
+             Effect.onInterrupt(() =>
+               Effect.gen(function* () {
+                 aborted = true
++                yield* refreshCancelledByUser()
+                 if (!ctx.assistantMessage.error) {
+                   yield* halt(new DOMException("Aborted", "AbortError"))
+                 }
+@@ -807,6 +1078,27 @@ export const layer = Layer.effect(
                (cause) => !Cause.hasInterruptsOnly(cause),
                (cause) => Effect.fail(Cause.squash(cause)),
              ),
@@ -1076,7 +1453,7 @@ index a287c3b00..efae2365b 100644
              Effect.retry(
                SessionRetry.policy({
                  provider: input.model.providerID,
-@@ -838,10 +1078,12 @@ export const layer = Layer.effect(
+@@ -838,10 +1130,12 @@ export const layer = Layer.effect(
                  },
                }),
              ),
@@ -1089,7 +1466,7 @@ index a287c3b00..efae2365b 100644
            if (ctx.needsCompaction) return "compact"
            if (ctx.blocked || ctx.assistantMessage.error) return "stop"
            return "continue"
-@@ -862,6 +1104,10 @@ export const layer = Layer.effect(
+@@ -862,6 +1156,45 @@ export const layer = Layer.effect(
    }),
  )
  
@@ -1097,14 +1474,73 @@ index a287c3b00..efae2365b 100644
 +  return error.info.terminalEvent === "response.failed" && !error.info.autoReplaySafe
 +}
 +
++const RESPONSE_STREAM_ERROR_PATTERNS = [/stream[_ ]incomplete/i, /before\s+response\.completed/i]
++const OPENAI_RESPONSE_STREAM_ROUTES = new Set(["openai/openai-responses", "openai/openai-responses-websocket"])
++
++function nativeOpenAIResponseStreamMessage(input: unknown) {
++  if (!(input instanceof LLMError)) return undefined
++  if (input.reason._tag !== "InvalidProviderOutput") return undefined
++  if (!input.reason.route || !OPENAI_RESPONSE_STREAM_ROUTES.has(input.reason.route)) return undefined
++  return [input.reason.raw, input.reason.message, input.message].find(responseStreamErrorMessage)
++}
++
++function nativeOpenAIResponseTransport(input: unknown): ProviderError.ResponseStreamInfo["transport"] | undefined {
++  if (!(input instanceof LLMError)) return undefined
++  if (input.reason._tag !== "InvalidProviderOutput") return undefined
++  if (input.reason.route === "openai/openai-responses-websocket") return "websocket"
++  return undefined
++}
++
++function responseStreamErrorMessage(value: string | undefined) {
++  return value !== undefined && RESPONSE_STREAM_ERROR_PATTERNS.some((pattern) => pattern.test(value))
++}
++
++function cancelInducedTransportCandidate(error: unknown) {
++  if (error instanceof ProviderError.ResponseStreamError) return true
++  if (error instanceof ProviderError.HeaderTimeoutError) return true
++  return error instanceof Error && error.name === "AbortError" && exactHeaderTimeoutMessage(error.message)
++}
++
++function abortFromCandidate(error: unknown) {
++  return new DOMException(errorMessage(error), "AbortError")
++}
++
++function exactHeaderTimeoutMessage(message: string) {
++  return /^Provider response headers timed out after \d+ms$/.test(message)
++}
++
  export const defaultLayer = Layer.suspend(() =>
    layer.pipe(
      Layer.provide(Session.defaultLayer),
 diff --git a/packages/opencode/src/session/prompt.ts b/packages/opencode/src/session/prompt.ts
-index 22fe4d81c..0aff65340 100644
+index 22fe4d81c..4c691ccab 100644
 --- a/packages/opencode/src/session/prompt.ts
 +++ b/packages/opencode/src/session/prompt.ts
-@@ -1474,6 +1474,7 @@ export const layer = Layer.effect(
+@@ -1248,6 +1248,7 @@ export const layer = Layer.effect(
+         let structured: unknown
+         let step = 0
+         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
++        const wasCancelled = yield* state.cancelProbe(sessionID)
+ 
+         while (true) {
+           yield* status.set(sessionID, { type: "busy" })
+@@ -1314,6 +1315,7 @@ export const layer = Layer.effect(
+               sessionID,
+               auto: task.auto,
+               overflow: task.overflow,
++              wasCancelled,
+             })
+             if (result === "stop") break
+             continue
+@@ -1376,6 +1378,7 @@ export const layer = Layer.effect(
+               assistantMessage: msg,
+               sessionID,
+               model,
++              wasCancelled,
+             })
+             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
+ 
+@@ -1474,6 +1477,7 @@ export const layer = Layer.effect(
              }
  
              if (result === "stop") return "break" as const
@@ -1129,6 +1565,178 @@ index 463bc27a9..e4ea0cc8f 100644
      const status = error.data.statusCode
      // 5xx errors are transient server failures and should always be retried,
      // even when the provider SDK doesn't explicitly mark them as retryable.
+diff --git a/packages/opencode/src/session/run-state.ts b/packages/opencode/src/session/run-state.ts
+index 8f0051dfb..4b265a2b5 100644
+--- a/packages/opencode/src/session/run-state.ts
++++ b/packages/opencode/src/session/run-state.ts
+@@ -10,6 +10,8 @@ import { SessionStatus } from "./status"
+ export interface Interface {
+   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
+   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
++  readonly cancelProbe: (sessionID: SessionID) => Effect.Effect<Effect.Effect<boolean>>
++  readonly wasCancelled: (sessionID: SessionID) => Effect.Effect<boolean>
+   readonly ensureRunning: (
+     sessionID: SessionID,
+     onInterrupt: Effect.Effect<MessageV2.WithParts>,
+@@ -25,6 +27,15 @@ export interface Interface {
+ 
+ export class Service extends Context.Service<Service, Interface>()("@opencode/SessionRunState") {}
+ 
++type CancelProbe = {
++  cancelled: boolean
++}
++
++type CancelProbes = {
++  active?: CancelProbe
++  queued?: CancelProbe
++}
++
+ export const layer = Layer.effect(
+   Service,
+   Effect.gen(function* () {
+@@ -35,6 +46,7 @@ export const layer = Layer.effect(
+       Effect.fn("SessionRunState.state")(function* () {
+         const scope = yield* Scope.Scope
+         const runners = new Map<SessionID, Runner.Runner<MessageV2.WithParts>>()
++        const cancelled = new Map<SessionID, CancelProbes>()
+         yield* Effect.addFinalizer(
+           Effect.fnUntraced(function* () {
+             yield* Effect.forEach(runners.values(), (runner) => runner.cancel, {
+@@ -42,9 +54,10 @@ export const layer = Layer.effect(
+               discard: true,
+             })
+             runners.clear()
++            cancelled.clear()
+           }),
+         )
+-        return { runners, scope }
++        return { runners, cancelled, scope }
+       }),
+     )
+ 
+@@ -74,22 +87,54 @@ export const layer = Layer.effect(
+     })
+ 
+     const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
+-      yield* cancelBackgroundJobs(background, sessionID)
+       const data = yield* InstanceState.get(state)
+       const existing = data.runners.get(sessionID)
+       if (!existing || !existing.busy) {
++        data.cancelled.delete(sessionID)
++        yield* cancelBackgroundJobs(background, sessionID)
+         yield* status.set(sessionID, { type: "idle" })
+         return
+       }
++      const probes = data.cancelled.get(sessionID) ?? {}
++      const probe = probes.active ?? probes.queued ?? { cancelled: false }
++      probe.cancelled = true
++      probes.active = probe
++      data.cancelled.set(sessionID, probes)
++      yield* cancelBackgroundJobs(background, sessionID)
+       yield* existing.cancel
+     })
+ 
++    const cancelProbe = Effect.fn("SessionRunState.cancelProbe")(function* (sessionID: SessionID) {
++      const probe = (yield* InstanceState.get(state)).cancelled.get(sessionID)?.active
++      if (!probe) return Effect.succeed(false)
++      return Effect.sync(() => probe.cancelled)
++    })
++
++    const wasCancelled = Effect.fn("SessionRunState.wasCancelled")(function* (sessionID: SessionID) {
++      const probes = (yield* InstanceState.get(state)).cancelled.get(sessionID)
++      return probes?.active?.cancelled ?? probes?.queued?.cancelled ?? false
++    })
++
+     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (
+       sessionID: SessionID,
+       onInterrupt: Effect.Effect<MessageV2.WithParts>,
+       work: Effect.Effect<MessageV2.WithParts>,
+     ) {
+-      return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(work)
++      const data = yield* InstanceState.get(state)
++      const current = yield* runner(sessionID, onInterrupt)
++      switch (current.state._tag) {
++        case "Idle": {
++          const probe = installActiveProbe(data.cancelled, sessionID)
++          return yield* current.ensureRunning(work.pipe(Effect.ensuring(clearActiveProbe(data.cancelled, sessionID, probe))))
++        }
++        case "Shell": {
++          const probe = installQueuedProbe(data.cancelled, sessionID)
++          return yield* current.ensureRunning(activateQueuedProbe(data.cancelled, sessionID, probe, work))
++        }
++        case "Running":
++        case "ShellThenRun":
++          return yield* current.ensureRunning(work)
++      }
+     })
+ 
+     const startShell = Effect.fn("SessionRunState.startShell")(function* (
+@@ -98,12 +143,18 @@ export const layer = Layer.effect(
+       work: Effect.Effect<MessageV2.WithParts>,
+       ready?: Latch.Latch,
+     ) {
+-      return yield* (yield* runner(sessionID, onInterrupt))
+-        .startShell(work, ready)
++      const data = yield* InstanceState.get(state)
++      const current = yield* runner(sessionID, onInterrupt)
++      if (current.state._tag !== "Idle") {
++        return yield* current.startShell(work, ready).pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
++      }
++      const probe = installActiveProbe(data.cancelled, sessionID)
++      return yield* current
++        .startShell(work.pipe(Effect.ensuring(clearActiveProbe(data.cancelled, sessionID, probe))), ready)
+         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
+     })
+ 
+-    return Service.of({ assertNotBusy, cancel, ensureRunning, startShell })
++    return Service.of({ assertNotBusy, cancel, cancelProbe, wasCancelled, ensureRunning, startShell })
+   }),
+ )
+ 
+@@ -150,4 +201,43 @@ function busyError(sessionID: SessionID) {
+   return new Session.BusyError({ sessionID })
+ }
+ 
++function installActiveProbe(probes: Map<SessionID, CancelProbes>, sessionID: SessionID) {
++  const probe = { cancelled: false }
++  probes.set(sessionID, { active: probe })
++  return probe
++}
++
++function installQueuedProbe(probes: Map<SessionID, CancelProbes>, sessionID: SessionID) {
++  const probe = { cancelled: false }
++  const current = probes.get(sessionID) ?? {}
++  current.queued = probe
++  probes.set(sessionID, current)
++  return probe
++}
++
++function activateQueuedProbe(
++  probes: Map<SessionID, CancelProbes>,
++  sessionID: SessionID,
++  probe: CancelProbe,
++  work: Effect.Effect<MessageV2.WithParts>,
++) {
++  return Effect.gen(function* () {
++    const current = probes.get(sessionID) ?? {}
++    current.active = probe
++    if (current.queued === probe) current.queued = undefined
++    probes.set(sessionID, current)
++    return yield* work.pipe(Effect.ensuring(clearActiveProbe(probes, sessionID, probe)))
++  })
++}
++
++function clearActiveProbe(probes: Map<SessionID, CancelProbes>, sessionID: SessionID, probe: CancelProbe) {
++  return Effect.sync(() => {
++    const current = probes.get(sessionID)
++    if (!current || current.active !== probe) return
++    current.active = undefined
++    if (current.queued) return
++    probes.delete(sessionID)
++  })
++}
++
+ export * as SessionRunState from "./run-state"
 diff --git a/packages/opencode/src/skill/index.ts b/packages/opencode/src/skill/index.ts
 index c1c6d0d6f..e06636fe0 100644
 --- a/packages/opencode/src/skill/index.ts
@@ -2067,8 +2675,185 @@ index dad1987de..9f6ba2ad2 100644
  describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
    const sessionID = "test-session-123"
  
+diff --git a/packages/opencode/test/session/message-v2.test.ts b/packages/opencode/test/session/message-v2.test.ts
+index 82bed0e9c..81cfdbb6e 100644
+--- a/packages/opencode/test/session/message-v2.test.ts
++++ b/packages/opencode/test/session/message-v2.test.ts
+@@ -6,6 +6,7 @@ import type { Provider } from "@/provider/provider"
+ import { ModelID, ProviderID } from "../../src/provider/schema"
+ import { SessionID, MessageID, PartID } from "../../src/session/schema"
+ import { Question } from "../../src/question"
++import { ProviderError } from "../../src/provider/error"
+ 
+ const sessionID = SessionID.make("session")
+ const providerID = ProviderID.make("test")
+@@ -985,7 +986,7 @@ describe("session.message-v2.toModelMessage", () => {
+     expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([])
+   })
+ 
+-  test("includes aborted assistant messages only when they have non-step-start/reasoning content", async () => {
++  test("omits aborted assistant partial text and reasoning from model history", async () => {
+     const assistantID1 = "m-assistant-1"
+     const assistantID2 = "m-assistant-2"
+ 
+@@ -1025,14 +1026,121 @@ describe("session.message-v2.toModelMessage", () => {
+       },
+     ]
+ 
++    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([])
++  })
++
++  test("preserves completed tool call and result pairs from aborted assistant messages", async () => {
++    const userID = "m-user-aborted-tool"
++    const assistantID = "m-assistant-aborted-tool"
++    const aborted = new MessageV2.AbortedError({ message: "aborted" }).toObject() as MessageV2.Assistant["error"]
++
++    const input: MessageV2.WithParts[] = [
++      {
++        info: userInfo(userID),
++        parts: [{ ...basePart(userID, "u1-aborted-tool"), type: "text", text: "run tool" }] as MessageV2.Part[],
++      },
++      {
++        info: assistantInfo(assistantID, userID, aborted),
++        parts: [
++          { ...basePart(assistantID, "a1-aborted-tool"), type: "text", text: "partial answer" },
++          {
++            ...basePart(assistantID, "a2-aborted-tool"),
++            type: "tool",
++            callID: "call-aborted-completed",
++            tool: "bash",
++            state: {
++              status: "completed",
++              input: { cmd: "pwd" },
++              output: "ok",
++              title: "Bash",
++              metadata: {},
++              time: { start: 0, end: 1 },
++            },
++          },
++        ] as MessageV2.Part[],
++      },
++    ]
++
+     expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
++      {
++        role: "user",
++        content: [{ type: "text", text: "run tool" }],
++      },
+       {
+         role: "assistant",
+         content: [
+-          { type: "reasoning", text: "thinking", providerOptions: undefined },
+-          { type: "text", text: "partial answer" },
++          {
++            type: "tool-call",
++            toolCallId: "call-aborted-completed",
++            toolName: "bash",
++            input: { cmd: "pwd" },
++            providerExecuted: undefined,
++          },
+         ],
+       },
++      {
++        role: "tool",
++        content: [
++          {
++            type: "tool-result",
++            toolCallId: "call-aborted-completed",
++            toolName: "bash",
++            output: { type: "text", value: "ok" },
++          },
++        ],
++      },
++    ])
++  })
++
++  test("drops interrupted pending and running tool parts from aborted assistant messages", async () => {
++    const userID = "m-user-aborted-dropped-tools"
++    const assistantID = "m-assistant-aborted-dropped-tools"
++    const aborted = new MessageV2.AbortedError({ message: "aborted" }).toObject() as MessageV2.Assistant["error"]
++
++    const input: MessageV2.WithParts[] = [
++      {
++        info: userInfo(userID),
++        parts: [{ ...basePart(userID, "u1-aborted-dropped-tools"), type: "text", text: "run tools" }] as MessageV2.Part[],
++      },
++      {
++        info: assistantInfo(assistantID, userID, aborted),
++        parts: [
++          {
++            ...basePart(assistantID, "a1-aborted-dropped-tools"),
++            type: "tool",
++            callID: "call-interrupted",
++            tool: "bash",
++            state: {
++              status: "error",
++              input: { cmd: "sleep" },
++              error: "Tool execution aborted",
++              metadata: { interrupted: true, output: "partial" },
++              time: { start: 0, end: 1 },
++            },
++          },
++          {
++            ...basePart(assistantID, "a2-aborted-dropped-tools"),
++            type: "tool",
++            callID: "call-pending-aborted",
++            tool: "bash",
++            state: { status: "pending", input: { cmd: "pwd" }, raw: "{}" },
++          },
++          {
++            ...basePart(assistantID, "a3-aborted-dropped-tools"),
++            type: "tool",
++            callID: "call-running-aborted",
++            tool: "bash",
++            state: { status: "running", input: { cmd: "ls" }, time: { start: 0 } },
++          },
++        ] as MessageV2.Part[],
++      },
++    ]
++
++    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
++      {
++        role: "user",
++        content: [{ type: "text", text: "run tools" }],
++      },
+     ])
+   })
+ 
+@@ -1546,6 +1654,31 @@ describe("session.message-v2.fromError", () => {
+ 
+     expect(result.name).toBe("MessageAbortedError")
+   })
++
++  test("classifies exact header timeout as retryable APIError without user cancellation", () => {
++    const result = MessageV2.fromError(new DOMException("Provider response headers timed out after 10000ms", "AbortError"), {
++      providerID,
++    })
++
++    expect(MessageV2.APIError.isInstance(result)).toBe(true)
++    expect((result as MessageV2.APIError).data.message).toBe("Provider response headers timed out after 10000ms")
++    expect((result as MessageV2.APIError).data.isRetryable).toBe(true)
++
++    const direct = MessageV2.fromError(new ProviderError.HeaderTimeoutError(10000), { providerID })
++    expect(MessageV2.APIError.isInstance(direct)).toBe(true)
++    expect((direct as MessageV2.APIError).data.message).toBe("Provider response headers timed out after 10000ms")
++  })
++
++  test("classifies exact abort-shaped header timeout as AbortedError with user cancellation", () => {
++    const result = MessageV2.fromError(new DOMException("Provider response headers timed out after 10000ms", "AbortError"), {
++      providerID,
++      userCancelled: true,
++    })
++
++    expect(MessageV2.AbortedError.isInstance(result)).toBe(true)
++    if (!MessageV2.AbortedError.isInstance(result)) throw new Error("expected aborted error")
++    expect(result.data.message).toBe("Provider response headers timed out after 10000ms")
++  })
+ })
+ 
+ describe("session.message-v2.latest", () => {
 diff --git a/packages/opencode/test/session/processor-effect.test.ts b/packages/opencode/test/session/processor-effect.test.ts
-index ede122297..71c72b120 100644
+index ede122297..acf92f6cc 100644
 --- a/packages/opencode/test/session/processor-effect.test.ts
 +++ b/packages/opencode/test/session/processor-effect.test.ts
 @@ -1,7 +1,8 @@
@@ -2077,7 +2862,7 @@ index ede122297..71c72b120 100644
 -import { tool } from "ai"
 -import { Cause, Effect, Exit, Fiber, Layer } from "effect"
 +import { APICallError, tool } from "ai"
-+import { LLMEvent } from "@opencode-ai/llm"
++import { InvalidProviderOutputReason, LLMError, LLMEvent } from "@opencode-ai/llm"
 +import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
  import path from "path"
  import z from "zod"
@@ -2214,10 +2999,376 @@ index ede122297..71c72b120 100644
  // ---------------------------------------------------------------------------
  // Tests
  // ---------------------------------------------------------------------------
-@@ -620,6 +676,1109 @@ it.live("session.processor effect tests publish retry status updates", () =>
+@@ -620,6 +676,1475 @@ it.live("session.processor effect tests publish retry status updates", () =>
    ),
  )
  
++isolatedIt.live("session.processor effect tests retry native stream_incomplete LLMError with visible status", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.fail(
++            new LLMError({
++              module: "Route",
++              method: "frames",
++              reason: new InvalidProviderOutputReason({
++                message: "Failed to read openai/openai-responses stream",
++                route: "openai/openai-responses",
++                raw: '{"code":"stream_incomplete","message":"Upstream websocket closed before response.completed"}',
++              }),
++            }),
++          ),
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.textStart({ id: "text_1" }),
++            LLMEvent.textDelta({ id: "text_1", text: "after" }),
++            LLMEvent.textEnd({ id: "text_1" }),
++            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
++            LLMEvent.finish({ reason: "stop" }),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++          const bus = yield* Bus.Service
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "native stream incomplete")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const states: number[] = []
++          const off = yield* bus.subscribeCallback(SessionStatus.Event.Status, (evt) => {
++            if (evt.properties.sessionID !== chat.id) return
++            if (evt.properties.status.type === "retry") states.push(evt.properties.status.attempt)
++          })
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies MessageV2.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "native stream incomplete" }],
++            tools: {},
++          })
++
++          off()
++
++          expect(value).toBe("continue")
++          expect(llm.calls).toBe(2)
++          expect(states).toStrictEqual([1])
++          expect(handle.message.error).toBeUndefined()
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests retry exact header timeout abort without user cancellation", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.fail(new DOMException("Provider response headers timed out after 10000ms", "AbortError")),
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.textStart({ id: "text_1" }),
++            LLMEvent.textDelta({ id: "text_1", text: "after" }),
++            LLMEvent.textEnd({ id: "text_1" }),
++            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
++            LLMEvent.finish({ reason: "stop" }),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++          const bus = yield* Bus.Service
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "header timeout")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const states: number[] = []
++          const off = yield* bus.subscribeCallback(SessionStatus.Event.Status, (evt) => {
++            if (evt.properties.sessionID !== chat.id) return
++            if (evt.properties.status.type === "retry") states.push(evt.properties.status.attempt)
++          })
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies MessageV2.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "header timeout" }],
++            tools: {},
++          })
++
++          off()
++
++          expect(value).toBe("continue")
++          expect(llm.calls).toBe(2)
++          expect(states).toStrictEqual([1])
++          expect(handle.message.error).toBeUndefined()
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests treats user-cancelled stream failure as abort without retry", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.fail(
++            new ProviderError.ResponseStreamError("stream_incomplete: Upstream closed before response.completed", {
++              transport: "sse",
++              phase: "before_first_event",
++              autoReplaySafe: true,
++            }),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++          const bus = yield* Bus.Service
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "cancelled stream incomplete")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const states: number[] = []
++          const off = yield* bus.subscribeCallback(SessionStatus.Event.Status, (evt) => {
++            if (evt.properties.sessionID !== chat.id) return
++            if (evt.properties.status.type === "retry") states.push(evt.properties.status.attempt)
++          })
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++            wasCancelled: Effect.succeed(true),
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies MessageV2.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "cancelled stream incomplete" }],
++            tools: {},
++          })
++
++          off()
++
++          expect(value).toBe("stop")
++          expect(llm.calls).toBe(1)
++          expect(states).toStrictEqual([])
++          expect(handle.message.error?.name).toBe("MessageAbortedError")
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests rollback retryable stream_incomplete provider-error events", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.textStart({ id: "text_1" }),
++            LLMEvent.textDelta({ id: "text_1", text: "partial" }),
++            LLMEvent.providerError({
++              message: "stream_incomplete: Upstream websocket closed before response.completed",
++              retryable: true,
++            }),
++          ),
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.textStart({ id: "text_2" }),
++            LLMEvent.textDelta({ id: "text_2", text: "after" }),
++            LLMEvent.textEnd({ id: "text_2" }),
++            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
++            LLMEvent.finish({ reason: "stop" }),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++          const bus = yield* Bus.Service
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "provider stream incomplete")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const states: number[] = []
++          const off = yield* bus.subscribeCallback(SessionStatus.Event.Status, (evt) => {
++            if (evt.properties.sessionID !== chat.id) return
++            if (evt.properties.status.type === "retry") states.push(evt.properties.status.attempt)
++          })
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies MessageV2.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "provider stream incomplete" }],
++            tools: {},
++          })
++
++          off()
++
++          const parts = MessageV2.parts(msg.id)
++
++          expect(value).toBe("continue")
++          expect(llm.calls).toBe(2)
++          expect(states).toStrictEqual([1])
++          expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
++          expect(parts.filter((part): part is MessageV2.TextPart => part.type === "text").map((part) => part.text)).toEqual([
++            "after",
++          ])
++          expect(handle.message.error).toBeUndefined()
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests do not replay arbitrary retryable provider-error events", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.providerError({
++              message: "temporary provider failure",
++              retryable: true,
++            }),
++          ),
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.textStart({ id: "text_after" }),
++            LLMEvent.textDelta({ id: "text_after", text: "after" }),
++            LLMEvent.textEnd({ id: "text_after" }),
++            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
++            LLMEvent.finish({ reason: "stop" }),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++          const bus = yield* Bus.Service
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "generic retryable provider error")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const states: number[] = []
++          const off = yield* bus.subscribeCallback(SessionStatus.Event.Status, (evt) => {
++            if (evt.properties.sessionID !== chat.id) return
++            if (evt.properties.status.type === "retry") states.push(evt.properties.status.attempt)
++          })
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies MessageV2.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "generic retryable provider error" }],
++            tools: {},
++          })
++
++          off()
++
++          expect(value).toBe("stop")
++          expect(llm.calls).toBe(1)
++          expect(states).toStrictEqual([])
++          expect(handle.message.error).toBeDefined()
++          expect(handle.message.error && "message" in handle.message.error.data ? handle.message.error.data.message : "").toContain(
++            "temporary provider failure",
++          )
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
 +it.live("session.processor effect tests rollback assistant-only partial output before retry", () =>
 +  provideTmpdirServer(
 +    ({ dir, llm }) =>
@@ -3439,6 +4590,304 @@ index e1cbec036..53f857f09 100644
    test("does not retry context overflow errors", () => {
      const error = new MessageV2.ContextOverflowError({
        message: "Input exceeds context window of this model",
+diff --git a/packages/opencode/test/session/run-state.test.ts b/packages/opencode/test/session/run-state.test.ts
+new file mode 100644
+index 000000000..afbc6ff72
+--- /dev/null
++++ b/packages/opencode/test/session/run-state.test.ts
+@@ -0,0 +1,292 @@
++import { describe, expect } from "bun:test"
++import { Deferred, Effect, Exit, Fiber } from "effect"
++import { ModelID, ProviderID } from "@/provider/schema"
++import { MessageV2 } from "@/session/message-v2"
++import { MessageID, SessionID } from "@/session/schema"
++import { SessionRunState } from "@/session/run-state"
++import { awaitWithTimeout, testEffect } from "../lib/effect"
++
++const it = testEffect(SessionRunState.defaultLayer)
++
++describe("SessionRunState", () => {
++  it.instance(
++    "isolates cancel probes between cancelled and replacement runs",
++    Effect.gen(function* () {
++      const run = yield* SessionRunState.Service
++      const sessionID = SessionID.make("ses_cancel_probe_race")
++      const output = assistant(sessionID)
++      const firstProbe = yield* Deferred.make<Effect.Effect<boolean>>()
++      const firstInterrupted = yield* Deferred.make<void>()
++      const holdFirstCleanup = yield* Deferred.make<void>()
++      const secondProbe = yield* Deferred.make<Effect.Effect<boolean>>()
++      const releaseSecond = yield* Deferred.make<void>()
++
++      yield* Effect.gen(function* () {
++        const first = yield* run
++          .ensureRunning(
++            sessionID,
++            Effect.succeed(output),
++            Effect.gen(function* () {
++              yield* Deferred.succeed(firstProbe, yield* run.cancelProbe(sessionID))
++              return yield* Effect.never
++            }).pipe(
++              Effect.onInterrupt(() => Deferred.succeed(firstInterrupted, undefined)),
++              Effect.ensuring(Deferred.await(holdFirstCleanup)),
++              Effect.as(output),
++            ),
++          )
++          .pipe(Effect.forkChild)
++
++        const oldWasCancelled = yield* awaitWithTimeout(
++          Deferred.await(firstProbe),
++          "first run did not capture cancel probe",
++        )
++        expect(yield* oldWasCancelled).toBe(false)
++
++        const cancel = yield* run.cancel(sessionID).pipe(Effect.forkChild)
++        yield* awaitWithTimeout(Deferred.await(firstInterrupted), "first run was not interrupted")
++        expect(yield* oldWasCancelled).toBe(true)
++
++        const second = yield* run
++          .ensureRunning(
++            sessionID,
++            Effect.succeed(output),
++            Effect.gen(function* () {
++              yield* Deferred.succeed(secondProbe, yield* run.cancelProbe(sessionID))
++              yield* Deferred.await(releaseSecond)
++              return output
++            }),
++          )
++          .pipe(Effect.forkChild)
++        const newWasCancelled = yield* awaitWithTimeout(
++          Deferred.await(secondProbe),
++          "second run did not capture cancel probe",
++        )
++
++        expect(yield* newWasCancelled).toBe(false)
++        expect(yield* run.wasCancelled(sessionID)).toBe(false)
++
++        yield* Deferred.succeed(holdFirstCleanup, undefined)
++        const cancelExit = yield* awaitWithTimeout(Fiber.await(cancel), "cancel did not finish after cleanup release")
++        expect(Exit.isSuccess(cancelExit)).toBe(true)
++        expect(yield* newWasCancelled).toBe(false)
++
++        yield* Deferred.succeed(releaseSecond, undefined)
++        expect(yield* Fiber.join(second)).toBe(output)
++        expect(yield* Fiber.join(first)).toBe(output)
++        expect(yield* run.wasCancelled(sessionID)).toBe(false)
++      }).pipe(
++        Effect.ensuring(
++          Effect.all([Deferred.succeed(holdFirstCleanup, undefined), Deferred.succeed(releaseSecond, undefined)], {
++            discard: true,
++          }).pipe(Effect.ignore),
++        ),
++      )
++    }),
++    3_000,
++  )
++
++  it.instance(
++    "preserves cancellation when direct runs are cancelled before probe capture",
++    Effect.gen(function* () {
++      const run = yield* SessionRunState.Service
++      const sessionID = SessionID.make("ses_cancel_probe_before_capture")
++      const output = assistant(sessionID)
++      const started = yield* Deferred.make<void>()
++      const interruptedProbe = yield* Deferred.make<Effect.Effect<boolean>>()
++      const holdCleanup = yield* Deferred.make<void>()
++
++      yield* Effect.gen(function* () {
++        const fiber = yield* run
++          .ensureRunning(
++            sessionID,
++            Effect.succeed(output),
++            Effect.gen(function* () {
++              yield* Deferred.succeed(started, undefined)
++              return yield* Effect.never
++            }).pipe(
++              Effect.ensuring(
++                Effect.gen(function* () {
++                  yield* Deferred.succeed(interruptedProbe, yield* run.cancelProbe(sessionID))
++                  yield* Deferred.await(holdCleanup)
++                }),
++              ),
++              Effect.as(output),
++            ),
++          )
++          .pipe(Effect.forkChild)
++
++        yield* awaitWithTimeout(Deferred.await(started), "run did not start")
++        const cancel = yield* run.cancel(sessionID).pipe(Effect.forkChild)
++        const wasCancelled = yield* awaitWithTimeout(
++          Deferred.await(interruptedProbe),
++          "interrupted run did not capture cancel probe",
++        )
++
++        expect(yield* wasCancelled).toBe(true)
++        yield* Deferred.succeed(holdCleanup, undefined)
++        expect(Exit.isSuccess(yield* Fiber.await(cancel))).toBe(true)
++        expect(yield* Fiber.join(fiber)).toBe(output)
++        expect(yield* run.wasCancelled(sessionID)).toBe(false)
++      }).pipe(Effect.ensuring(Deferred.succeed(holdCleanup, undefined).pipe(Effect.ignore)))
++    }),
++    3_000,
++  )
++
++  it.instance(
++    "installs a fresh cancel probe for runs queued behind shells",
++    Effect.gen(function* () {
++      const run = yield* SessionRunState.Service
++      const sessionID = SessionID.make("ses_cancel_probe_shell_queue")
++      const output = assistant(sessionID)
++      const shellStarted = yield* Deferred.make<void>()
++      const releaseShell = yield* Deferred.make<void>()
++      const queuedProbe = yield* Deferred.make<Effect.Effect<boolean>>()
++      const releaseQueued = yield* Deferred.make<void>()
++
++      yield* Effect.gen(function* () {
++        const shell = yield* run
++          .startShell(
++            sessionID,
++            Effect.succeed(output),
++            Effect.gen(function* () {
++              yield* Deferred.succeed(shellStarted, undefined)
++              yield* Deferred.await(releaseShell)
++              return output
++            }),
++          )
++          .pipe(Effect.forkChild)
++
++        yield* awaitWithTimeout(Deferred.await(shellStarted), "shell did not start")
++
++        const queued = yield* run
++          .ensureRunning(
++            sessionID,
++            Effect.succeed(output),
++            Effect.gen(function* () {
++              yield* Deferred.succeed(queuedProbe, yield* run.cancelProbe(sessionID))
++              yield* Deferred.await(releaseQueued)
++              return output
++            }),
++          )
++          .pipe(Effect.forkChild)
++
++        yield* Effect.yieldNow
++        expect(yield* Deferred.isDone(queuedProbe)).toBe(false)
++
++        yield* Deferred.succeed(releaseShell, undefined)
++        expect(yield* Fiber.join(shell)).toBe(output)
++
++        const queuedWasCancelled = yield* awaitWithTimeout(
++          Deferred.await(queuedProbe),
++          "queued run did not capture cancel probe",
++        )
++        expect(yield* queuedWasCancelled).toBe(false)
++
++        yield* run.cancel(sessionID)
++        expect(yield* queuedWasCancelled).toBe(true)
++        expect(yield* Fiber.join(queued)).toBe(output)
++        expect(yield* run.wasCancelled(sessionID)).toBe(false)
++        expect(yield* (yield* run.cancelProbe(sessionID))).toBe(false)
++      }).pipe(
++        Effect.ensuring(
++          Effect.all([Deferred.succeed(releaseShell, undefined), Deferred.succeed(releaseQueued, undefined)], {
++            discard: true,
++          }).pipe(Effect.ignore),
++        ),
++      )
++    }),
++    3_000,
++  )
++
++  it.instance(
++    "preserves cancellation when shell-queued runs are cancelled before probe capture",
++    Effect.gen(function* () {
++      const run = yield* SessionRunState.Service
++      const sessionID = SessionID.make("ses_cancel_probe_shell_queue_before_capture")
++      const output = assistant(sessionID)
++      const shellStarted = yield* Deferred.make<void>()
++      const releaseShell = yield* Deferred.make<void>()
++      const queuedStarted = yield* Deferred.make<void>()
++      const queuedInterruptedProbe = yield* Deferred.make<Effect.Effect<boolean>>()
++      const holdQueuedCleanup = yield* Deferred.make<void>()
++
++      yield* Effect.gen(function* () {
++        const shell = yield* run
++          .startShell(
++            sessionID,
++            Effect.succeed(output),
++            Effect.gen(function* () {
++              yield* Deferred.succeed(shellStarted, undefined)
++              yield* Deferred.await(releaseShell)
++              return output
++            }),
++          )
++          .pipe(Effect.forkChild)
++
++        yield* awaitWithTimeout(Deferred.await(shellStarted), "shell did not start")
++        const queued = yield* run
++          .ensureRunning(
++            sessionID,
++            Effect.succeed(output),
++            Effect.gen(function* () {
++              yield* Deferred.succeed(queuedStarted, undefined)
++              return yield* Effect.never
++            }).pipe(
++              Effect.ensuring(
++                Effect.gen(function* () {
++                  yield* Deferred.succeed(queuedInterruptedProbe, yield* run.cancelProbe(sessionID))
++                  yield* Deferred.await(holdQueuedCleanup)
++                }),
++              ),
++              Effect.as(output),
++            ),
++          )
++          .pipe(Effect.forkChild)
++
++        yield* Deferred.succeed(releaseShell, undefined)
++        expect(yield* Fiber.join(shell)).toBe(output)
++        yield* awaitWithTimeout(Deferred.await(queuedStarted), "queued run did not start")
++
++        const cancel = yield* run.cancel(sessionID).pipe(Effect.forkChild)
++        const wasCancelled = yield* awaitWithTimeout(
++          Deferred.await(queuedInterruptedProbe),
++          "queued run did not capture cancel probe on interrupt",
++        )
++
++        expect(yield* wasCancelled).toBe(true)
++        yield* Deferred.succeed(holdQueuedCleanup, undefined)
++        expect(Exit.isSuccess(yield* Fiber.await(cancel))).toBe(true)
++        expect(yield* Fiber.join(queued)).toBe(output)
++        expect(yield* run.wasCancelled(sessionID)).toBe(false)
++      }).pipe(
++        Effect.ensuring(
++          Effect.all([Deferred.succeed(releaseShell, undefined), Deferred.succeed(holdQueuedCleanup, undefined)], {
++            discard: true,
++          }).pipe(Effect.ignore),
++        ),
++      )
++    }),
++    3_000,
++  )
++})
++
++function assistant(sessionID: SessionID): MessageV2.WithParts {
++  return {
++    info: {
++      id: MessageID.make("msg_cancel_probe_race_assistant"),
++      sessionID,
++      role: "assistant",
++      parentID: MessageID.make("msg_cancel_probe_race_user"),
++      time: { created: 0 },
++      modelID: ModelID.make("test-model"),
++      providerID: ProviderID.make("test"),
++      mode: "build",
++      agent: "build",
++      path: { cwd: "/tmp", root: "/tmp" },
++      cost: 0,
++      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
++    },
++    parts: [],
++  }
++}
 diff --git a/packages/opencode/test/skill/skill.test.ts b/packages/opencode/test/skill/skill.test.ts
 index fc1f6bff6..8bdd78d5c 100644
 --- a/packages/opencode/test/skill/skill.test.ts
