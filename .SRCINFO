@@ -1,6 +1,6 @@
 pkgbase = opencode
 	pkgdesc = The open source coding agent
-	pkgver = 1.16.2
+	pkgver = 1.17.0
 	pkgrel = 1
 	url = https://github.com/anomalyco/opencode
 	arch = x86_64
@@ -17,7 +17,7 @@ pkgbase = opencode
 	optdepends = xclip: clipboard support on X11
 	options = !debug
 	options = !strip
-	source = git+https://github.com/anomalyco/opencode.git#tag=v1.16.2
-	b2sums = b80862d7359856eeee20e09bc5aaedd3aa024f4bef4c4486ea904f20392f29b366ab4fd9683abfe035101c7168f8adc963310d4fc8bb0fc141718bceebd49a62
+	source = git+https://github.com/anomalyco/opencode.git#tag=v1.17.0
+	b2sums = 1645a1051188263e7d6f09f8d61ec4d8193b22f2cbd90c176935c59e4dcf10722c3c3a063c64bbe46d7e2fbc8d2930b6c855610728bbbe90a3b0e1f366ac9cec
 
 pkgname = opencode
