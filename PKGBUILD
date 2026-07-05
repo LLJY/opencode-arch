@@ -15,9 +15,9 @@ depends=(
   'ripgrep'
   'tar'
 )
-checkdepends=(
-  'nodejs-lts-jod'
-)
+#checkdepends=(
+#  'nodejs-lts-jod'
+#)
 makedepends=(
   'bun'
   'git'
@@ -43,8 +43,8 @@ build() {
   OPENCODE_VERSION=$pkgver bun run ./script/build.ts --single --baseline --skip-install
 }
 
-check() {
-  cd $pkgname/packages/opencode
+#check() {
+#  cd $pkgname/packages/opencode
 
   # I _really_ tried to make the tests work but I'm getting 100s of failures, mostly due to this I think:
   # https://github.com/oven-sh/bun/issues/30014
@@ -54,7 +54,7 @@ check() {
   # git config --global user.email "builduser@archlinux.org"
   # git config --global user.name "Build User"
   # bun test --timeout=20000 --parallel
-}
+#}
 
 package() {
   cd $pkgname

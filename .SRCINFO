@@ -5,7 +5,6 @@ pkgbase = opencode
 	url = https://github.com/anomalyco/opencode
 	arch = x86_64
 	license = MIT
-	checkdepends = nodejs-lts-jod
 	makedepends = bun
 	makedepends = git
 	depends = curl
