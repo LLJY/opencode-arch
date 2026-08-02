@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+pkgver=${PKGVER:-$(awk -F= '/^pkgver=/{ print $2; exit }' "$repo_root/PKGBUILD")}
+pkgrel=${PKGREL:-$(awk -F= '/^pkgrel=/{ print $2; exit }' "$repo_root/PKGBUILD")}
+pkgdesc=${PKGDESC:-"The open source coding agent"}
+homepage=${HOMEPAGE:-https://github.com/anomalyco/opencode}
+maintainer=${DEB_MAINTAINER:-"opencode downstream maintainers <noreply@example.invalid>"}
+opencode_repo=${OPENCODE_REPO:-$homepage.git}
+patch_file=${PATCH_FILE:-$repo_root/downstream-$pkgver.patch}
+out_dir=${OUT_DIR:-$repo_root/dist/debian}
+work_dir=${WORK_DIR:-}
+
+usage() {
+  cat <<EOF
+Usage: ${0##*/} [--help]
+
+Build Debian binary packages for opencode and opencode-daemon.
+
+Environment overrides:
+  PKGVER           Upstream version (default: pkgver from PKGBUILD)
+  PKGREL           Debian revision (default: pkgrel from PKGBUILD)
+  OPENCODE_REPO    Git repository/path to clone (default: $homepage.git)
+  PATCH_FILE       Downstream patch (default: downstream-\$PKGVER.patch)
+  OUT_DIR          Output directory (default: dist/debian)
+  WORK_DIR         Work directory (default: temporary directory)
+  DEB_MAINTAINER   Maintainer field (default: $maintainer)
+EOF
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  "") ;;
+  *)
+    usage >&2
+    exit 64
+    ;;
+esac
+
+require() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    printf 'Missing required command: %s\n' "$1" >&2
+    exit 127
+  fi
+}
+
+require bun
+require dpkg
+require dpkg-deb
+require dpkg-shlibdeps
+require git
+require md5sum
+require patch
+
+if [ ! -f "$patch_file" ]; then
+  printf 'Missing downstream patch: %s\n' "$patch_file" >&2
+  exit 66
+fi
+
+deb_arch=$(dpkg --print-architecture)
+case "$deb_arch" in
+  amd64)
+    dist_dir=opencode-linux-x64-baseline
+    build_args=(--single --baseline --skip-install)
+    ;;
+  arm64)
+    dist_dir=opencode-linux-arm64
+    build_args=(--single --skip-install)
+    ;;
+  *)
+    printf 'Unsupported Debian architecture: %s\n' "$deb_arch" >&2
+    exit 65
+    ;;
+esac
+
+if [ -z "$work_dir" ]; then
+  work_dir=$(mktemp -d)
+  cleanup_work_dir=1
+else
+  cleanup_work_dir=0
+  mkdir -p "$work_dir"
+fi
+
+cleanup() {
+  if [ "$cleanup_work_dir" -eq 1 ]; then
+    rm -rf "$work_dir"
+  fi
+}
+trap cleanup EXIT
+
+version=$pkgver-$pkgrel
+src_dir=$work_dir/src/opencode
+pkg_root=$work_dir/pkg
+mkdir -p "$out_dir" "$pkg_root"
+
+printf 'Cloning %s at v%s\n' "$opencode_repo" "$pkgver"
+git clone --depth 1 --branch "v$pkgver" "$opencode_repo" "$src_dir"
+
+printf 'Applying %s\n' "$patch_file"
+patch -d "$src_dir" -Np1 -i "$patch_file"
+
+printf 'Installing dependencies\n'
+(cd "$src_dir" && bun install --frozen-lockfile --ignore-scripts)
+
+printf 'Building opencode binary\n'
+(cd "$src_dir/packages/opencode" && OPENCODE_VERSION=$pkgver bun run ./script/build.ts "${build_args[@]}")
+
+build_opencode_package() {
+  local pkgdir=$pkg_root/opencode
+  local control=$pkgdir/DEBIAN/control
+  rm -rf "$pkgdir"
+
+  install -Dm755 "$src_dir/packages/opencode/dist/$dist_dir/bin/opencode" "$pkgdir/usr/bin/opencode"
+  install -Dm644 "$src_dir/LICENSE" "$pkgdir/usr/share/licenses/opencode/LICENSE"
+
+  SHELL=/bin/bash "$pkgdir/usr/bin/opencode" completion > "$work_dir/opencode.bash-completion"
+  install -Dm644 "$work_dir/opencode.bash-completion" "$pkgdir/usr/share/bash-completion/completions/opencode"
+
+  SHELL=/bin/zsh "$pkgdir/usr/bin/opencode" completion > "$work_dir/opencode.zsh-completion"
+  install -Dm644 "$work_dir/opencode.zsh-completion" "$pkgdir/usr/share/zsh/vendor-completions/_opencode"
+
+  mkdir -p "$pkgdir/DEBIAN"
+  local shlibs depends installed_size
+  shlibs=$(shlib_depends "$pkgdir" opencode)
+  depends=$(join_depends "$shlibs" curl ripgrep tar)
+  installed_size=$(installed_size "$pkgdir")
+  write_control "$control" opencode "$deb_arch" "$depends" "$installed_size" "$pkgdesc" \
+    "opencode is an AI-powered development tool and coding agent."
+  write_md5sums "$pkgdir"
+
+  dpkg-deb --build --root-owner-group "$pkgdir" "$out_dir/opencode_${version}_${deb_arch}.deb"
+}
+
+build_daemon_package() {
+  local pkgdir=$pkg_root/opencode-daemon
+  local control=$pkgdir/DEBIAN/control
+  rm -rf "$pkgdir"
+
+  install -Dm755 "$repo_root/opencode-daemon" "$pkgdir/usr/bin/opencode-daemon"
+  ln -s opencode-daemon "$pkgdir/usr/bin/ocd"
+  install -Dm644 "$repo_root/opencode-daemon.service" "$pkgdir/usr/lib/systemd/user/opencode-daemon.service"
+  install -Dm644 "$repo_root/LICENSE" "$pkgdir/usr/share/licenses/opencode-daemon/LICENSE"
+
+  mkdir -p "$pkgdir/DEBIAN"
+  write_control "$control" opencode-daemon all "opencode (= $version), systemd" "$(installed_size "$pkgdir")" \
+    "Systemd user service wrapper for opencode" \
+    "opencode-daemon installs a user service wrapper and the ocd convenience command for attaching to a persistent local opencode server."
+  write_md5sums "$pkgdir"
+
+  dpkg-deb --build --root-owner-group "$pkgdir" "$out_dir/opencode-daemon_${version}_all.deb"
+}
+
+shlib_depends() {
+  local pkgdir=$1
+  local pkgname=$2
+  local deps_dir=$work_dir/shlibdeps-$pkgname
+  rm -rf "$deps_dir"
+  mkdir -p "$deps_dir/debian"
+  cat > "$deps_dir/debian/control" <<EOF
+Source: opencode
+Package: $pkgname
+Architecture: any
+EOF
+  (
+    cd "$deps_dir"
+    dpkg-shlibdeps -O -Tsubstvars -e"$pkgdir/usr/bin/opencode"
+  ) | sed -n 's/^shlibs:Depends=//p'
+}
+
+join_depends() {
+  local first=${1:-}
+  shift || true
+  local result=$first
+  local dep
+  for dep in "$@"; do
+    if [ -n "$result" ]; then
+      result="$result, $dep"
+    else
+      result=$dep
+    fi
+  done
+  printf '%s\n' "$result"
+}
+
+installed_size() {
+  du -sk "$1/usr" | awk '{ print $1 }'
+}
+
+write_control() {
+  local file=$1 package=$2 arch=$3 depends=$4 installed=$5 short=$6 long=$7
+  cat > "$file" <<EOF
+Package: $package
+Version: $version
+Section: utils
+Priority: optional
+Architecture: $arch
+Maintainer: $maintainer
+Installed-Size: $installed
+Depends: $depends
+Homepage: $homepage
+Description: $short
+ $long
+EOF
+}
+
+write_md5sums() {
+  local pkgdir=$1
+  (
+    cd "$pkgdir"
+    find . -path ./DEBIAN -prune -o -type f -print | sort | sed 's#^./##' | xargs md5sum
+  ) > "$pkgdir/DEBIAN/md5sums"
+}
+
+build_opencode_package
+build_daemon_package
+
+printf 'Validating Debian packages\n'
+dpkg-deb -I "$out_dir/opencode_${version}_${deb_arch}.deb" >/dev/null
+dpkg-deb -c "$out_dir/opencode_${version}_${deb_arch}.deb" >/dev/null
+dpkg-deb -I "$out_dir/opencode-daemon_${version}_all.deb" >/dev/null
+dpkg-deb -c "$out_dir/opencode-daemon_${version}_all.deb" >/dev/null
+
+printf 'Built:\n'
+printf '  %s\n' "$out_dir/opencode_${version}_${deb_arch}.deb"
+printf '  %s\n' "$out_dir/opencode-daemon_${version}_all.deb"

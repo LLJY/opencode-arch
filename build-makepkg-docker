@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+image=${MAKEPKG_IMAGE:-opencode-makepkg:arch}
+out_dir=${OUT_DIR:-$repo_root/dist/arch}
+container=opencode-makepkg-$$
+
+mkdir -p "$out_dir"
+
+docker build --file "$repo_root/Dockerfile.makepkg" --tag "$image" "$repo_root"
+docker create --name "$container" "$image" >/dev/null
+cleanup() { docker rm -f "$container" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+
+docker start --attach "$container"
+
+pkgver=$(awk -F= '/^pkgver=/{ print $2; exit }' "$repo_root/PKGBUILD")
+pkgrel=$(awk -F= '/^pkgrel=/{ print $2; exit }' "$repo_root/PKGBUILD")
+opencode_pkg="opencode-${pkgver}-${pkgrel}-x86_64.pkg.tar.zst"
+daemon_pkg="opencode-daemon-${pkgver}-${pkgrel}-x86_64.pkg.tar.zst"
+
+docker cp "$container:/build/$opencode_pkg" "$out_dir/$opencode_pkg"
+docker cp "$container:/build/$daemon_pkg" "$out_dir/$daemon_pkg"
+
+printf 'Built Arch packages:\n'
+printf '  %s\n' "$out_dir/$opencode_pkg" "$out_dir/$daemon_pkg"

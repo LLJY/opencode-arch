@@ -1,0 +1,8 @@
+.git
+src
+pkg
+opencode
+dist
+*.pkg.tar.*
+*.deb
+*.log

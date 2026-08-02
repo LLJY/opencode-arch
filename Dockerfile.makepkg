@@ -1,0 +1,14 @@
+FROM archlinux:base-devel
+
+RUN pacman -Syu --noconfirm --needed bun git \
+    && pacman -Scc --noconfirm \
+    && useradd --create-home --shell /bin/bash builder \
+    && printf 'builder ALL=(ALL) NOPASSWD: /usr/bin/pacman\n' >/etc/sudoers.d/builder-makepkg \
+    && chmod 0440 /etc/sudoers.d/builder-makepkg
+
+RUN mkdir -p /build && chown builder:builder /build
+WORKDIR /build
+COPY --chown=builder:builder . /build
+
+USER builder
+CMD ["makepkg", "--syncdeps", "--noconfirm", "--cleanbuild", "--clean", "--force"]

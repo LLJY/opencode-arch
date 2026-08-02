@@ -6,8 +6,8 @@ pkgname=(
   'opencode'
   'opencode-daemon'
 )
-pkgver=1.15.13
-pkgrel=6
+pkgver=1.18.11
+pkgrel=1
 pkgdesc='The open source coding agent'
 arch=('x86_64')
 url='https://github.com/anomalyco/opencode'
@@ -25,20 +25,20 @@ options=(
 )
 source=(
   "git+$url.git#tag=v$pkgver"
-  'downstream-1.15.13.patch'
+  'downstream-1.18.11.patch'
   'opencode-daemon'
   'opencode-daemon.service'
   'LICENSE'
 )
-b2sums=('fddf7bb60f5d3f5a0c1790798e73349934d2b12646542aa66095368293ddeff627b10a724bb06180070014929f37c53ffd2721698eea7ab689c32adb8b6f2256'
-        '094949882b3983062dbbe33784d09dc9468a2a265de13c381c967a820cc3fe45d1fcda01d5e9b92f8d6c44da1537f9a610dde07f9c51ee1cc0a7f07cd37fbdb9'
-        'a2e4e1d739dafced870982347c00c017c6040dd281893df6fd181090348d7dd771cbaa99065f2d27a4ec93be9aca24ca9510f6b63e704407e3d142ca3cf5f2c9'
-        'e6a605c6838925a84f6cedbabf7dd02923e83e12c492db08bf58141ae08d46d1d046af5765f099d1d804aea38a84f5d563ae34abeea5d5fb3142d2894ddfe480'
+b2sums=('SKIP'
+        '8ac6ef548e2e23b2a7695fbb9a2e36aea04c68b0b645905f9dd76864d50e31ba62d6397a700cd2a66ee773414e4d4b232452bf677022ce85afbffb4f85a23f7d'
+        '14b099d6f6e2fb6445a5ed52eb53928559603bb15ba1d504ab0b953e2ab6d7c238be0c8a93974b8ed288b2e8353b840c743968769b24e1dde661d0412ef381ec'
+        'a4662a1e2caf4b5d24e4bd41a023c29d27590f5da0c881d4ee5570327e269a78652d98a4aa29f8286f808edb1e94b814d7eb145ff24f00fbf8eb07363617aaa7'
         'a29664104e1ee73ca0aee1d633e9095d92a57c92787f8d8740bdb7211ba3205782ed8677f539bdb8cae3dd75a3694be3132e185fa3fc4b3f401e1f88eb776101')
 
 prepare() {
   cd $pkgbase
-  patch -Np1 -i ../downstream-1.15.13.patch
+  patch -Np1 -i ../downstream-1.18.11.patch
   bun install --frozen-lockfile --ignore-scripts
 }
 
