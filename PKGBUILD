@@ -2,7 +2,7 @@
 # Maintainer: Sven-Hendrik Haase <svenstaro@archlinux.org>
 
 pkgname=opencode
-pkgver=1.18.15
+pkgver=1.18.16
 pkgrel=1
 pkgdesc='The open source coding agent'
 arch=('x86_64')
@@ -31,7 +31,7 @@ options=(
   '!strip'
 )
 source=("git+$url.git#tag=v$pkgver")
-b2sums=('02f51b0a031de7c89d5233c188edef9aca7058ec5c77a1a205dbf9c2ce3220e149a3c5b5e0fdf02c1bbbbbcfe5ad99af5ed5c949bf6e653ef8775f00b1bb2e2d')
+b2sums=('1908c9f9a3ee4b56a717e583898821db8646424fb80a45b27c5d41c316902cf5ee080573102f23544a3636813b72612afcb0d65e97f45fdf4ec5e4a54fc94c36')
 
 prepare() {
   cd $pkgname
