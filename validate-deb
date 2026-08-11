@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -lt 4 ] || [ "$#" -gt 5 ]; then
+  printf 'Usage: %s DEB PACKAGE VERSION ARCH [BINARY_PATH]\n' "${0##*/}" >&2
+  exit 64
+fi
+
+deb=$1
+expected_package=$2
+expected_version=$3
+expected_arch=$4
+binary_path=${5:-}
+
+fail() {
+  printf 'Validation failed for %s: %s\n' "$deb" "$1" >&2
+  exit 1
+}
+
+[ -s "$deb" ] || fail "package is missing or empty"
+[ "$(dpkg-deb -f "$deb" Package)" = "$expected_package" ] || fail "unexpected Package metadata"
+[ "$(dpkg-deb -f "$deb" Version)" = "$expected_version" ] || fail "unexpected Version metadata"
+[ "$(dpkg-deb -f "$deb" Architecture)" = "$expected_arch" ] || fail "unexpected Architecture metadata"
+dpkg-deb -I "$deb" >/dev/null
+dpkg-deb -c "$deb" >/dev/null
+
+if [ -z "$binary_path" ]; then
+  printf 'Validated %s %s (%s)\n' "$expected_package" "$expected_version" "$expected_arch"
+  exit 0
+fi
+
+case "$expected_arch" in
+  amd64)
+    expected_machine='Advanced Micro Devices X86-64'
+    expected_interpreter='/lib64/ld-linux-x86-64.so.2'
+    ;;
+  arm64)
+    expected_machine='AArch64'
+    expected_interpreter='/lib/ld-linux-aarch64.so.1'
+    ;;
+  *) fail "unsupported executable architecture $expected_arch" ;;
+esac
+
+extract_dir=$(mktemp -d)
+cleanup() { rm -rf "$extract_dir"; }
+trap cleanup EXIT INT TERM
+dpkg-deb -x "$deb" "$extract_dir"
+binary="$extract_dir/$binary_path"
+[ -x "$binary" ] || fail "missing executable $binary_path"
+
+elf_class=$(readelf -h "$binary" | sed -n 's/^[[:space:]]*Class:[[:space:]]*//p')
+machine=$(readelf -h "$binary" | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')
+interpreter=$(readelf -l "$binary" | sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p')
+[ "$elf_class" = ELF64 ] || fail "unexpected ELF class $elf_class"
+[ "$machine" = "$expected_machine" ] || fail "unexpected ELF machine $machine"
+[ "$interpreter" = "$expected_interpreter" ] || fail "unexpected ELF interpreter $interpreter"
+
+runner=()
+if [ "$expected_arch" = arm64 ] && [ "$(dpkg --print-architecture)" != arm64 ]; then
+  command -v qemu-aarch64-static >/dev/null || fail "qemu-aarch64-static is unavailable"
+  runner=(qemu-aarch64-static -L /)
+elif [ "$expected_arch" != "$(dpkg --print-architecture)" ]; then
+  fail "cannot execute $expected_arch binary on $(dpkg --print-architecture)"
+fi
+
+actual_binary_version=$(SHELL=/bin/bash "${runner[@]}" "$binary" --version)
+expected_binary_version=${expected_version%%-*}
+[ "$actual_binary_version" = "$expected_binary_version" ] || fail "binary version $actual_binary_version != $expected_binary_version"
+
+printf 'Validated %s %s (%s, %s, %s)\n' \
+  "$expected_package" "$expected_version" "$expected_arch" "$machine" "$interpreter"

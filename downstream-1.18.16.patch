@@ -1581,6 +1581,241 @@ index cd8bad51af..363fca0f97 100644
      }),
    )
  
+diff --git a/packages/opencode/script/build.ts b/packages/opencode/script/build.ts
+index ce45f770f0..20ed709052 100755
+--- a/packages/opencode/script/build.ts
++++ b/packages/opencode/script/build.ts
+@@ -20,6 +20,12 @@ const singleFlag = process.argv.includes("--single")
+ const baselineFlag = process.argv.includes("--baseline")
+ const skipInstall = process.argv.includes("--skip-install")
+ const sourcemapsFlag = process.argv.includes("--sourcemaps")
++const targetArgs = process.argv.filter((arg) => arg.startsWith("--target"))
++if (targetArgs.length > 1) throw new Error("Build target may be specified only once")
++const targetArg = targetArgs[0]
++if (targetArg && !targetArg.startsWith("--target=")) throw new Error(`Invalid build target argument: ${targetArg}`)
++const targetFlag = targetArg?.slice("--target=".length)
++if (targetArg && !targetFlag) throw new Error("Build target must not be empty")
+ const plugin = createSolidTransformPlugin()
+ const skipEmbedWebUi = process.argv.includes("--skip-embed-web-ui")
+ 
+@@ -113,26 +119,41 @@ const allTargets: {
+   },
+ ]
+ 
+-const targets = singleFlag
+-  ? allTargets.filter((item) => {
+-      if (item.os !== process.platform || item.arch !== process.arch) {
+-        return false
+-      }
++const targetName = (item: (typeof allTargets)[number]) =>
++  [
++    pkg.name,
++    item.os === "win32" ? "windows" : item.os,
++    item.arch,
++    item.avx2 === false ? "baseline" : undefined,
++    item.abi === undefined ? undefined : item.abi,
++  ]
++    .filter(Boolean)
++    .join("-")
++
++const targets = (() => {
++  if (targetFlag) return allTargets.filter((item) => targetName(item).slice(`${pkg.name}-`.length) === targetFlag)
++  if (!singleFlag) return allTargets
++  return allTargets.filter((item) => {
++    if (item.os !== process.platform || item.arch !== process.arch) {
++      return false
++    }
++
++    // When building for the current platform, prefer a single native binary by default.
++    // Baseline binaries require additional Bun artifacts and can be flaky to download.
++    if (item.avx2 === false) {
++      return baselineFlag
++    }
+ 
+-      // When building for the current platform, prefer a single native binary by default.
+-      // Baseline binaries require additional Bun artifacts and can be flaky to download.
+-      if (item.avx2 === false) {
+-        return baselineFlag
+-      }
++    // also skip abi-specific builds for the same reason
++    if (item.abi !== undefined) {
++      return false
++    }
+ 
+-      // also skip abi-specific builds for the same reason
+-      if (item.abi !== undefined) {
+-        return false
+-      }
++    return true
++  })
++})()
+ 
+-      return true
+-    })
+-  : allTargets
++if (targets.length === 0) throw new Error(`Unknown or unavailable build target: ${targetFlag ?? "native"}`)
+ 
+ await $`rm -rf dist`
+ 
+@@ -143,16 +164,7 @@ if (!skipInstall) {
+   await $`bun install --os="*" --cpu="*" @ff-labs/fff-bun@${pkg.dependencies["@ff-labs/fff-bun"]}`
+ }
+ for (const item of targets) {
+-  const name = [
+-    pkg.name,
+-    // changing to win32 flags npm for some reason
+-    item.os === "win32" ? "windows" : item.os,
+-    item.arch,
+-    item.avx2 === false ? "baseline" : undefined,
+-    item.abi === undefined ? undefined : item.abi,
+-  ]
+-    .filter(Boolean)
+-    .join("-")
++  const name = targetName(item)
+   console.log(`building ${name}`)
+   await $`mkdir -p dist/${name}/bin`
+ 
+diff --git a/packages/opencode/src/cli/cmd/mcp.ts b/packages/opencode/src/cli/cmd/mcp.ts
+index c2d2ee2f3b..80e8f62890 100644
+--- a/packages/opencode/src/cli/cmd/mcp.ts
++++ b/packages/opencode/src/cli/cmd/mcp.ts
+@@ -20,6 +20,7 @@ import { Global } from "@opencode-ai/core/global"
+ import { modify, applyEdits } from "jsonc-parser"
+ import { Filesystem } from "@/util/filesystem"
+ import { Effect } from "effect"
++import { McpConfig } from "../../mcp/config"
+ 
+ function getAuthStatusIcon(status: MCP.AuthStatus): string {
+   switch (status) {
+@@ -61,7 +62,7 @@ function configuredServers(config: ConfigV1.Info) {
+ 
+ function oauthServers(config: ConfigV1.Info) {
+   return configuredServers(config).filter(
+-    (entry): entry is [string, McpRemote] => isMcpRemote(entry[1]) && entry[1].oauth !== false,
++    (entry): entry is [string, McpRemote] => isMcpRemote(entry[1]) && !McpConfig.oauthDisabled(entry[1]),
+   )
+ }
+ 
+@@ -125,7 +126,7 @@ export const McpListCommand = effectCmd({
+ 
+     for (const [name, serverConfig] of servers) {
+       const status = statuses[name]
+-      const hasOAuth = isMcpRemote(serverConfig) && !!serverConfig.oauth
++      const hasOAuth = isMcpRemote(serverConfig) && !!serverConfig.oauth && !McpConfig.oauthDisabled(serverConfig)
+       const hasStoredTokens = stored[name]
+ 
+       let statusIcon: string
+@@ -231,7 +232,7 @@ export const McpAuthCommand = effectCmd({
+       return
+     }
+ 
+-    if (!isMcpRemote(serverConfig) || serverConfig.oauth === false) {
++    if (!isMcpRemote(serverConfig) || McpConfig.oauthDisabled(serverConfig)) {
+       prompts.log.error(`MCP server ${serverName} is not an OAuth-capable remote server`)
+       prompts.outro("Done")
+       return
+@@ -667,14 +668,19 @@ export const McpDebugCommand = effectCmd({
+     }),
+   handler: Effect.fn("Cli.mcp.debug")(function* (args) {
+     const config = yield* Config.Service.use((cfg) => cfg.get())
+-    const mcp = yield* MCP.Service
+-    const auth = yield* McpAuth.Service
+     const serverConfig = config.mcp?.[args.name]
+     const authInfo =
+-      serverConfig && isMcpRemote(serverConfig) && serverConfig.oauth !== false
+-        ? yield* Effect.all({
+-            authStatus: mcp.getAuthStatus(args.name),
+-            entry: auth.get(args.name),
++      serverConfig && isMcpRemote(serverConfig) && !McpConfig.oauthDisabled(serverConfig)
++        ? yield* Effect.gen(function* () {
++            const mcp = yield* MCP.Service
++            const auth = yield* McpAuth.Service
++            return {
++              ...(yield* Effect.all({
++                authStatus: mcp.getAuthStatus(args.name),
++                entry: auth.get(args.name),
++              })),
++              auth,
++            }
+           })
+         : undefined
+     yield* Effect.promise(async () => {
+@@ -695,35 +701,34 @@ export const McpDebugCommand = effectCmd({
+         return
+       }
+ 
+-      if (serverConfig.oauth === false) {
+-        prompts.log.warn(`MCP server ${serverName} has OAuth explicitly disabled`)
+-        prompts.outro("Done")
+-        return
+-      }
+-
+       prompts.log.info(`Server: ${serverName}`)
+       prompts.log.info(`URL: ${serverConfig.url}`)
+ 
+-      const { authStatus, entry } = authInfo!
+-      prompts.log.info(`Auth status: ${getAuthStatusIcon(authStatus)} ${getAuthStatusText(authStatus)}`)
++      if (!authInfo) prompts.log.warn(`MCP server ${serverName} has OAuth disabled by configuration`)
++
++      if (authInfo) {
++        prompts.log.info(
++          `Auth status: ${getAuthStatusIcon(authInfo.authStatus)} ${getAuthStatusText(authInfo.authStatus)}`,
++        )
++      }
+ 
+-      if (entry?.tokens) {
++      if (authInfo?.entry?.tokens) {
+         prompts.log.info(
+-          `  Access token: ${entry.tokens.accessToken.length > 8 ? `${entry.tokens.accessToken.slice(0, 4)}***${entry.tokens.accessToken.slice(-4)}` : "***"}`,
++          `  Access token: ${authInfo.entry.tokens.accessToken.length > 8 ? `${authInfo.entry.tokens.accessToken.slice(0, 4)}***${authInfo.entry.tokens.accessToken.slice(-4)}` : "***"}`,
+         )
+-        if (entry.tokens.expiresAt) {
+-          const expiresDate = new Date(entry.tokens.expiresAt * 1000)
+-          const isExpired = entry.tokens.expiresAt < Date.now() / 1000
++        if (authInfo.entry.tokens.expiresAt) {
++          const expiresDate = new Date(authInfo.entry.tokens.expiresAt * 1000)
++          const isExpired = authInfo.entry.tokens.expiresAt < Date.now() / 1000
+           prompts.log.info(`  Expires: ${expiresDate.toISOString()} ${isExpired ? "(EXPIRED)" : ""}`)
+         }
+-        if (entry.tokens.refreshToken) {
++        if (authInfo.entry.tokens.refreshToken) {
+           prompts.log.info(`  Refresh token: present`)
+         }
+       }
+-      if (entry?.clientInfo) {
+-        prompts.log.info(`  Client ID: ${entry.clientInfo.clientId}`)
+-        if (entry.clientInfo.clientSecretExpiresAt) {
+-          const expiresDate = new Date(entry.clientInfo.clientSecretExpiresAt * 1000)
++      if (authInfo?.entry?.clientInfo) {
++        prompts.log.info(`  Client ID: ${authInfo.entry.clientInfo.clientId}`)
++        if (authInfo.entry.clientInfo.clientSecretExpiresAt) {
++          const expiresDate = new Date(authInfo.entry.clientInfo.clientSecretExpiresAt * 1000)
+           prompts.log.info(`  Client secret expires: ${expiresDate.toISOString()}`)
+         }
+       }
+@@ -760,7 +765,12 @@ export const McpDebugCommand = effectCmd({
+           prompts.log.info(`WWW-Authenticate: ${wwwAuth}`)
+         }
+ 
+-        if (response.status === 401) {
++        if (response.status === 401 && !authInfo) {
++          prompts.log.warn(
++            "Connection returned 401 while OAuth is disabled; check the configured authentication headers",
++          )
++        } else if (response.status === 401) {
++          if (!authInfo) throw new Error("OAuth debug state is unavailable")
+           prompts.log.info("Initial unauthenticated check returned 401, so this server requires OAuth")
+ 
+           // Try to discover OAuth metadata
+@@ -777,7 +787,7 @@ export const McpDebugCommand = effectCmd({
+             {
+               onRedirect: async () => {},
+             },
+-            auth,
++            authInfo.auth,
+           )
+ 
+           prompts.log.info("Testing OAuth flow (without completing authorization)...")
 diff --git a/packages/opencode/src/mcp/catalog.ts b/packages/opencode/src/mcp/catalog.ts
 index 3f985eeb94..79cdbdf673 100644
 --- a/packages/opencode/src/mcp/catalog.ts
@@ -1614,19 +1849,37 @@ index 3f985eeb94..79cdbdf673 100644
  export function prompts(client: Client, timeout?: number) {
    if (!client.getServerCapabilities()?.prompts) return Promise.resolve([])
    return paginate(
+diff --git a/packages/opencode/src/mcp/config.ts b/packages/opencode/src/mcp/config.ts
+new file mode 100644
+index 0000000000..9ece362d85
+--- /dev/null
++++ b/packages/opencode/src/mcp/config.ts
+@@ -0,0 +1,11 @@
++import { ConfigMCPV1 } from "@opencode-ai/core/v1/config/mcp"
++
++type Remote = Extract<ConfigMCPV1.Info, { type: "remote" }>
++
++export function oauthDisabled(config: Remote) {
++  return (
++    config.oauth === false || Object.keys(config.headers ?? {}).some((key) => key.toLowerCase() === "authorization")
++  )
++}
++
++export * as McpConfig from "./config"
 diff --git a/packages/opencode/src/mcp/index.ts b/packages/opencode/src/mcp/index.ts
-index 05f12fa2ee..940b506d17 100644
+index 05f12fa2ee..481f2984e8 100644
 --- a/packages/opencode/src/mcp/index.ts
 +++ b/packages/opencode/src/mcp/index.ts
-@@ -34,6 +34,7 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+@@ -34,6 +34,8 @@ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
  import { McpCatalog } from "./catalog"
  import { McpEvent } from "@opencode-ai/schema/mcp-event"
  import { McpBrowser } from "./browser"
 +import { McpRateLimit } from "./rate-limit"
++import { McpConfig } from "./config"
  
  const DEFAULT_TIMEOUT = 30_000
  const CLIENT_OPTIONS = {
-@@ -107,7 +108,7 @@ export const Status = Schema.Union([
+@@ -107,7 +109,7 @@ export const Status = Schema.Union([
  export type Status = Schema.Schema.Type<typeof Status>
  
  // Store transports for OAuth servers to allow finishing auth
@@ -1635,7 +1888,7 @@ index 05f12fa2ee..940b506d17 100644
  const pendingOAuthTransports = new Map<string, { transport: TransportWithAuth; provider?: McpOAuthPendingProvider }>()
  
  // Prompt cache types
-@@ -209,7 +210,7 @@ const layer = Layer.effect(
+@@ -209,7 +211,7 @@ const layer = Layer.effect(
      const events = yield* EventV2Bridge.Service
      const browser = yield* McpBrowser.Service
  
@@ -1644,7 +1897,16 @@ index 05f12fa2ee..940b506d17 100644
  
      /**
       * Connect a client via the given transport with resource safety:
-@@ -269,17 +270,27 @@ const layer = Layer.effect(
+@@ -237,7 +239,7 @@ const layer = Layer.effect(
+       key: string,
+       mcp: ConfigMCPV1.Info & { type: "remote" },
+     ) {
+-      const oauthDisabled = mcp.oauth === false
++      const oauthDisabled = McpConfig.oauthDisabled(mcp)
+       const oauthConfig = typeof mcp.oauth === "object" ? mcp.oauth : undefined
+       const url = remoteURL(mcp.url)
+       if (!url) {
+@@ -269,17 +271,27 @@ const layer = Layer.effect(
        const transports: Array<{ name: string; transport: TransportWithAuth }> = [
          {
            name: "StreamableHTTP",
@@ -1680,7 +1942,19 @@ index 05f12fa2ee..940b506d17 100644
          },
        ]
  
-@@ -843,10 +854,15 @@ const layer = Layer.effect(
+@@ -806,7 +818,10 @@ const layer = Layer.effect(
+     const startAuth = Effect.fn("MCP.startAuth")(function* (mcpName: string) {
+       const mcpConfig = yield* requireMcpConfig(mcpName)
+       if (mcpConfig.type !== "remote") throw new Error(`MCP server ${mcpName} is not a remote server`)
+-      if (mcpConfig.oauth === false) throw new Error(`MCP server ${mcpName} has OAuth explicitly disabled`)
++      if (McpConfig.oauthDisabled(mcpConfig)) {
++        if (mcpConfig.oauth === false) throw new Error(`MCP server ${mcpName} has OAuth explicitly disabled`)
++        throw new Error(`MCP server ${mcpName} uses an explicit Authorization header; OAuth is disabled`)
++      }
+       const url = remoteURL(mcpConfig.url)
+       if (!url) throw new Error(`Invalid MCP URL for "${mcpName}"`)
+ 
+@@ -843,10 +858,15 @@ const layer = Layer.effect(
          auth,
        )
  
@@ -1700,12 +1974,57 @@ index 05f12fa2ee..940b506d17 100644
        const directory = yield* InstanceState.directory
  
        return yield* Effect.tryPromise({
+@@ -915,8 +935,25 @@ const layer = Layer.effect(
+       return yield* finishAuth(mcpName, code)
+     })
+ 
++    const invalidatePendingAuth = Effect.fnUntraced(function* (mcpName: string) {
++      const pending = pendingOAuthTransports.get(mcpName)
++      pendingOAuthTransports.delete(mcpName)
++      McpOAuthCallback.cancelPending(mcpName)
++      yield* auth.clearOAuthState(mcpName)
++      yield* auth.clearCodeVerifier(mcpName)
++      if (pending) yield* Effect.tryPromise(() => pending.transport.close()).pipe(Effect.ignore)
++    })
++
+     const finishAuth = Effect.fn("MCP.finishAuth")(function* (mcpName: string, authorizationCode: string) {
+-      yield* requireMcpConfig(mcpName)
++      const mcpConfig = yield* requireMcpConfig(mcpName)
++      if (mcpConfig.type !== "remote") {
++        yield* invalidatePendingAuth(mcpName)
++        throw new Error(`MCP server ${mcpName} is not a remote server`)
++      }
++      if (McpConfig.oauthDisabled(mcpConfig)) {
++        yield* invalidatePendingAuth(mcpName)
++        throw new Error(`OAuth is disabled by configuration for MCP server ${mcpName}`)
++      }
+       const pending = pendingOAuthTransports.get(mcpName)
+       if (!pending) throw new Error(`No pending OAuth flow for MCP server: ${mcpName}`)
+ 
+@@ -936,8 +973,6 @@ const layer = Layer.effect(
+       yield* auth.clearCodeVerifier(mcpName)
+       pendingOAuthTransports.delete(mcpName)
+ 
+-      const mcpConfig = yield* requireMcpConfig(mcpName)
+-
+       return yield* createAndStore(mcpName, { ...mcpConfig, enabled: true })
+     })
+ 
+@@ -949,7 +984,7 @@ const layer = Layer.effect(
+ 
+     const supportsOAuth = Effect.fn("MCP.supportsOAuth")(function* (mcpName: string) {
+       const mcpConfig = yield* requireMcpConfig(mcpName)
+-      return mcpConfig.type === "remote" && mcpConfig.oauth !== false
++      return mcpConfig.type === "remote" && !McpConfig.oauthDisabled(mcpConfig)
+     })
+ 
+     const hasStoredTokens = Effect.fn("MCP.hasStoredTokens")(function* (mcpName: string) {
 diff --git a/packages/opencode/src/mcp/rate-limit.ts b/packages/opencode/src/mcp/rate-limit.ts
 new file mode 100644
-index 0000000000..e8575346b3
+index 0000000000..b5eae63ee6
 --- /dev/null
 +++ b/packages/opencode/src/mcp/rate-limit.ts
-@@ -0,0 +1,233 @@
+@@ -0,0 +1,238 @@
 +import { AsyncLocalStorage } from "node:async_hooks"
 +import type { FetchLike, Transport, TransportSendOptions } from "@modelcontextprotocol/sdk/shared/transport.js"
 +import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js"
@@ -1714,6 +2033,7 @@ index 0000000000..e8575346b3
 +const MAX_DELAY = 30_000
 +const MAX_TIMER_DELAY = 2_147_483_647
 +const ACTIVE_POLL_INTERVAL = 25
++const MAX_UNSCOPED_RETRIES = 3
 +
 +type RemoteTransport = Transport & {
 +  finishAuth: (authorizationCode: string) => Promise<void>
@@ -1758,7 +2078,10 @@ index 0000000000..e8575346b3
 +    this.random = options.random ?? Math.random
 +    this.wait = options.wait ?? wait
 +    this.transport = make((url, init) => this.retry(url, init))
-+    this.transport.onclose = () => this.onclose?.()
++    this.transport.onclose = () => {
++      this.controller.abort()
++      this.onclose?.()
++    }
 +    this.transport.onerror = (error) => this.onerror?.(error)
 +    this.transport.onmessage = (message, extra) => this.onmessage?.(message, extra)
 +  }
@@ -1817,6 +2140,7 @@ index 0000000000..e8575346b3
 +      ensureActive(signals, active)
 +      const response = await this.fetchImpl(url, init)
 +      if (response.status !== 429) return response
++      if (!active && attempt >= MAX_UNSCOPED_RETRIES) return response
 +
 +      const duration = delay(response.headers, attempt, { now: this.now(), random: this.random() })
 +      void response.body?.cancel().catch(() => {})
@@ -3563,10 +3887,10 @@ index 9b3f2c46f4..7c7fc433c3 100644
  }
  
 diff --git a/packages/opencode/src/session/processor.ts b/packages/opencode/src/session/processor.ts
-index 20aa8a8404..86986fdf55 100644
+index 20aa8a8404..131e80fdbb 100644
 --- a/packages/opencode/src/session/processor.ts
 +++ b/packages/opencode/src/session/processor.ts
-@@ -18,19 +18,83 @@ import type { SessionID } from "./schema"
+@@ -18,19 +18,87 @@ import type { SessionID } from "./schema"
  import { SessionRetry } from "./retry"
  import { SessionStatus } from "./status"
  import { SessionSummary } from "./summary"
@@ -3630,8 +3954,12 @@ index 20aa8a8404..86986fdf55 100644
 +  public override readonly name = "SessionProcessorStopAfterBlockedToolBoundary"
 +}
 +
-+class StopAfterUnsafeToolActivity extends Error {
-+  public override readonly name = "SessionProcessorStopAfterUnsafeToolActivity"
++class StopAfterDeterministicAssistantError extends Error {
++  public override readonly name = "SessionProcessorStopAfterDeterministicAssistantError"
++}
++
++class StopAfterObservedSideEffect extends Error {
++  public override readonly name = "SessionProcessorStopAfterObservedSideEffect"
 +}
 +
 +class StopAfterRollbackFailure extends Error {
@@ -3652,7 +3980,7 @@ index 20aa8a8404..86986fdf55 100644
    readonly updateToolCall: (
      toolCallID: string,
      update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
-@@ -51,6 +115,7 @@ type Input = {
+@@ -51,6 +119,7 @@ type Input = {
    assistantMessage: SessionV1.Assistant
    sessionID: SessionID
    model: Provider.Model
@@ -3660,13 +3988,15 @@ index 20aa8a8404..86986fdf55 100644
  }
  
  export interface Interface {
-@@ -70,8 +135,14 @@ interface ProcessorContext extends Input {
+@@ -70,8 +139,16 @@ interface ProcessorContext extends Input {
    snapshot: string | undefined
    blocked: boolean
    needsCompaction: boolean
 +  requestHasCommittedToolBoundary: boolean
 +  attemptHasToolActivity: boolean
++  attemptHasTextCompleteEffect: boolean
 +  attemptCommitted: boolean
++  attemptHasSnapshotPatch: boolean
 +  attemptNeedsReset: boolean
 +  attemptPartIDs: PartID[]
    currentText: SessionV1.TextPart | undefined
@@ -3675,13 +4005,15 @@ index 20aa8a8404..86986fdf55 100644
  }
  
  type StreamEvent = LLMEvent
-@@ -109,16 +180,145 @@ const layer = Layer.effect(
+@@ -109,16 +186,149 @@ const layer = Layer.effect(
          snapshot: initialSnapshot,
          blocked: false,
          needsCompaction: false,
 +        requestHasCommittedToolBoundary: false,
 +        attemptHasToolActivity: false,
++        attemptHasTextCompleteEffect: false,
 +        attemptCommitted: false,
++        attemptHasSnapshotPatch: false,
 +        attemptNeedsReset: false,
 +        attemptPartIDs: [],
          currentText: undefined,
@@ -3737,7 +4069,9 @@ index 20aa8a8404..86986fdf55 100644
 +
 +      function resetReplayGuardState() {
 +        ctx.attemptHasToolActivity = false
++        ctx.attemptHasTextCompleteEffect = false
 +        ctx.attemptCommitted = false
++        ctx.attemptHasSnapshotPatch = false
 +        ctx.attemptPartIDs = []
 +        replayState = captureReplayState()
 +      }
@@ -3784,7 +4118,7 @@ index 20aa8a8404..86986fdf55 100644
 +        if (!message) return undefined
 +        return new ProviderError.ResponseStreamError(message, currentResponseStreamInfo(message, nativeOpenAIResponseTransport(error)), {
 +          cause: error,
-+        })
+         })
 +      }
 +
 +      function normalizeJsonParseResponseStreamError(error: unknown): ProviderError.ResponseStreamError | undefined {
@@ -3800,7 +4134,7 @@ index 20aa8a8404..86986fdf55 100644
 +        if (!responseStreamErrorMessage(message)) return undefined
 +        return new ProviderError.ResponseStreamError(message, currentResponseStreamInfo(message), {
 +          cause: error,
-         })
++        })
 +      }
 +
 +      function providerErrorStreamInfo(value: Extract<StreamEvent, { type: "provider-error" }>) {
@@ -3821,7 +4155,7 @@ index 20aa8a8404..86986fdf55 100644
  
        const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
          const done = ctx.toolcalls[toolCallID]?.done
-@@ -180,6 +380,7 @@ const layer = Layer.effect(
+@@ -180,6 +390,7 @@ const layer = Layer.effect(
              attachments: output.attachments,
            },
          })
@@ -3829,7 +4163,7 @@ index 20aa8a8404..86986fdf55 100644
          yield* settleToolCall(toolCallID)
        })
  
-@@ -200,6 +401,7 @@ const layer = Layer.effect(
+@@ -200,6 +411,7 @@ const layer = Layer.effect(
          if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
            ctx.blocked = ctx.shouldBreak
          }
@@ -3837,7 +4171,7 @@ index 20aa8a8404..86986fdf55 100644
          yield* settleToolCall(toolCallID)
          return true
        })
-@@ -278,6 +480,7 @@ const layer = Layer.effect(
+@@ -278,6 +490,7 @@ const layer = Layer.effect(
        const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
          switch (value.type) {
            case "reasoning-start":
@@ -3845,7 +4179,7 @@ index 20aa8a8404..86986fdf55 100644
              if (value.id in ctx.reasoningMap) return
              ctx.reasoningMap[value.id] = {
                id: PartID.ascending(),
-@@ -288,13 +491,16 @@ const layer = Layer.effect(
+@@ -288,13 +501,16 @@ const layer = Layer.effect(
                time: { start: Date.now() },
                metadata: value.providerMetadata,
              }
@@ -3863,7 +4197,7 @@ index 20aa8a8404..86986fdf55 100644
              if (value.providerMetadata) ctx.reasoningMap[value.id].metadata = value.providerMetadata
              yield* session.updatePartDelta({
                sessionID: ctx.reasoningMap[value.id].sessionID,
-@@ -316,6 +522,7 @@ const layer = Layer.effect(
+@@ -316,14 +532,17 @@ const layer = Layer.effect(
              if (ctx.assistantMessage.summary) {
                throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
              }
@@ -3871,7 +4205,9 @@ index 20aa8a8404..86986fdf55 100644
              yield* ensureToolCall(value)
              return
  
-@@ -324,6 +531,7 @@ const layer = Layer.effect(
+           case "tool-input-delta":
++            ctx.attemptHasToolActivity = true
+             yield* ensureToolCall(value)
              return
  
            case "tool-input-end": {
@@ -3879,7 +4215,7 @@ index 20aa8a8404..86986fdf55 100644
              yield* ensureToolCall(value)
              return
            }
-@@ -332,7 +540,9 @@ const layer = Layer.effect(
+@@ -332,7 +551,9 @@ const layer = Layer.effect(
              if (ctx.assistantMessage.summary) {
                throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
              }
@@ -3889,7 +4225,7 @@ index 20aa8a8404..86986fdf55 100644
              const input = isRecord(value.input) ? value.input : { value: value.input }
              yield* updateToolCall(value.id, (match) => ({
                ...match,
-@@ -381,6 +591,7 @@ const layer = Layer.effect(
+@@ -381,6 +602,7 @@ const layer = Layer.effect(
            }
  
            case "tool-result": {
@@ -3897,7 +4233,7 @@ index 20aa8a8404..86986fdf55 100644
              const toolCall = yield* readToolCall(value.id)
              if (!toolCall && value.result.type === "error") return
              if (value.result.type === "error") {
-@@ -414,25 +625,43 @@ const layer = Layer.effect(
+@@ -414,25 +636,43 @@ const layer = Layer.effect(
            }
  
            case "tool-error": {
@@ -3944,7 +4280,7 @@ index 20aa8a8404..86986fdf55 100644
              const completedSnapshot = yield* snapshot.track()
              yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
              const usage = Session.getUsage({
-@@ -441,10 +670,17 @@ const layer = Layer.effect(
+@@ -441,10 +681,17 @@ const layer = Layer.effect(
                metadata: value.providerMetadata,
              })
              ctx.assistantMessage.finish = value.reason
@@ -3963,7 +4299,7 @@ index 20aa8a8404..86986fdf55 100644
                reason: value.reason,
                snapshot: completedSnapshot,
                messageID: ctx.assistantMessage.id,
-@@ -453,18 +689,24 @@ const layer = Layer.effect(
+@@ -453,18 +700,25 @@ const layer = Layer.effect(
                tokens: usage.tokens,
                cost: usage.cost,
              })
@@ -3975,6 +4311,7 @@ index 20aa8a8404..86986fdf55 100644
              if (ctx.snapshot) {
                const patch = yield* snapshot.patch(ctx.snapshot)
                if (patch.files.length) {
++                ctx.attemptHasSnapshotPatch = true
 +                const patchPartID = PartID.ascending()
                  yield* session.updatePart({
 -                  id: PartID.ascending(),
@@ -3989,7 +4326,7 @@ index 20aa8a8404..86986fdf55 100644
                }
                ctx.snapshot = undefined
              }
-@@ -480,10 +722,12 @@ const layer = Layer.effect(
+@@ -480,10 +734,12 @@ const layer = Layer.effect(
              ) {
                ctx.needsCompaction = true
              }
@@ -4002,7 +4339,7 @@ index 20aa8a8404..86986fdf55 100644
              ctx.currentText = {
                id: PartID.ascending(),
                messageID: ctx.assistantMessage.id,
-@@ -493,12 +737,16 @@ const layer = Layer.effect(
+@@ -493,12 +749,16 @@ const layer = Layer.effect(
                time: { start: Date.now() },
                metadata: value.providerMetadata,
              }
@@ -4020,7 +4357,17 @@ index 20aa8a8404..86986fdf55 100644
              if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
              yield* session.updatePartDelta({
                sessionID: ctx.currentText.sessionID,
-@@ -532,6 +780,7 @@ const layer = Layer.effect(
+@@ -513,6 +773,9 @@ const layer = Layer.effect(
+             if (!ctx.currentText) return
+             // oxlint-disable-next-line no-self-assign -- reactivity trigger
+             ctx.currentText.text = ctx.currentText.text
++            ctx.attemptHasTextCompleteEffect = (yield* plugin.list()).some(
++              (hook) => hook["experimental.text.complete"] !== undefined,
++            )
+             ctx.currentText.text = (yield* plugin.trigger(
+               "experimental.text.complete",
+               {
+@@ -532,6 +795,7 @@ const layer = Layer.effect(
              return
  
            case "finish":
@@ -4028,17 +4375,17 @@ index 20aa8a8404..86986fdf55 100644
              return
          }
        })
-@@ -603,7 +852,8 @@ const layer = Layer.effect(
+@@ -603,7 +867,8 @@ const layer = Layer.effect(
            error: errorMessage(e),
            stack: e instanceof Error ? e.stack : undefined,
          })
 -        const error = parse(e)
-+        const source = e instanceof StopAfterUnsafeToolActivity ? (e.cause ?? e) : e
++        const source = e instanceof StopAfterObservedSideEffect ? (e.cause ?? e) : e
 +        const error = parse(source)
          if (SessionV1.ContextOverflowError.isInstance(error)) {
            if ((yield* config.get()).compaction?.auto === false && !ctx.assistantMessage.summary) {
              ctx.assistantMessage.error = error
-@@ -624,6 +874,85 @@ const layer = Layer.effect(
+@@ -624,6 +889,102 @@ const layer = Layer.effect(
          yield* status.set(ctx.sessionID, { type: "idle" })
        })
  
@@ -4082,12 +4429,27 @@ index 20aa8a8404..86986fdf55 100644
 +              : SessionRetry.retryable(parse(candidate), input.model.providerID)
 +          if (!retryable) return candidate
 +
++          // Deterministic assistant errors (for example EmptyResponseError) are
++          // already persisted and published; replay cannot safely retract them.
++          if (ctx.assistantMessage.error) {
++            return new StopAfterDeterministicAssistantError(retryable.message, { cause: candidate })
++          }
++
 +          if (ctx.blocked) {
 +            return new StopAfterBlockedToolBoundary(retryable.message, { cause: candidate })
 +          }
 +
-+          if (ctx.attemptHasToolActivity) {
-+            return new StopAfterUnsafeToolActivity(retryable.message, { cause: candidate })
++          // Provider replay metadata cannot make locally observed effects safe
++          // to execute again.
++          if (ctx.attemptHasTextCompleteEffect || ctx.attemptHasToolActivity || ctx.attemptHasSnapshotPatch) {
++            return new StopAfterObservedSideEffect(retryable.message, { cause: candidate })
++          }
++
++          if (
++            ctx.attemptCommitted &&
++            (ctx.assistantMessage.finish === "content-filter" || ctx.assistantMessage.finish === "error")
++          ) {
++            return new StopAfterDeterministicAssistantError(retryable.message, { cause: candidate })
 +          }
 +
 +          if (ctx.requestHasCommittedToolBoundary) {
@@ -4097,7 +4459,12 @@ index 20aa8a8404..86986fdf55 100644
 +
 +          if (!(candidate instanceof ProviderError.ResponseStreamError)) return candidate
 +          if (candidate.info.autoReplaySafe) return candidate
-+          if (ctx.attemptCommitted) return candidate
++          // A completed assistant-only step is still local model output and can
++          // be rolled back as one failed attempt. A captured filesystem patch is
++          // an external effect that removing session parts cannot undo.
++          // Only a normally stopped assistant-only step is safe to regenerate.
++          // Deterministic finishes such as content-filter/error remain terminal.
++          if (ctx.attemptCommitted && ctx.assistantMessage.finish !== "stop") return candidate
 +          if (ctx.attemptPartIDs.length === 0) return candidate
 +
 +          yield* rollbackCurrentAttempt()
@@ -4111,12 +4478,9 @@ index 20aa8a8404..86986fdf55 100644
 +            Effect.gen(function* () {
 +              const rollbackError = Cause.squash(cause)
 +              yield* Effect.logWarning("rollback retryable stream error failed", { error: errorMessage(rollbackError) })
-+              if (ctx.requestHasCommittedToolBoundary) {
-+                return new StopAfterRollbackFailure(errorMessage(rollbackError), {
-+                  cause: rollbackError,
-+                })
-+              }
-+              return error
++              return new StopAfterRollbackFailure(errorMessage(rollbackError), {
++                cause: rollbackError,
++              })
 +            }),
 +          ),
 +        )
@@ -4124,9 +4488,11 @@ index 20aa8a8404..86986fdf55 100644
        const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
          yield* Effect.logInfo("process", {
            "session.id": input.sessionID,
-@@ -633,9 +962,11 @@ const layer = Layer.effect(
+@@ -631,11 +992,12 @@ const layer = Layer.effect(
+         })
+         ctx.needsCompaction = false
          ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
- 
+-
          return yield* Effect.gen(function* () {
 -          yield* Effect.gen(function* () {
 +          const outcome = yield* Effect.gen(function* () {
@@ -4137,7 +4503,7 @@ index 20aa8a8404..86986fdf55 100644
              yield* status.set(ctx.sessionID, { type: "busy" })
              const stream = llm.stream(streamInput)
  
-@@ -648,6 +979,7 @@ const layer = Layer.effect(
+@@ -648,6 +1010,7 @@ const layer = Layer.effect(
              Effect.onInterrupt(() =>
                Effect.gen(function* () {
                  aborted = true
@@ -4145,7 +4511,7 @@ index 20aa8a8404..86986fdf55 100644
                  if (!ctx.assistantMessage.error) {
                    yield* halt(new DOMException("Aborted", "AbortError"))
                  }
-@@ -657,6 +989,27 @@ const layer = Layer.effect(
+@@ -657,6 +1020,31 @@ const layer = Layer.effect(
                (cause) => !Cause.hasInterruptsOnly(cause),
                (cause) => Effect.fail(Cause.squash(cause)),
              ),
@@ -4163,7 +4529,11 @@ index 20aa8a8404..86986fdf55 100644
 +              () => Effect.succeed("stop" as const),
 +            ),
 +            Effect.catchIf(
-+              (error) => error instanceof StopAfterUnsafeToolActivity,
++              (error) => error instanceof StopAfterDeterministicAssistantError,
++              () => Effect.succeed("stop" as const),
++            ),
++            Effect.catchIf(
++              (error) => error instanceof StopAfterObservedSideEffect,
 +              (error) => halt(error.cause ?? error).pipe(Effect.as("stop" as const)),
 +            ),
 +            Effect.catchIf(
@@ -4173,7 +4543,7 @@ index 20aa8a8404..86986fdf55 100644
              Effect.retry(
                SessionRetry.policy({
                  provider: input.model.providerID,
-@@ -672,10 +1025,12 @@ const layer = Layer.effect(
+@@ -672,10 +1060,13 @@ const layer = Layer.effect(
                  },
                }),
              ),
@@ -4183,10 +4553,11 @@ index 20aa8a8404..86986fdf55 100644
            )
  
 +          if (outcome === "resume") return "resume"
++          if (outcome === "stop") return "stop"
            if (ctx.needsCompaction) return "compact"
            if (ctx.blocked || ctx.assistantMessage.error) return "stop"
            return "continue"
-@@ -686,6 +1041,7 @@ const layer = Layer.effect(
+@@ -686,6 +1077,7 @@ const layer = Layer.effect(
          get message() {
            return ctx.assistantMessage
          },
@@ -4194,7 +4565,7 @@ index 20aa8a8404..86986fdf55 100644
          updateToolCall,
          completeToolCall,
          process,
-@@ -696,6 +1052,57 @@ const layer = Layer.effect(
+@@ -696,6 +1088,57 @@ const layer = Layer.effect(
    }),
  )
  
@@ -4661,14 +5032,299 @@ index 5a04ec2139..2d148e4232 100644
      }
    }
  
+diff --git a/packages/opencode/test/cli/mcp-debug.test.ts b/packages/opencode/test/cli/mcp-debug.test.ts
+new file mode 100644
+index 0000000000..6eba279276
+--- /dev/null
++++ b/packages/opencode/test/cli/mcp-debug.test.ts
+@@ -0,0 +1,99 @@
++import { describe, expect } from "bun:test"
++import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js"
++import { Effect } from "effect"
++import fs from "node:fs/promises"
++import path from "node:path"
++import { cliIt } from "../lib/cli-process"
++
++const serve = Effect.acquireRelease(
++  Effect.sync(() => {
++    const requests = new Map<string, Array<string | null>>()
++    const http = Bun.serve({
++      port: 0,
++      async fetch(request) {
++        const url = new URL(request.url)
++        const seen = requests.get(url.pathname) ?? []
++        seen.push(request.headers.get("authorization"))
++        requests.set(url.pathname, seen)
++
++        if (seen.length === 1) return new Response("Unauthorized", { status: 401 })
++        if (request.method === "DELETE") return new Response(null, { status: 200 })
++        if (request.method !== "POST") return new Response(null, { status: 405 })
++
++        const body = (await request.json()) as { id?: string | number; method?: string }
++        if (body.method === "notifications/initialized") return new Response(null, { status: 202 })
++        return Response.json(
++          {
++            jsonrpc: "2.0",
++            id: body.id,
++            result: {
++              protocolVersion: LATEST_PROTOCOL_VERSION,
++              capabilities: {},
++              serverInfo: { name: "static-auth-debug", version: "1.0.0" },
++            },
++          },
++          { headers: { "Mcp-Session-Id": crypto.randomUUID() } },
++        )
++      },
++    })
++    return {
++      requests,
++      url: http.url,
++      close: () => http.stop(true),
++    }
++  }),
++  (server) => Effect.promise(server.close),
++)
++
++describe("opencode mcp debug", () => {
++  cliIt.live(
++    "never uses stored OAuth credentials when static Authorization is configured",
++    ({ home, opencode }) =>
++      Effect.gen(function* () {
++        const server = yield* serve
++        const cases = ["Authorization", "authorization", "aUtHoRiZaTiOn"].map((header, index) => {
++          const name = `static-debug-${index}`
++          const url = new URL(`/${name}`, server.url).toString()
++          return {
++            name,
++            url,
++            header,
++            staticValue: `Bearer configured-static-${index}`,
++            oauthValue: `stored-oauth-secret-${index}`,
++          }
++        })
++        const config = {
++          mcp: Object.fromEntries(
++            cases.map((item) => [
++              item.name,
++              { type: "remote", url: item.url, headers: { [item.header]: item.staticValue } },
++            ]),
++          ),
++        }
++        const data = path.join(home, ".local", "share", "opencode")
++        yield* Effect.promise(() => fs.mkdir(data, { recursive: true }))
++        yield* Effect.promise(() =>
++          Bun.write(
++            path.join(data, "mcp-auth.json"),
++            JSON.stringify(
++              Object.fromEntries(
++                cases.map((item) => [item.name, { tokens: { accessToken: item.oauthValue }, serverUrl: item.url }]),
++              ),
++            ),
++          ),
++        )
++
++        for (const item of cases) {
++          const result = yield* opencode.spawn(["mcp", "debug", item.name], {
++            timeoutMs: 30_000,
++            env: { OPENCODE_CONFIG_CONTENT: JSON.stringify(config) },
++          })
++          opencode.expectExit(result, 0, item.name)
++          expect(result.stdout).not.toContain("Access token:")
++          expect(result.stdout).not.toContain("Testing OAuth flow")
++          expect(server.requests.get(new URL(item.url).pathname)).toEqual([item.staticValue])
++        }
++      }),
++    120_000,
++  )
++})
+diff --git a/packages/opencode/test/mcp/headers.test.ts b/packages/opencode/test/mcp/headers.test.ts
+index 31cfc20d51..cb54640258 100644
+--- a/packages/opencode/test/mcp/headers.test.ts
++++ b/packages/opencode/test/mcp/headers.test.ts
+@@ -3,11 +3,12 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js"
+ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js"
+ import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js"
+ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+-import { Effect } from "effect"
++import { Cause, Effect, Exit } from "effect"
+ import { testEffect } from "../lib/effect"
++import { McpAuth } from "../../src/mcp/auth"
+ import { MCP } from "../../src/mcp/index"
+ 
+-const it = testEffect(LayerNode.compile(MCP.node))
++const it = testEffect(LayerNode.compile(LayerNode.group([MCP.node, McpAuth.node])))
+ 
+ const serve = Effect.acquireRelease(
+   Effect.promise(async () => {
+@@ -39,6 +40,69 @@ const serve = Effect.acquireRelease(
+ )
+ 
+ describe("mcp.headers", () => {
++  it.instance("configured Authorization casing overrides stored OAuth credentials", () =>
++    Effect.gen(function* () {
++      const mcp = yield* MCP.Service
++      const auth = yield* McpAuth.Service
++
++      for (const [index, header] of ["Authorization", "authorization", "aUtHoRiZaTiOn"].entries()) {
++        const server = yield* serve
++        const name = `static-auth-${index}`
++        const value = `Bearer ${name}`
++        yield* auth.updateTokens(name, { accessToken: "oauth-token" }, server.url)
++        const result = yield* mcp.add(name, {
++          type: "remote",
++          url: server.url,
++          headers: { [header]: value },
++        })
++
++        expect(result.status).toMatchObject({ [name]: { status: "connected" } })
++        expect(server.requests.length).toBeGreaterThan(0)
++        for (const headers of server.requests) {
++          expect(headers.get("authorization")).toBe(value)
++        }
++      }
++    }),
++  )
++
++  it.instance("configured Authorization rejects manual OAuth before auth setup", () =>
++    Effect.gen(function* () {
++      const mcp = yield* MCP.Service
++      const name = "static-auth-manual"
++      yield* mcp.add(name, {
++        type: "remote",
++        url: "not-an-mcp-url",
++        enabled: false,
++        headers: { authorization: "Bearer static" },
++      })
++
++      const exit = yield* mcp.startAuth(name).pipe(Effect.exit)
++      expect(Exit.isFailure(exit)).toBe(true)
++      if (Exit.isSuccess(exit)) throw new Error("expected explicit Authorization to disable OAuth")
++      const error = Cause.squash(exit.cause)
++      expect(error).toBeInstanceOf(Error)
++      if (error instanceof Error) expect(error.message).toContain("explicit Authorization")
++    }),
++  )
++
++  it.instance("configured Authorization disables OAuth capability regardless of casing", () =>
++    Effect.gen(function* () {
++      const mcp = yield* MCP.Service
++
++      for (const [index, header] of ["Authorization", "authorization", "aUtHoRiZaTiOn"].entries()) {
++        const name = `static-auth-capability-${index}`
++        yield* mcp.add(name, {
++          type: "remote",
++          url: "https://example.com/mcp",
++          enabled: false,
++          headers: { [header]: "Bearer static" },
++        })
++
++        expect(yield* mcp.supportsOAuth(name)).toBe(false)
++      }
++    }),
++  )
++
+   it.instance("headers are passed to transports when oauth is enabled (default)", () =>
+     Effect.gen(function* () {
+       const server = yield* serve
+diff --git a/packages/opencode/test/mcp/oauth-auto-connect.test.ts b/packages/opencode/test/mcp/oauth-auto-connect.test.ts
+index 5f8889068c..01c53d4c01 100644
+--- a/packages/opencode/test/mcp/oauth-auto-connect.test.ts
++++ b/packages/opencode/test/mcp/oauth-auto-connect.test.ts
+@@ -5,7 +5,7 @@ import { ListResourcesRequestSchema, ListToolsRequestSchema } from "@modelcontex
+ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+ import { FSUtil } from "@opencode-ai/core/fs-util"
+-import { Effect } from "effect"
++import { Cause, Effect, Exit } from "effect"
+ import { Config } from "../../src/config/config"
+ import { EventV2Bridge } from "../../src/event-v2-bridge"
+ import { McpAuth } from "../../src/mcp/auth"
+@@ -37,6 +37,7 @@ function serveOAuthMcp(options: OAuthMcpOptions = {}) {
+         enableJsonResponse: true,
+       })
+       let listToolsCalls = 0
++      let tokenCalls = 0
+       let requiresAuth = true
+ 
+       if (capabilities === "tools") {
+@@ -91,6 +92,7 @@ function serveOAuthMcp(options: OAuthMcpOptions = {}) {
+             return Response.json({ ...metadata, client_id: "replacement-client" }, { status: 201 })
+           }
+           if (url.pathname === "/token") {
++            tokenCalls++
+             const body = new URLSearchParams(await request.text())
+             if (body.get("code") !== "valid-code") {
+               return Response.json(
+@@ -121,6 +123,7 @@ function serveOAuthMcp(options: OAuthMcpOptions = {}) {
+           requiresAuth = false
+         },
+         listToolsCalls: () => listToolsCalls,
++        tokenCalls: () => tokenCalls,
+         close: async () => {
+           await http.stop(true)
+           await protocol.close()
+@@ -248,6 +251,52 @@ mcpTest.instance("successful reauthentication commits replacement credentials",
+   }),
+ )
+ 
++mcpTest.instance("finishAuth refuses a stale pending flow after static Authorization is configured", () =>
++  Effect.gen(function* () {
++    yield* stopOAuthCallback
++    const server = yield* serveOAuthMcp()
++    const mcp = yield* MCP.Service
++    const auth = yield* McpAuth.Service
++    const name = "test-stale-static-auth"
++
++    yield* auth.updateClientInfo(name, { clientId: "old-client" }, server.url)
++    yield* auth.updateTokens(name, { accessToken: "old-token" }, server.url)
++    yield* mcp.add(name, remote(server.url))
++    expect((yield* mcp.startAuth(name)).authorizationUrl).toContain("/authorize")
++
++    yield* mcp.add(name, {
++      type: "remote",
++      url: server.url,
++      enabled: false,
++      headers: { aUtHoRiZaTiOn: "Bearer static" },
++    })
++
++    const exit = yield* mcp.finishAuth(name, "valid-code").pipe(Effect.exit)
++    expect(Exit.isFailure(exit)).toBe(true)
++    if (Exit.isSuccess(exit)) throw new Error("expected static Authorization to invalidate the pending OAuth flow")
++    const error = Cause.squash(exit.cause)
++    expect(error).toBeInstanceOf(Error)
++    if (error instanceof Error) expect(error.message).toContain("OAuth is disabled")
++
++    expect(server.tokenCalls()).toBe(0)
++    expect(yield* auth.get(name)).toMatchObject({
++      tokens: { accessToken: "old-token" },
++      clientInfo: { clientId: "old-client" },
++    })
++    expect((yield* auth.get(name))?.oauthState).toBeUndefined()
++    expect((yield* auth.get(name))?.codeVerifier).toBeUndefined()
++
++    yield* mcp.add(name, remote(server.url, false))
++    const retry = yield* mcp.finishAuth(name, "valid-code").pipe(Effect.exit)
++    expect(Exit.isFailure(retry)).toBe(true)
++    if (Exit.isSuccess(retry)) throw new Error("expected the stale pending OAuth flow to be removed")
++    const retryError = Cause.squash(retry.cause)
++    expect(retryError).toBeInstanceOf(Error)
++    if (retryError instanceof Error) expect(retryError.message).toContain("No pending OAuth flow")
++    expect(server.tokenCalls()).toBe(0)
++  }),
++)
++
+ mcpTest.instance("auth status only reports credentials stored for the configured server URL", () =>
+   Effect.gen(function* () {
+     const mcp = yield* MCP.Service
 diff --git a/packages/opencode/test/mcp/rate-limit.test.ts b/packages/opencode/test/mcp/rate-limit.test.ts
 new file mode 100644
-index 0000000000..bc14b8f19b
+index 0000000000..9ee66bbbba
 --- /dev/null
 +++ b/packages/opencode/test/mcp/rate-limit.test.ts
-@@ -0,0 +1,550 @@
+@@ -0,0 +1,739 @@
 +import { describe, expect, test } from "bun:test"
 +import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js"
++import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
 +import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 +import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js"
 +import {
@@ -4808,6 +5464,51 @@ index 0000000000..bc14b8f19b
 +    await expect(send).rejects.toBeDefined()
 +  })
 +
++  test("inner transport close interrupts pending retry backoff", async () => {
++    const entered = Promise.withResolvers<void>()
++    const closed = Promise.withResolvers<() => void>()
++    const endpoint = new URL("https://mcp.example.test")
++    const transport = new McpRateLimit.RetryTransport(
++      endpoint,
++      (retry) => ({
++        start: () => Promise.resolve(),
++        close: () => Promise.resolve(),
++        finishAuth: () => Promise.resolve(),
++        send: (message) => retry(endpoint, { method: "POST", body: JSON.stringify(message) }).then(() => {}),
++        set onclose(value: (() => void) | undefined) {
++          if (value) closed.resolve(value)
++        },
++      }),
++      {
++        fetch: () => Promise.resolve(new Response(null, { status: 429, headers: { "retry-after": "30" } })),
++        wait: (_delay, signals) => {
++          entered.resolve()
++          return new Promise((resolve, reject) => {
++            const signal = AbortSignal.any([...signals])
++            const abort = () => reject(signal.reason)
++            signal.addEventListener("abort", abort, { once: true })
++            if (signal.aborted) abort()
++          })
++        },
++      },
++    )
++    const send = transport.send({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} })
++    await entered.promise
++
++    const close = await closed.promise
++    close()
++
++    const result = await Promise.race([
++      send.then(
++        () => ({ status: "resolved" as const }),
++        (error) => ({ status: "rejected" as const, error }),
++      ),
++      Bun.sleep(25).then(() => ({ status: "pending" as const })),
++    ])
++    await transport.close()
++    expect(result).toMatchObject({ status: "rejected", error: { name: "AbortError" } })
++  })
++
 +  test("forwards optional Streamable HTTP session APIs", async () => {
 +    const resumed: string[] = []
 +    let terminated = 0
@@ -4843,6 +5544,102 @@ index 0000000000..bc14b8f19b
 +    expect(terminated).toBe(1)
 +  })
 +
++  test("bounds always-429 Streamable HTTP SSE resumption GET", async () => {
++    const endpoint = new URL("https://mcp.example.test")
++    const methods: string[] = []
++    const eventIds: Array<string | null> = []
++    const cancelled: number[] = []
++    const errors: Error[] = []
++    let attempts = 0
++    const transport = new McpRateLimit.RetryTransport(
++      endpoint,
++      (fetch) => new StreamableHTTPClientTransport(endpoint, { fetch }),
++      {
++        fetch: (_url, init) => {
++          const attempt = ++attempts
++          methods.push(init?.method ?? "GET")
++          eventIds.push(new Headers(init?.headers).get("last-event-id"))
++          return Promise.resolve(
++            new Response(
++              new ReadableStream({
++                cancel() {
++                  cancelled.push(attempt)
++                },
++              }),
++              {
++                status: 429,
++                statusText: "Too Many Requests",
++                headers: { "x-ratelimit-reset-after": "0.001" },
++              },
++            ),
++          )
++        },
++      },
++    )
++    transport.onerror = (error) => errors.push(error)
++    await transport.start()
++
++    try {
++      await expect(transport.resumeStream("event-42")).rejects.toMatchObject({ code: 429 })
++      expect(attempts).toBe(4)
++      expect(methods).toEqual(["GET", "GET", "GET", "GET"])
++      expect(eventIds).toEqual(["event-42", "event-42", "event-42", "event-42"])
++      expect(cancelled).toEqual([1, 2, 3, 4])
++      expect(errors).toHaveLength(1)
++      expect(errors[0]).toMatchObject({ code: 429 })
++    } finally {
++      await transport.close()
++    }
++  })
++
++  test("bounds always-429 background Streamable HTTP SSE GET", async () => {
++    const endpoint = new URL("https://mcp.example.test")
++    const failed = Promise.withResolvers<Error>()
++    const cancelled: number[] = []
++    let gets = 0
++    let posts = 0
++    const transport = new McpRateLimit.RetryTransport(
++      endpoint,
++      (fetch) => new StreamableHTTPClientTransport(endpoint, { fetch }),
++      {
++        fetch: (_url, init) => {
++          if (init?.method === "POST") {
++            posts++
++            return Promise.resolve(new Response(null, { status: 202 }))
++          }
++
++          const attempt = ++gets
++          return Promise.resolve(
++            new Response(
++              new ReadableStream({
++                cancel() {
++                  cancelled.push(attempt)
++                },
++              }),
++              {
++                status: 429,
++                statusText: "Too Many Requests",
++                headers: { "x-ratelimit-reset-after": "0.001" },
++              },
++            ),
++          )
++        },
++      },
++    )
++    transport.onerror = failed.resolve
++    await transport.start()
++
++    try {
++      await transport.send({ jsonrpc: "2.0", method: "notifications/initialized" })
++      await expect(failed.promise).resolves.toMatchObject({ code: 429 })
++      expect(posts).toBe(1)
++      expect(gets).toBe(4)
++      expect(cancelled).toEqual([1, 2, 3, 4])
++    } finally {
++      await transport.close()
++    }
++  })
++
 +  test("retries cancellation notifications and session termination after explicit 429", async () => {
 +    const attempts = new Map<string, number>()
 +    const endpoint = new URL("https://mcp.example.test")
@@ -4875,6 +5672,53 @@ index 0000000000..bc14b8f19b
 +        ["delete", 2],
 +      ]),
 +    )
++  })
++
++  test("returns the fourth notification 429 for the SDK to report", async () => {
++    const endpoint = new URL("https://mcp.example.test")
++    const overrun = new Error("notification exceeded its retry budget")
++    let attempts = 0
++    let cancelled = 0
++    let waits = 0
++    const transport = new McpRateLimit.RetryTransport(
++      endpoint,
++      (fetch) => new StreamableHTTPClientTransport(endpoint, { fetch }),
++      {
++        fetch: () => {
++          attempts++
++          return Promise.resolve(
++            new Response(
++              new ReadableStream({
++                pull(controller) {
++                  controller.enqueue(new TextEncoder().encode("rate limited"))
++                  controller.close()
++                },
++                cancel() {
++                  cancelled++
++                },
++              }),
++              { status: 429 },
++            ),
++          )
++        },
++        wait: () => {
++          waits++
++          return waits === 4 ? Promise.reject(overrun) : Promise.resolve()
++        },
++      },
++    )
++    await transport.start()
++
++    try {
++      await expect(
++        transport.send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } }),
++      ).rejects.toMatchObject({ code: 429 })
++      expect(attempts).toBe(4)
++      expect(waits).toBe(3)
++      expect(cancelled).toBe(3)
++    } finally {
++      await transport.close()
++    }
 +  })
 +
 +  test("does not replay an ambiguous fetch failure", async () => {
@@ -7581,10 +8425,10 @@ index 734a30e424..c8b2a416a0 100644
  
  describe("session.message-v2.latest", () => {
 diff --git a/packages/opencode/test/session/processor-effect.test.ts b/packages/opencode/test/session/processor-effect.test.ts
-index 052477d0a2..29ca9c5ef5 100644
+index 052477d0a2..c6a1a32a28 100644
 --- a/packages/opencode/test/session/processor-effect.test.ts
 +++ b/packages/opencode/test/session/processor-effect.test.ts
-@@ -1,13 +1,16 @@
+@@ -1,13 +1,17 @@
  import { SessionV1 } from "@opencode-ai/core/v1/session"
 +import { PermissionV1 } from "@opencode-ai/core/v1/permission"
  import { Database } from "@opencode-ai/core/database/database"
@@ -7596,13 +8440,14 @@ index 052477d0a2..29ca9c5ef5 100644
 +import { InvalidProviderOutputReason, InvalidRequestReason, LLMError, LLMEvent } from "@opencode-ai/llm"
  import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
  import path from "path"
++import { pathToFileURL } from "url"
  import z from "zod"
  import type { Agent } from "../../src/agent/agent"
 +import { ProviderError } from "../../src/provider/error"
  import { Provider } from "@/provider/provider"
  
  import { Session } from "@/session/session"
-@@ -25,7 +28,6 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
+@@ -25,7 +29,6 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
  import { ProviderV2 } from "@opencode-ai/core/provider"
  import { ModelV2 } from "@opencode-ai/core/model"
  import { SessionProjector } from "@opencode-ai/core/session/projector"
@@ -7610,7 +8455,7 @@ index 052477d0a2..29ca9c5ef5 100644
  
  const summary = Layer.succeed(
    SessionSummary.Service,
-@@ -71,6 +73,10 @@ const cfg = {
+@@ -71,6 +74,10 @@ const cfg = {
  }
  
  function providerCfg(url: string) {
@@ -7621,7 +8466,7 @@ index 052477d0a2..29ca9c5ef5 100644
    return {
      ...cfg,
      provider: {
-@@ -80,6 +86,7 @@ function providerCfg(url: string) {
+@@ -80,6 +87,7 @@ function providerCfg(url: string) {
          options: {
            ...cfg.provider.test.options,
            baseURL: url,
@@ -7629,10 +8474,48 @@ index 052477d0a2..29ca9c5ef5 100644
          },
        },
      },
-@@ -184,7 +191,38 @@ const env = LayerNode.compile(
+@@ -184,7 +192,77 @@ const env = LayerNode.compile(
    replacements,
  )
  
++function postToolRecoveryLLMLayer() {
++  let calls = 0
++  return Layer.effect(
++    LLM.Service,
++    Effect.gen(function* () {
++      const live = yield* LLM.Service
++      return LLM.Service.of({
++        stream: (input) => {
++          calls += 1
++          const stream = live.stream(input)
++          if (calls !== 1) return stream
++          return stream.pipe(
++            Stream.drain,
++            Stream.concat(
++              Stream.fail(
++                new ProviderError.ResponseStreamError(
++                  "stream_incomplete: Upstream closed before response.completed after graceful tool failure",
++                  {
++                    transport: "websocket",
++                    phase: "after_first_event",
++                    autoReplaySafe: true,
++                    retryable: true,
++                  },
++                ),
++              ),
++            ),
++          )
++        },
++      })
++    }),
++  ).pipe(Layer.provide(LayerNode.compile(LLM.node)))
++}
++
++const postToolRecoveryEnv = LayerNode.compile(
++  LayerNode.group([root, LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })]),
++  [...replacements, [LLM.node, postToolRecoveryLLMLayer()]],
++)
++
 +function processorLayer(
 +  llmLayer: Layer.Layer<LLM.Service>,
 +  sessionLayer?: Layer.Layer<Session.Service>,
@@ -7664,11 +8547,12 @@ index 052477d0a2..29ca9c5ef5 100644
 +}
 +
  const it = testEffect(env)
++const postToolRecoveryIt = testEffect(postToolRecoveryEnv)
 +const isolatedIt = testEffect(LayerNode.compile(CrossSpawnSpawner.node))
  
  const providerErrorLLM = Layer.succeed(
    LLM.Service,
-@@ -233,6 +271,29 @@ const boot = Effect.fn("test.boot")(function* () {
+@@ -233,6 +311,29 @@ const boot = Effect.fn("test.boot")(function* () {
    return { processors, session, provider }
  })
  
@@ -7698,7 +8582,7 @@ index 052477d0a2..29ca9c5ef5 100644
  // ---------------------------------------------------------------------------
  // Tests
  // ---------------------------------------------------------------------------
-@@ -473,7 +534,7 @@ it.live("session.processor effect tests reset reasoning state across retries", (
+@@ -473,7 +574,7 @@ it.live("session.processor effect tests reset reasoning state across retries", (
        Effect.gen(function* () {
          const { processors, session, provider } = yield* boot()
  
@@ -7707,7 +8591,7 @@ index 052477d0a2..29ca9c5ef5 100644
  
          const chat = yield* session.create({})
          const parent = yield* user(chat.id, "reason")
-@@ -659,7 +720,7 @@ it.live("session.processor effect tests publish retry status updates", () =>
+@@ -659,7 +760,7 @@ it.live("session.processor effect tests publish retry status updates", () =>
          const events = yield* EventV2Bridge.Service
  
          yield* llm.error(503, { error: "boom" })
@@ -7716,14 +8600,18 @@ index 052477d0a2..29ca9c5ef5 100644
  
          const chat = yield* session.create({})
          const parent = yield* user(chat.id, "retry")
-@@ -705,6 +766,1970 @@ it.live("session.processor effect tests publish retry status updates", () =>
+@@ -705,109 +806,2975 @@ it.live("session.processor effect tests publish retry status updates", () =>
    ),
  )
  
+-it.live("session.processor effect tests compact on structured context overflow", () =>
+-  provideTmpdirServer(
+-    ({ dir, llm }) =>
 +isolatedIt.live("session.processor effect tests retry native stream_incomplete LLMError with visible status", () =>
 +  provideTmpdirInstance(
 +    (dir) =>
-+      Effect.gen(function* () {
+       Effect.gen(function* () {
+-        const { processors, session, provider } = yield* boot()
 +        const llm = llmStub()
 +        llm.push(
 +          Stream.fail(
@@ -7746,7 +8634,8 @@ index 052477d0a2..29ca9c5ef5 100644
 +            LLMEvent.finish({ reason: "stop" }),
 +          ),
 +        )
-+
+ 
+-        yield* llm.error(400, { type: "error", error: { code: "context_length_exceeded" } })
 +        const effect = Effect.gen(function* () {
 +          const { processors, session, provider } = yield* boot()
 +          const events = yield* EventV2Bridge.Service
@@ -7767,7 +8656,15 @@ index 052477d0a2..29ca9c5ef5 100644
 +            sessionID: chat.id,
 +            model: mdl,
 +          })
-+
+ 
+-        const chat = yield* session.create({})
+-        const parent = yield* user(chat.id, "compact json")
+-        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+-        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+-        const handle = yield* processors.create({
+-          assistantMessage: msg,
+-          sessionID: chat.id,
+-          model: mdl,
 +          const value = yield* handle.process({
 +            user: {
 +              id: parent.id,
@@ -7791,8 +8688,11 @@ index 052477d0a2..29ca9c5ef5 100644
 +          expect(llm.calls).toBe(2)
 +          expect(states).toStrictEqual([1])
 +          expect(handle.message.error).toBeUndefined()
-+        })
-+
+         })
+ 
+-        const value = yield* handle.process({
+-          user: {
+-            id: parent.id,
 +        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
 +      }),
 +    { config: cfg },
@@ -7833,7 +8733,18 @@ index 052477d0a2..29ca9c5ef5 100644
 +          })
 +          const handle = yield* processors.create({
 +            assistantMessage: msg,
-+            sessionID: chat.id,
+             sessionID: chat.id,
+-            role: "user",
+-            time: parent.time,
+-            agent: parent.agent,
+-            model: { providerID: ref.providerID, modelID: ref.modelID },
+-          } satisfies SessionV1.User,
+-          sessionID: chat.id,
+-          model: mdl,
+-          agent: agent(),
+-          system: [],
+-          messages: [{ role: "user", content: "compact json" }],
+-          tools: {},
 +            model: mdl,
 +          })
 +
@@ -7860,18 +8771,26 @@ index 052477d0a2..29ca9c5ef5 100644
 +          expect(llm.calls).toBe(2)
 +          expect(states).toStrictEqual([1])
 +          expect(handle.message.error).toBeUndefined()
-+        })
-+
+         })
+ 
+-        expect(value).toBe("compact")
+-        expect(yield* llm.calls).toBe(1)
+-        expect(handle.message.error).toBeUndefined()
 +        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
-+      }),
+       }),
+-    { config: (url) => providerCfg(url) },
 +    { config: cfg },
-+  ),
-+)
-+
+   ),
+ )
+ 
+-it.live("session.processor effect tests complete AI SDK tool calls when native flag is off", () =>
+-  provideTmpdirServer(
+-    ({ dir, llm }) =>
 +isolatedIt.live("session.processor effect tests treats user-cancelled stream failure as abort without retry", () =>
 +  provideTmpdirInstance(
 +    (dir) =>
-+      Effect.gen(function* () {
+       Effect.gen(function* () {
+-        const { processors, session, provider } = yield* boot()
 +        const llm = llmStub()
 +        llm.push(
 +          Stream.fail(
@@ -7882,7 +8801,8 @@ index 052477d0a2..29ca9c5ef5 100644
 +            }),
 +          ),
 +        )
-+
+ 
+-        yield* llm.tool("lookup", { query: "weather" })
 +        const effect = Effect.gen(function* () {
 +          const { processors, session, provider } = yield* boot()
 +          const events = yield* EventV2Bridge.Service
@@ -7904,7 +8824,15 @@ index 052477d0a2..29ca9c5ef5 100644
 +            model: mdl,
 +            wasCancelled: Effect.succeed(true),
 +          })
-+
+ 
+-        const chat = yield* session.create({})
+-        const parent = yield* user(chat.id, "tool")
+-        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+-        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+-        const handle = yield* processors.create({
+-          assistantMessage: msg,
+-          sessionID: chat.id,
+-          model: mdl,
 +          const value = yield* handle.process({
 +            user: {
 +              id: parent.id,
@@ -7928,8 +8856,11 @@ index 052477d0a2..29ca9c5ef5 100644
 +          expect(llm.calls).toBe(1)
 +          expect(states).toStrictEqual([])
 +          expect(handle.message.error?.name).toBe("MessageAbortedError")
-+        })
-+
+         })
+ 
+-        const value = yield* handle.process({
+-          user: {
+-            id: parent.id,
 +        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
 +      }),
 +    { config: cfg },
@@ -7975,7 +8906,28 @@ index 052477d0a2..29ca9c5ef5 100644
 +          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
 +          const handle = yield* processors.create({
 +            assistantMessage: msg,
-+            sessionID: chat.id,
+             sessionID: chat.id,
+-            role: "user",
+-            time: parent.time,
+-            agent: parent.agent,
+-            model: { providerID: ref.providerID, modelID: ref.modelID },
+-          } satisfies SessionV1.User,
+-          sessionID: chat.id,
+-          model: mdl,
+-          agent: agent(),
+-          system: [],
+-          messages: [{ role: "user", content: "tool" }],
+-          tools: {
+-            lookup: tool({
+-              description: "Look up information",
+-              inputSchema: z.object({ query: z.string() }),
+-              execute: async (input) => ({
+-                title: "Weather lookup",
+-                output: `result:${input.query}`,
+-                metadata: { source: "test" },
+-              }),
+-            }),
+-          },
 +            model: mdl,
 +          })
 +
@@ -8005,6 +8957,91 @@ index 052477d0a2..29ca9c5ef5 100644
 +            "after",
 +          ])
 +          expect(handle.message.error).toBeUndefined()
+         })
+ 
+-        const parts = yield* MessageV2.parts(msg.id)
+-        const call = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
+ 
+-        expect(value).toBe("continue")
+-        expect(yield* llm.calls).toBe(1)
+-        expect(call?.callID).toBe("call_1")
+-        expect(call?.tool).toBe("lookup")
+-        expect(call?.state.status).toBe("completed")
+-        if (call?.state.status !== "completed") return
+-        expect(call.state.input).toEqual({ query: "weather" })
+-        expect(call.state.output).toBe("result:weather")
+-        expect(call.state.title).toBe("Weather lookup")
+-        expect(call.state.metadata).toEqual({ source: "test" })
+-        expect(call.state.time.start).toBeDefined()
+-        expect(call.state.time.end).toBeDefined()
++isolatedIt.live("session.processor effect tests do not replay malformed streams after orphan tool-input deltas", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(LLMEvent.toolInputDelta({ id: "call_delta", name: "lookup", text: '{"query":' })).pipe(
++            Stream.concat(
++              Stream.fail(
++                new JSONParseError({
++                  text: '{"type":"response.function_call_arguments.delta"',
++                  cause: new SyntaxError("Unexpected end of JSON input"),
++                }),
++              ),
++            ),
++          ),
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.textStart({ id: "text_2" }),
++            LLMEvent.textDelta({ id: "text_2", text: "must not run" }),
++            LLMEvent.textEnd({ id: "text_2" }),
++            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
++            LLMEvent.finish({ reason: "stop" }),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "do not retry orphan tool delta")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies SessionV1.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "do not retry orphan tool delta" }],
++            tools: {},
++          })
++
++          const parts = yield* MessageV2.parts(msg.id)
++          const toolPart = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
++
++          expect(value).toBe("stop")
++          expect(llm.calls).toBe(1)
++          expect(toolPart?.state.status).toBe("error")
++          expect(handle.message.error).toBeDefined()
 +        })
 +
 +        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
@@ -8557,6 +9594,607 @@ index 052477d0a2..29ca9c5ef5 100644
 +  ),
 +)
 +
++isolatedIt.live("session.processor effect tests rollback a completed assistant-only step before transient terminal retry", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.reasoningStart({ id: "reasoning_1" }),
++            LLMEvent.reasoningDelta({ id: "reasoning_1", text: "discarded reasoning" }),
++            LLMEvent.reasoningEnd({ id: "reasoning_1" }),
++            LLMEvent.textStart({ id: "text_1" }),
++            LLMEvent.textDelta({ id: "text_1", text: "discarded answer" }),
++            LLMEvent.textEnd({ id: "text_1" }),
++            LLMEvent.stepFinish({ index: 0, reason: "stop", usage: { inputTokens: 2, outputTokens: 3, totalTokens: 5 } }),
++          ).pipe(
++            Stream.concat(
++              Stream.fail(
++                new ProviderError.ResponseStreamError("server_error: response failed after the completed step", {
++                  transport: "websocket",
++                  phase: "after_first_event",
++                  autoReplaySafe: false,
++                  retryable: true,
++                  terminalEvent: "response.failed",
++                }),
++              ),
++            ),
++          ),
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.textStart({ id: "text_2" }),
++            LLMEvent.textDelta({ id: "text_2", text: "after" }),
++            LLMEvent.textEnd({ id: "text_2" }),
++            LLMEvent.stepFinish({ index: 0, reason: "stop", usage: { inputTokens: 5, outputTokens: 7, totalTokens: 12 } }),
++            LLMEvent.finish({ reason: "stop", usage: { inputTokens: 5, outputTokens: 7, totalTokens: 12 } }),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "retry completed assistant-only step")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies SessionV1.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "retry completed assistant-only step" }],
++            tools: {},
++          })
++
++          const parts = yield* MessageV2.parts(msg.id)
++
++          expect(value).toBe("continue")
++          expect(llm.calls).toBe(2)
++          expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
++          expect(parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
++          expect(parts.filter((part): part is SessionV1.ReasoningPart => part.type === "reasoning")).toEqual([])
++          expect(parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text)).toEqual([
++            "after",
++          ])
++          expect(handle.message.tokens).toEqual({
++            input: 5,
++            output: 7,
++            total: 12,
++            reasoning: 0,
++            cache: { read: 0, write: 0 },
++          })
++          expect(handle.message.error).toBeUndefined()
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests do not replay a completed text plugin effect", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const marker = path.join(dir, "text-complete-effects.txt")
++        const pluginFile = path.join(dir, "text-complete-plugin.ts")
++        yield* Effect.promise(() => Bun.write(marker, ""))
++        yield* Effect.promise(() =>
++          Bun.write(
++            pluginFile,
++            [
++              "export default async () => ({",
++              '  "experimental.text.complete": async () => {',
++              `    await Bun.write(${JSON.stringify(marker)}, (await Bun.file(${JSON.stringify(marker)}).text()) + "complete\\n")`,
++              "  },",
++              "})",
++              "",
++            ].join("\n"),
++          ),
++        )
++        yield* Effect.promise(() =>
++          Bun.write(
++            path.join(dir, "opencode.json"),
++            JSON.stringify({
++              $schema: "https://opencode.ai/config.json",
++              ...cfg,
++              plugin: [pathToFileURL(pluginFile).href],
++            }),
++          ),
++        )
++
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.textStart({ id: "text_1" }),
++            LLMEvent.textDelta({ id: "text_1", text: "completed answer" }),
++            LLMEvent.textEnd({ id: "text_1" }),
++            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
++          ).pipe(
++            Stream.concat(
++              Stream.fail(
++                new ProviderError.ResponseStreamError("server_error: failed after the completed plugin effect", {
++                  transport: "websocket",
++                  phase: "before_first_event",
++                  autoReplaySafe: true,
++                  retryable: true,
++                  terminalEvent: "response.failed",
++                }),
++              ),
++            ),
++          ),
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.textStart({ id: "text_2" }),
++            LLMEvent.textDelta({ id: "text_2", text: "must not run" }),
++            LLMEvent.textEnd({ id: "text_2" }),
++            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
++            LLMEvent.finish({ reason: "stop" }),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "do not replay completed plugin effects")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies SessionV1.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "do not replay completed plugin effects" }],
++            tools: {},
++          })
++
++          const effects = yield* Effect.promise(() => Bun.file(marker).text())
++
++          expect(effects).toBe("complete\n")
++          expect(llm.calls).toBe(1)
++          expect(value).toBe("stop")
++          expect(handle.message.error).toBeDefined()
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests do not retry a completed step with a deterministic empty-response error", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.stepFinish({ index: 0, reason: "stop", usage: { inputTokens: 2, outputTokens: 0, totalTokens: 2 } }),
++          ).pipe(
++            Stream.concat(
++              Stream.fail(
++                new ProviderError.ResponseStreamError("server_error: response failed after the empty step", {
++                  transport: "websocket",
++                  phase: "after_first_event",
++                  autoReplaySafe: false,
++                  retryable: true,
++                  terminalEvent: "response.failed",
++                }),
++              ),
++            ),
++          ),
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.textStart({ id: "text_2" }),
++            LLMEvent.textDelta({ id: "text_2", text: "must not run" }),
++            LLMEvent.textEnd({ id: "text_2" }),
++            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
++            LLMEvent.finish({ reason: "stop" }),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "do not retry deterministic empty response")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies SessionV1.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "do not retry deterministic empty response" }],
++            tools: {},
++          })
++
++          expect(value).toBe("stop")
++          expect(llm.calls).toBe(1)
++          expect(SessionV1.EmptyResponseError.isInstance(handle.message.error)).toBe(true)
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++for (const reason of ["content-filter", "error"] as const) {
++  isolatedIt.live(`session.processor effect tests do not retry completed deterministic finish reason ${reason}`, () =>
++    provideTmpdirInstance(
++      (dir) =>
++        Effect.gen(function* () {
++          const llm = llmStub()
++          llm.push(
++            Stream.make(
++              LLMEvent.stepStart({ index: 0 }),
++              LLMEvent.textStart({ id: "text_1" }),
++              LLMEvent.textDelta({ id: "text_1", text: "deterministic output" }),
++              LLMEvent.textEnd({ id: "text_1" }),
++              LLMEvent.stepFinish({ index: 0, reason }),
++            ).pipe(
++              Stream.concat(
++                Stream.fail(
++                  new ProviderError.ResponseStreamError(`server_error: response failed after ${reason}`, {
++                    transport: "websocket",
++                    phase: "after_first_event",
++                    autoReplaySafe: false,
++                    retryable: true,
++                    terminalEvent: "response.failed",
++                  }),
++                ),
++              ),
++            ),
++            Stream.make(
++              LLMEvent.stepStart({ index: 0 }),
++              LLMEvent.textStart({ id: "text_2" }),
++              LLMEvent.textDelta({ id: "text_2", text: "must not run" }),
++              LLMEvent.textEnd({ id: "text_2" }),
++              LLMEvent.stepFinish({ index: 0, reason: "stop" }),
++              LLMEvent.finish({ reason: "stop" }),
++            ),
++          )
++
++          const effect = Effect.gen(function* () {
++            const { processors, session, provider } = yield* boot()
++
++            const chat = yield* session.create({})
++            const parent = yield* user(chat.id, `do not retry ${reason}`)
++            const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++            const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++            const handle = yield* processors.create({
++              assistantMessage: msg,
++              sessionID: chat.id,
++              model: mdl,
++            })
++
++            const value = yield* handle.process({
++              user: {
++                id: parent.id,
++                sessionID: chat.id,
++                role: "user",
++                time: parent.time,
++                agent: parent.agent,
++                model: { providerID: ref.providerID, modelID: ref.modelID },
++              } satisfies SessionV1.User,
++              sessionID: chat.id,
++              model: mdl,
++              agent: agent(),
++              system: [],
++              messages: [{ role: "user", content: `do not retry ${reason}` }],
++              tools: {},
++            })
++
++            expect(value).toBe("stop")
++            expect(llm.calls).toBe(1)
++            expect(handle.message.finish).toBe(reason)
++          })
++
++          yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++        }),
++      { config: cfg },
++    ),
++  )
++}
++
++isolatedIt.live("session.processor effect tests keep content-filter terminal after a settled tool", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
++            LLMEvent.toolResult({
++              id: "call_1",
++              name: "lookup",
++              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
++            }),
++            LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
++            LLMEvent.stepStart({ index: 1 }),
++            LLMEvent.textStart({ id: "text_1" }),
++            LLMEvent.textDelta({ id: "text_1", text: "filtered answer" }),
++            LLMEvent.textEnd({ id: "text_1" }),
++            LLMEvent.stepFinish({ index: 1, reason: "content-filter" }),
++          ).pipe(
++            Stream.concat(
++              Stream.fail(
++                new ProviderError.ResponseStreamError("server_error: response failed after content filter", {
++                  transport: "websocket",
++                  phase: "after_first_event",
++                  autoReplaySafe: false,
++                  retryable: true,
++                  terminalEvent: "response.failed",
++                }),
++              ),
++            ),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "keep content filter terminal after tool")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies SessionV1.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "keep content filter terminal after tool" }],
++            tools: {},
++          })
++
++          const parts = yield* MessageV2.parts(msg.id)
++
++          expect(value).toBe("stop")
++          expect(llm.calls).toBe(1)
++          expect(handle.message.finish).toBe("content-filter")
++          expect(parts.filter((part) => part.type === "tool")).toHaveLength(1)
++          expect(parts.some((part) => part.type === "text" && part.text === "filtered answer")).toBe(true)
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests keep error finish terminal after a settled tool", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.toolCall({ id: "call_1", name: "lookup", input: { query: "weather" } }),
++            LLMEvent.toolResult({
++              id: "call_1",
++              name: "lookup",
++              result: { type: "json", value: { title: "Weather lookup", output: "result:weather", metadata: {} } },
++            }),
++            LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
++            LLMEvent.stepStart({ index: 1 }),
++            LLMEvent.textStart({ id: "text_1" }),
++            LLMEvent.textDelta({ id: "text_1", text: "error answer" }),
++            LLMEvent.textEnd({ id: "text_1" }),
++            LLMEvent.stepFinish({ index: 1, reason: "error" }),
++          ).pipe(
++            Stream.concat(
++              Stream.fail(
++                new ProviderError.ResponseStreamError("stream_incomplete: response.done failed after error finish", {
++                  transport: "websocket",
++                  phase: "after_first_event",
++                  autoReplaySafe: false,
++                  retryable: true,
++                  terminalEvent: "response.done",
++                }),
++              ),
++            ),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "keep error finish terminal after tool")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies SessionV1.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "keep error finish terminal after tool" }],
++            tools: {},
++          })
++
++          const parts = yield* MessageV2.parts(msg.id)
++
++          expect(value).toBe("stop")
++          expect(llm.calls).toBe(1)
++          expect(handle.message.finish).toBe("error")
++          expect(parts.filter((part) => part.type === "tool")).toHaveLength(1)
++          expect(parts.some((part) => part.type === "text" && part.text === "error answer")).toBe(true)
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests let a filesystem patch override provider replay-safe metadata", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.textStart({ id: "text_1" }),
++            LLMEvent.textDelta({ id: "text_1", text: "answer with external effect" }),
++            LLMEvent.textEnd({ id: "text_1" }),
++          ).pipe(
++            Stream.concat(
++              Stream.fromEffect(
++                Effect.promise(async () => {
++                  await Bun.write(path.join(dir, "side-effect.txt"), "changed")
++                  return LLMEvent.stepFinish({
++                    index: 0,
++                    reason: "stop",
++                    usage: { inputTokens: 2, outputTokens: 3, totalTokens: 5 },
++                  })
++                }),
++              ),
++            ),
++            Stream.concat(
++              Stream.fail(
++                new ProviderError.ResponseStreamError("server_error: response failed after the patched step", {
++                  transport: "websocket",
++                  phase: "after_first_event",
++                  autoReplaySafe: true,
++                  retryable: true,
++                  terminalEvent: "response.failed",
++                }),
++              ),
++            ),
++          ),
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.textStart({ id: "text_2" }),
++            LLMEvent.textDelta({ id: "text_2", text: "must not run" }),
++            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
++            LLMEvent.finish({ reason: "stop" }),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "do not retry completed step with patch")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies SessionV1.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "do not retry completed step with patch" }],
++            tools: {},
++          })
++
++          const parts = yield* MessageV2.parts(msg.id)
++
++          expect(value).toBe("stop")
++          expect(llm.calls).toBe(1)
++          expect(parts.some((part) => part.type === "patch")).toBe(true)
++          expect(parts.some((part) => part.type === "text" && part.text === "answer with external effect")).toBe(true)
++          expect(handle.message.error).toBeDefined()
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg, git: true },
++  ),
++)
++
 +isolatedIt.live("session.processor effect tests preserve permanent response.done provider-error metadata", () =>
 +  provideTmpdirInstance(
 +    (dir) =>
@@ -8813,7 +10451,7 @@ index 052477d0a2..29ca9c5ef5 100644
 +  ),
 +)
 +
-+isolatedIt.live("session.processor effect tests resume immediately after a completed tool result", () =>
++isolatedIt.live("session.processor effect tests resume after a completed tool result and transient response.failed", () =>
 +  provideTmpdirInstance(
 +    (dir) =>
 +      Effect.gen(function* () {
@@ -8830,10 +10468,12 @@ index 052477d0a2..29ca9c5ef5 100644
 +          ).pipe(
 +            Stream.concat(
 +              Stream.fail(
-+                new ProviderError.ResponseStreamError("Upstream websocket closed before response.completed", {
++                new ProviderError.ResponseStreamError("server_error: response failed after the completed tool", {
 +                  transport: "websocket",
 +                  phase: "after_first_event",
 +                  autoReplaySafe: false,
++                  retryable: true,
++                  terminalEvent: "response.failed",
 +                }),
 +              ),
 +            ),
@@ -8876,6 +10516,7 @@ index 052477d0a2..29ca9c5ef5 100644
 +          expect(value).toBe("resume")
 +          expect(llm.calls).toBe(1)
 +          expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
++          expect(parts.filter((part) => part.type === "tool")).toHaveLength(1)
 +          expect(parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text)).toEqual([])
 +          expect(toolPart?.state.status).toBe("completed")
 +          expect(handle.message.error).toBeUndefined()
@@ -9176,7 +10817,154 @@ index 052477d0a2..29ca9c5ef5 100644
 +  ),
 +)
 +
-+isolatedIt.live("session.processor effect tests resume after a durable tool error boundary", () =>
++isolatedIt.live("session.processor effect tests stop when model-only JSON rollback fails", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.textStart({ id: "text_1" }),
++            LLMEvent.textDelta({ id: "text_1", text: "partial" }),
++          ).pipe(
++            Stream.concat(
++              Stream.fail(
++                new JSONParseError({
++                  text: '{"type":"response.output_text.delta"',
++                  cause: new SyntaxError("Unexpected end of JSON input"),
++                }),
++              ),
++            ),
++          ),
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.textStart({ id: "text_2" }),
++            LLMEvent.textDelta({ id: "text_2", text: "must not run" }),
++            LLMEvent.textEnd({ id: "text_2" }),
++            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
++            LLMEvent.finish({ reason: "stop" }),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "rollback failure for malformed model output")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies SessionV1.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "rollback failure for malformed model output" }],
++            tools: {},
++          })
++
++          expect(value).toBe("stop")
++          expect(llm.calls).toBe(1)
++          expect(handle.message.error).toBeDefined()
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer, rollbackFailureSessionLayer())))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests stop when model-only native LLM rollback fails", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.textStart({ id: "text_1" }),
++            LLMEvent.textDelta({ id: "text_1", text: "partial" }),
++          ).pipe(
++            Stream.concat(
++              Stream.fail(
++                new LLMError({
++                  module: "Route",
++                  method: "frames",
++                  reason: new InvalidProviderOutputReason({
++                    message: "Failed to read openai-responses stream",
++                    route: "openai-responses",
++                    raw: '{"code":"stream_incomplete","message":"Upstream websocket closed before response.completed"}',
++                  }),
++                }),
++              ),
++            ),
++          ),
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.textStart({ id: "text_2" }),
++            LLMEvent.textDelta({ id: "text_2", text: "must not run" }),
++            LLMEvent.textEnd({ id: "text_2" }),
++            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
++            LLMEvent.finish({ reason: "stop" }),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "rollback failure for native stream error")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies SessionV1.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "rollback failure for native stream error" }],
++            tools: {},
++          })
++
++          expect(value).toBe("stop")
++          expect(llm.calls).toBe(1)
++          expect(handle.message.error).toBeDefined()
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer, rollbackFailureSessionLayer())))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests resume after a durable tool error and transient response.done", () =>
 +  provideTmpdirInstance(
 +    (dir) =>
 +      Effect.gen(function* () {
@@ -9194,10 +10982,12 @@ index 052477d0a2..29ca9c5ef5 100644
 +          ).pipe(
 +            Stream.concat(
 +              Stream.fail(
-+                new ProviderError.ResponseStreamError("Upstream websocket closed before response.completed", {
++                new ProviderError.ResponseStreamError("stream_incomplete: response.done failed after the tool error", {
 +                  transport: "websocket",
 +                  phase: "after_first_event",
 +                  autoReplaySafe: false,
++                  retryable: true,
++                  terminalEvent: "response.done",
 +                }),
 +              ),
 +            ),
@@ -9240,6 +11030,7 @@ index 052477d0a2..29ca9c5ef5 100644
 +          expect(value).toBe("resume")
 +          expect(llm.calls).toBe(1)
 +          expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
++          expect(parts.filter((part) => part.type === "tool")).toHaveLength(1)
 +          expect(parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text)).toEqual([])
 +          expect(toolPart?.state.status).toBe("error")
 +          expect(handle.message.error).toBeUndefined()
@@ -9684,9 +11475,189 @@ index 052477d0a2..29ca9c5ef5 100644
 +  ),
 +)
 +
- it.live("session.processor effect tests compact on structured context overflow", () =>
-   provideTmpdirServer(
-     ({ dir, llm }) =>
++it.live("session.processor effect tests compact on structured context overflow", () =>
++  provideTmpdirServer(
++    ({ dir, llm }) =>
++      Effect.gen(function* () {
++        const { processors, session, provider } = yield* boot()
++
++        yield* llm.error(400, { type: "error", error: { code: "context_length_exceeded" } })
++
++        const chat = yield* session.create({})
++        const parent = yield* user(chat.id, "compact json")
++        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++        const handle = yield* processors.create({
++          assistantMessage: msg,
++          sessionID: chat.id,
++          model: mdl,
++        })
++
++        const value = yield* handle.process({
++          user: {
++            id: parent.id,
++            sessionID: chat.id,
++            role: "user",
++            time: parent.time,
++            agent: parent.agent,
++            model: { providerID: ref.providerID, modelID: ref.modelID },
++          } satisfies SessionV1.User,
++          sessionID: chat.id,
++          model: mdl,
++          agent: agent(),
++          system: [],
++          messages: [{ role: "user", content: "compact json" }],
++          tools: {},
++        })
++
++        expect(value).toBe("compact")
++        expect(yield* llm.calls).toBe(1)
++        expect(handle.message.error).toBeUndefined()
++      }),
++    { config: (url) => providerCfg(url) },
++  ),
++)
++
++it.live("session.processor effect tests complete AI SDK tool calls when native flag is off", () =>
++  provideTmpdirServer(
++    ({ dir, llm }) =>
++      Effect.gen(function* () {
++        const { processors, session, provider } = yield* boot()
++
++        yield* llm.tool("lookup", { query: "weather" })
++
++        const chat = yield* session.create({})
++        const parent = yield* user(chat.id, "tool")
++        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++        const handle = yield* processors.create({
++          assistantMessage: msg,
++          sessionID: chat.id,
++          model: mdl,
++        })
++
++        const value = yield* handle.process({
++          user: {
++            id: parent.id,
++            sessionID: chat.id,
++            role: "user",
++            time: parent.time,
++            agent: parent.agent,
++            model: { providerID: ref.providerID, modelID: ref.modelID },
++          } satisfies SessionV1.User,
++          sessionID: chat.id,
++          model: mdl,
++          agent: agent(),
++          system: [],
++          messages: [{ role: "user", content: "tool" }],
++          tools: {
++            lookup: tool({
++              description: "Look up information",
++              inputSchema: z.object({ query: z.string() }),
++              execute: async (input) => ({
++                title: "Weather lookup",
++                output: `result:${input.query}`,
++                metadata: { source: "test" },
++              }),
++            }),
++          },
++        })
++
++        const parts = yield* MessageV2.parts(msg.id)
++        const call = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
++
++        expect(value).toBe("continue")
++        expect(yield* llm.calls).toBe(1)
++        expect(call?.callID).toBe("call_1")
++        expect(call?.tool).toBe("lookup")
++        expect(call?.state.status).toBe("completed")
++        if (call?.state.status !== "completed") return
++        expect(call.state.input).toEqual({ query: "weather" })
++        expect(call.state.output).toBe("result:weather")
++        expect(call.state.title).toBe("Weather lookup")
++        expect(call.state.metadata).toEqual({ source: "test" })
++        expect(call.state.time.start).toBeDefined()
++        expect(call.state.time.end).toBeDefined()
++      }),
++    { config: (url) => providerCfg(url) },
++  ),
++)
++
++postToolRecoveryIt.live("session.processor effect tests retry a graceful tool failure hidden by stream incomplete", () =>
++  provideTmpdirServer(
++    ({ dir, llm }) =>
++      Effect.gen(function* () {
++        const { processors, session, provider } = yield* boot()
++        let executions = 0
++        const receivers: unknown[] = []
++
++        yield* llm.push(
++          reply().tool("lookup", { query: "weather" }),
++          reply().tool("lookup", { query: "weather" }),
++        )
++
++        const chat = yield* session.create({})
++        const parent = yield* user(chat.id, "recover after one real tool execution")
++        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++        const lookup = tool({
++          description: "Look up information",
++          inputSchema: z.object({ query: z.string() }),
++          async execute(input) {
++            executions += 1
++            receivers.push(this)
++            if (executions === 1) throw new Error("graceful lookup failure")
++            return {
++              title: "Weather lookup",
++              output: `result:${input.query}`,
++              metadata: { source: "test" },
++            }
++          },
++        })
++        Object.freeze(lookup)
++        const executeDescriptor = Object.getOwnPropertyDescriptor(lookup, "execute")
++        const prototype = Object.getPrototypeOf(lookup)
++        const tools = { lookup }
++        const input = {
++          user: {
++            id: parent.id,
++            sessionID: chat.id,
++            role: "user",
++            time: parent.time,
++            agent: parent.agent,
++            model: { providerID: ref.providerID, modelID: ref.modelID },
++          } satisfies SessionV1.User,
++          sessionID: chat.id,
++          model: mdl,
++          agent: agent(),
++          system: [],
++          messages: [{ role: "user", content: "recover after one real tool execution" }],
++          tools,
++        } satisfies LLM.StreamInput
++        const handle = yield* processors.create({
++          assistantMessage: msg,
++          sessionID: chat.id,
++          model: mdl,
++        })
++
++        const value = yield* handle.process(input)
++        const toolParts = (yield* MessageV2.parts(msg.id)).filter(
++          (part): part is SessionV1.ToolPart => part.type === "tool",
++        )
++
++        expect(executions).toBe(2)
++        expect(receivers).toEqual([lookup, lookup])
++        expect(yield* llm.calls).toBe(2)
++        expect(value).toBe("continue")
++        expect(toolParts).toHaveLength(1)
++        expect(toolParts[0]?.state.status).toBe("completed")
++        expect(handle.message.error).toBeUndefined()
++        expect(Object.getOwnPropertyDescriptor(lookup, "execute")).toEqual(executeDescriptor)
++        expect(Object.getPrototypeOf(lookup)).toBe(prototype)
++        expect(Object.isFrozen(lookup)).toBe(true)
+       }),
+     { config: (url) => providerCfg(url) },
+   ),
 diff --git a/packages/opencode/test/session/prompt.test.ts b/packages/opencode/test/session/prompt.test.ts
 index 5a0176abc9..cce0409377 100644
 --- a/packages/opencode/test/session/prompt.test.ts

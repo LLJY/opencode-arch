@@ -6,53 +6,83 @@ pkgver=$(awk -F= '/^pkgver=/{ print $2; exit }' "$repo_root/PKGBUILD")
 pkgrel=$(awk -F= '/^pkgrel=/{ print $2; exit }' "$repo_root/PKGBUILD")
 out_dir=${OUT_DIR:-$repo_root/dist/debian-final-$pkgver-$pkgrel}
 target=${1:-all}
+version=$pkgver-$pkgrel
 
 case "$target" in
-  all) platforms=(linux/amd64 linux/arm64) ;;
-  amd64) platforms=(linux/amd64) ;;
-  arm64) platforms=(linux/arm64) ;;
+  all) arches=(amd64 arm64) ;;
+  amd64) arches=(amd64) ;;
+  arm64) arches=(arm64) ;;
   *)
     printf 'Usage: %s [all|amd64|arm64]\n' "${0##*/}" >&2
     exit 64
     ;;
 esac
 
-if [[ " ${platforms[*]} " == *" linux/arm64 "* ]]; then
-  entry=/proc/sys/fs/binfmt_misc/qemu-aarch64
-  if [ ! -r "$entry" ] || ! grep -q '^flags:.*F' "$entry"; then
-    printf 'arm64 binfmt with fix-binary (F) support is required: %s\n' "$entry" >&2
-    exit 69
-  fi
-  docker run --rm --platform linux/arm64 ubuntu:24.04 sh -c 'test "$(uname -m)" = aarch64'
-fi
-
 mkdir -p "$out_dir"
+out_dir=$(cd -- "$out_dir" && pwd)
+expected=()
+for deb_arch in "${arches[@]}"; do
+  expected+=("$out_dir/opencode_${version}_${deb_arch}.deb")
+  if [ "$deb_arch" = amd64 ]; then
+    expected+=("$out_dir/opencode-daemon_${version}_all.deb")
+  fi
+done
+for file in "${expected[@]}"; do
+  if [ -e "$file" ]; then
+    printf 'Refusing to reuse existing package output: %s\n' "$file" >&2
+    exit 73
+  fi
+done
 
-for platform in "${platforms[@]}"; do
-  deb_arch=${platform#linux/}
+built=()
+for deb_arch in "${arches[@]}"; do
   build_daemon=$([ "$deb_arch" = amd64 ] && printf 1 || printf 0)
-  image="opencode-deb:${pkgver}-${pkgrel}-${deb_arch}"
-  container="opencode-deb-${pkgver}-${pkgrel}-${deb_arch}-$$"
+  image="opencode-deb:${version}-${deb_arch}"
+  container="opencode-deb-${version}-${deb_arch}-$$"
+  package="opencode_${version}_${deb_arch}.deb"
 
-  docker build --platform "$platform" --file "$repo_root/Dockerfile.debian" --tag "$image" "$repo_root"
-  docker create --platform "$platform" --name "$container" --env BUILD_DAEMON="$build_daemon" "$image" >/dev/null
+  docker build \
+    --platform linux/amd64 \
+    --build-arg "DEB_ARCH=$deb_arch" \
+    --file "$repo_root/Dockerfile.debian" \
+    --tag "$image" \
+    "$repo_root"
+  docker create \
+    --platform linux/amd64 \
+    --name "$container" \
+    --env "DEB_ARCH=$deb_arch" \
+    --env "BUILD_DAEMON=$build_daemon" \
+    "$image" >/dev/null
   cleanup() { docker rm -f "$container" >/dev/null 2>&1 || true; }
   trap cleanup EXIT INT TERM
 
   docker start --attach "$container"
-  docker cp "$container:/out/opencode_${pkgver}-${pkgrel}_${deb_arch}.deb" "$out_dir/"
+  docker cp "$container:/out/$package" "$out_dir/$package"
+  [ -s "$out_dir/$package" ]
+  docker run --rm \
+    --platform linux/amd64 \
+    --volume "$out_dir:/export:ro" \
+    --entrypoint /bin/bash \
+    "$image" \
+    /pkg/validate-deb "/export/$package" opencode "$version" "$deb_arch" usr/bin/opencode
+  built+=("$out_dir/$package")
+
   if [ "$build_daemon" -eq 1 ]; then
-    docker cp "$container:/out/opencode-daemon_${pkgver}-${pkgrel}_all.deb" "$out_dir/"
+    daemon="opencode-daemon_${version}_all.deb"
+    docker cp "$container:/out/$daemon" "$out_dir/$daemon"
+    [ -s "$out_dir/$daemon" ]
+    docker run --rm \
+      --platform linux/amd64 \
+      --volume "$out_dir:/export:ro" \
+      --entrypoint /bin/bash \
+      "$image" \
+      /pkg/validate-deb "/export/$daemon" opencode-daemon "$version" all
+    built+=("$out_dir/$daemon")
   fi
 
   cleanup
   trap - EXIT INT TERM
 done
 
-printf 'Built Debian packages:\n'
-for file in \
-  "$out_dir/opencode_${pkgver}-${pkgrel}_amd64.deb" \
-  "$out_dir/opencode-daemon_${pkgver}-${pkgrel}_all.deb" \
-  "$out_dir/opencode_${pkgver}-${pkgrel}_arm64.deb"; do
-  [ -f "$file" ] && printf '  %s\n' "$file"
-done
+printf 'Built and validated Debian packages:\n'
+printf '  %s\n' "${built[@]}"
