@@ -1,8 +1,11 @@
 .git
+.maintenance-backup-*
 src
 pkg
 opencode
 dist
+downstream-*.patch
+!downstream-1.18.16.patch
 *.pkg.tar.*
 *.deb
 *.log

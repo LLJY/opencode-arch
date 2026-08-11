@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+pkgver=$(awk -F= '/^pkgver=/{ print $2; exit }' "$repo_root/PKGBUILD")
+pkgrel=$(awk -F= '/^pkgrel=/{ print $2; exit }' "$repo_root/PKGBUILD")
+out_dir=${OUT_DIR:-$repo_root/dist/debian-final-$pkgver-$pkgrel}
+target=${1:-all}
+
+case "$target" in
+  all) platforms=(linux/amd64 linux/arm64) ;;
+  amd64) platforms=(linux/amd64) ;;
+  arm64) platforms=(linux/arm64) ;;
+  *)
+    printf 'Usage: %s [all|amd64|arm64]\n' "${0##*/}" >&2
+    exit 64
+    ;;
+esac
+
+if [[ " ${platforms[*]} " == *" linux/arm64 "* ]]; then
+  entry=/proc/sys/fs/binfmt_misc/qemu-aarch64
+  if [ ! -r "$entry" ] || ! grep -q '^flags:.*F' "$entry"; then
+    printf 'arm64 binfmt with fix-binary (F) support is required: %s\n' "$entry" >&2
+    exit 69
+  fi
+  docker run --rm --platform linux/arm64 ubuntu:24.04 sh -c 'test "$(uname -m)" = aarch64'
+fi
+
+mkdir -p "$out_dir"
+
+for platform in "${platforms[@]}"; do
+  deb_arch=${platform#linux/}
+  build_daemon=$([ "$deb_arch" = amd64 ] && printf 1 || printf 0)
+  image="opencode-deb:${pkgver}-${pkgrel}-${deb_arch}"
+  container="opencode-deb-${pkgver}-${pkgrel}-${deb_arch}-$$"
+
+  docker build --platform "$platform" --file "$repo_root/Dockerfile.debian" --tag "$image" "$repo_root"
+  docker create --platform "$platform" --name "$container" --env BUILD_DAEMON="$build_daemon" "$image" >/dev/null
+  cleanup() { docker rm -f "$container" >/dev/null 2>&1 || true; }
+  trap cleanup EXIT INT TERM
+
+  docker start --attach "$container"
+  docker cp "$container:/out/opencode_${pkgver}-${pkgrel}_${deb_arch}.deb" "$out_dir/"
+  if [ "$build_daemon" -eq 1 ]; then
+    docker cp "$container:/out/opencode-daemon_${pkgver}-${pkgrel}_all.deb" "$out_dir/"
+  fi
+
+  cleanup
+  trap - EXIT INT TERM
+done
+
+printf 'Built Debian packages:\n'
+for file in \
+  "$out_dir/opencode_${pkgver}-${pkgrel}_amd64.deb" \
+  "$out_dir/opencode-daemon_${pkgver}-${pkgrel}_all.deb" \
+  "$out_dir/opencode_${pkgver}-${pkgrel}_arm64.deb"; do
+  [ -f "$file" ] && printf '  %s\n' "$file"
+done
