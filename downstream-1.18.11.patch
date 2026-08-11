@@ -1,3 +1,30 @@
+diff --git a/packages/core/src/session/compaction.ts b/packages/core/src/session/compaction.ts
+index 4b21ff348f..6718df5d4d 100644
+--- a/packages/core/src/session/compaction.ts
++++ b/packages/core/src/session/compaction.ts
+@@ -37,12 +37,21 @@ const SUMMARY_TEMPLATE = `Output exactly the Markdown structure shown inside <te
+ 
+ ## Relevant Files
+ - [file or directory path: why it matters, or "(none)"]
++
++## Workflow Status
++[Include this section only if an active workplan is currently being planned or executed. Otherwise, omit this section entirely.]
++- Mode: [workflow-plan | workflow-execute]
++- Workplan path: [exact path]
++- Current step: [exact current step and status]
++- Plan-checker ran: [yes | no]
++- Continuation requirement: [workflow-plan: "Load the workflow-plan skill before continuing." | workflow-execute: "Load the workflow-execute skill before continuing."]
+ </template>
+ 
+ Rules:
+-- Keep every section, even when empty.
++- Keep every non-conditional section, even when empty.
+ - Use terse bullets, not prose paragraphs.
+ - Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers when known.
++- Do not infer an active workflow from an old, completed, cancelled, proposed, or merely discussed workplan.
+ - Do not mention the summary process or that context was compacted.`
+ 
+ type Entry = {
 diff --git a/packages/core/src/session/runner/llm.ts b/packages/core/src/session/runner/llm.ts
 index 72c761e10d..f15fc5f683 100644
 --- a/packages/core/src/session/runner/llm.ts
@@ -33,6 +60,21 @@ index b4ce31e5f0..275acf69ed 100644
  })
  export const ContentFilterError = NamedError.create("ContentFilterError", { message: Schema.String })
 +export const EmptyResponseError = NamedError.create("EmptyResponseError", { message: Schema.String })
+diff --git a/packages/core/test/session-compaction.test.ts b/packages/core/test/session-compaction.test.ts
+index 9d45e0acc3..2d99e971ef 100644
+--- a/packages/core/test/session-compaction.test.ts
++++ b/packages/core/test/session-compaction.test.ts
+@@ -8,6 +8,10 @@ test("compaction prompt preserves detailed work state and relevant files", () =>
+   expect(prompt).toContain("### Active")
+   expect(prompt).toContain("### Blocked")
+   expect(prompt).toContain("## Relevant Files")
++  expect(prompt).toContain("## Workflow Status")
++  expect(prompt.indexOf("## Workflow Status")).toBeGreaterThan(prompt.indexOf("## Relevant Files"))
++  expect(prompt).toContain("Load the workflow-execute skill before continuing.")
++  expect(prompt).toContain("Do not infer an active workflow")
+ })
+ 
+ test("compaction describes tool media without embedding base64", () => {
 diff --git a/packages/core/test/session-runner.test.ts b/packages/core/test/session-runner.test.ts
 index 0515d55cf5..c445629a62 100644
 --- a/packages/core/test/session-runner.test.ts
@@ -3037,11 +3079,36 @@ index a99f8acff2..c74f0fec23 100644
  }
  
  export type StreamRequest = StreamInput & {
+diff --git a/packages/opencode/src/session/llm/native-request.ts b/packages/opencode/src/session/llm/native-request.ts
+index b7f30e24c3..730704bbd4 100644
+--- a/packages/opencode/src/session/llm/native-request.ts
++++ b/packages/opencode/src/session/llm/native-request.ts
+@@ -110,7 +110,7 @@ const messages = (input: readonly ModelMessage[]) => {
+       Message.make({
+         role: message.role,
+         content: content(message.content),
+-        native: isRecord(message.providerOptions) ? { providerOptions: message.providerOptions } : undefined,
++        native: isRecord(message.providerOptions) ? message.providerOptions : undefined,
+       }),
+     ]
+   })
 diff --git a/packages/opencode/src/session/llm/native-runtime.ts b/packages/opencode/src/session/llm/native-runtime.ts
-index bac385c591..632e178260 100644
+index bac385c591..81faceffdb 100644
 --- a/packages/opencode/src/session/llm/native-runtime.ts
 +++ b/packages/opencode/src/session/llm/native-runtime.ts
-@@ -82,7 +82,7 @@ export function stream(input: StreamInput): StreamResult {
+@@ -57,6 +57,11 @@ function statusWithFetch(
+   const npm = input.model.api.npm
+   if (npm !== "@ai-sdk/openai" && npm !== "@ai-sdk/openai-compatible" && npm !== "@ai-sdk/anthropic")
+     return { type: "unsupported", reason: "provider package is not OpenAI, OpenAI-compatible, or Anthropic" }
++  const interleavedField =
++    typeof input.model.capabilities.interleaved === "object" ? input.model.capabilities.interleaved.field : undefined
++  if (npm === "@ai-sdk/openai-compatible" && interleavedField && interleavedField !== "reasoning_content") {
++    return { type: "unsupported", reason: `native OpenAI-compatible runtime does not support ${interleavedField}` }
++  }
+   if (input.auth?.type === "oauth" && !(input.provider.id === "openai" && fetch)) {
+     return { type: "unsupported", reason: "OAuth auth requires a provider fetch override" }
+   }
+@@ -82,7 +87,7 @@ export function stream(input: StreamInput): StreamResult {
    // ProviderTransform.providerOptions builds AI-SDK-shaped options for the
    // selected SDK key (e.g. "openai") and the native LLM SDK reads the same
    // keys via OpenAIOptions.* (store, reasoningEffort, reasoningSummary,
@@ -3365,10 +3432,10 @@ index 1bea9f52c3..08ff86e0e1 100644
  }
  
 diff --git a/packages/opencode/src/session/processor.ts b/packages/opencode/src/session/processor.ts
-index 20aa8a8404..c8170dbd24 100644
+index 20aa8a8404..86986fdf55 100644
 --- a/packages/opencode/src/session/processor.ts
 +++ b/packages/opencode/src/session/processor.ts
-@@ -18,19 +18,82 @@ import type { SessionID } from "./schema"
+@@ -18,19 +18,83 @@ import type { SessionID } from "./schema"
  import { SessionRetry } from "./retry"
  import { SessionStatus } from "./status"
  import { SessionSummary } from "./summary"
@@ -3381,6 +3448,7 @@ index 20aa8a8404..c8170dbd24 100644
  import { Database } from "@opencode-ai/core/database/database"
 -import { Usage, type LLMEvent } from "@opencode-ai/llm"
 +import { LLMError, Usage, type LLMEvent } from "@opencode-ai/llm"
++import { JSONParseError } from "ai"
  
  const DOOM_LOOP_THRESHOLD = 3
 -export type Result = "compact" | "stop" | "continue"
@@ -3453,7 +3521,7 @@ index 20aa8a8404..c8170dbd24 100644
    readonly updateToolCall: (
      toolCallID: string,
      update: (part: SessionV1.ToolPart) => SessionV1.ToolPart,
-@@ -51,6 +114,7 @@ type Input = {
+@@ -51,6 +115,7 @@ type Input = {
    assistantMessage: SessionV1.Assistant
    sessionID: SessionID
    model: Provider.Model
@@ -3461,7 +3529,7 @@ index 20aa8a8404..c8170dbd24 100644
  }
  
  export interface Interface {
-@@ -70,8 +134,14 @@ interface ProcessorContext extends Input {
+@@ -70,8 +135,14 @@ interface ProcessorContext extends Input {
    snapshot: string | undefined
    blocked: boolean
    needsCompaction: boolean
@@ -3476,7 +3544,7 @@ index 20aa8a8404..c8170dbd24 100644
  }
  
  type StreamEvent = LLMEvent
-@@ -109,17 +179,140 @@ const layer = Layer.effect(
+@@ -109,16 +180,145 @@ const layer = Layer.effect(
          snapshot: initialSnapshot,
          blocked: false,
          needsCompaction: false,
@@ -3506,8 +3574,8 @@ index 20aa8a8404..c8170dbd24 100644
            providerID: input.model.providerID,
            aborted,
 +          userCancelled: cancelledByUser,
-         })
- 
++        })
++
 +      const refreshCancelledByUser = Effect.fn("SessionProcessor.refreshCancelledByUser")(function* () {
 +        cancelledByUser = cancelledByUser || (yield* (input.wasCancelled ?? Effect.succeed(false)))
 +        return cancelledByUser
@@ -3588,6 +3656,12 @@ index 20aa8a8404..c8170dbd24 100644
 +        })
 +      }
 +
++      function normalizeJsonParseResponseStreamError(error: unknown): ProviderError.ResponseStreamError | undefined {
++        if (!JSONParseError.isInstance(error)) return undefined
++        const message = `Provider returned malformed JSON stream: ${error.message.slice(0, 200)}`
++        return new ProviderError.ResponseStreamError(message, currentResponseStreamInfo(message), { cause: error })
++      }
++
 +      function normalizeRetryableProviderStreamError(
 +        message: string,
 +        error: Error,
@@ -3595,7 +3669,7 @@ index 20aa8a8404..c8170dbd24 100644
 +        if (!responseStreamErrorMessage(message)) return undefined
 +        return new ProviderError.ResponseStreamError(message, currentResponseStreamInfo(message), {
 +          cause: error,
-+        })
+         })
 +      }
 +
 +      function providerErrorStreamInfo(value: Extract<StreamEvent, { type: "provider-error" }>) {
@@ -3613,11 +3687,10 @@ index 20aa8a8404..c8170dbd24 100644
 +          retryable: value.retryable === true,
 +        } satisfies ProviderError.ResponseStreamInfo
 +      }
-+
+ 
        const settleToolCall = Effect.fn("SessionProcessor.settleToolCall")(function* (toolCallID: string) {
          const done = ctx.toolcalls[toolCallID]?.done
-         delete ctx.toolcalls[toolCallID]
-@@ -180,6 +373,7 @@ const layer = Layer.effect(
+@@ -180,6 +380,7 @@ const layer = Layer.effect(
              attachments: output.attachments,
            },
          })
@@ -3625,7 +3698,7 @@ index 20aa8a8404..c8170dbd24 100644
          yield* settleToolCall(toolCallID)
        })
  
-@@ -200,6 +394,7 @@ const layer = Layer.effect(
+@@ -200,6 +401,7 @@ const layer = Layer.effect(
          if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
            ctx.blocked = ctx.shouldBreak
          }
@@ -3633,7 +3706,7 @@ index 20aa8a8404..c8170dbd24 100644
          yield* settleToolCall(toolCallID)
          return true
        })
-@@ -278,6 +473,7 @@ const layer = Layer.effect(
+@@ -278,6 +480,7 @@ const layer = Layer.effect(
        const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
          switch (value.type) {
            case "reasoning-start":
@@ -3641,7 +3714,7 @@ index 20aa8a8404..c8170dbd24 100644
              if (value.id in ctx.reasoningMap) return
              ctx.reasoningMap[value.id] = {
                id: PartID.ascending(),
-@@ -288,13 +484,16 @@ const layer = Layer.effect(
+@@ -288,13 +491,16 @@ const layer = Layer.effect(
                time: { start: Date.now() },
                metadata: value.providerMetadata,
              }
@@ -3659,7 +3732,7 @@ index 20aa8a8404..c8170dbd24 100644
              if (value.providerMetadata) ctx.reasoningMap[value.id].metadata = value.providerMetadata
              yield* session.updatePartDelta({
                sessionID: ctx.reasoningMap[value.id].sessionID,
-@@ -316,6 +515,7 @@ const layer = Layer.effect(
+@@ -316,6 +522,7 @@ const layer = Layer.effect(
              if (ctx.assistantMessage.summary) {
                throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
              }
@@ -3667,7 +3740,7 @@ index 20aa8a8404..c8170dbd24 100644
              yield* ensureToolCall(value)
              return
  
-@@ -324,6 +524,7 @@ const layer = Layer.effect(
+@@ -324,6 +531,7 @@ const layer = Layer.effect(
              return
  
            case "tool-input-end": {
@@ -3675,7 +3748,7 @@ index 20aa8a8404..c8170dbd24 100644
              yield* ensureToolCall(value)
              return
            }
-@@ -332,7 +533,9 @@ const layer = Layer.effect(
+@@ -332,7 +540,9 @@ const layer = Layer.effect(
              if (ctx.assistantMessage.summary) {
                throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
              }
@@ -3685,7 +3758,7 @@ index 20aa8a8404..c8170dbd24 100644
              const input = isRecord(value.input) ? value.input : { value: value.input }
              yield* updateToolCall(value.id, (match) => ({
                ...match,
-@@ -381,6 +584,7 @@ const layer = Layer.effect(
+@@ -381,6 +591,7 @@ const layer = Layer.effect(
            }
  
            case "tool-result": {
@@ -3693,7 +3766,7 @@ index 20aa8a8404..c8170dbd24 100644
              const toolCall = yield* readToolCall(value.id)
              if (!toolCall && value.result.type === "error") return
              if (value.result.type === "error") {
-@@ -414,25 +618,43 @@ const layer = Layer.effect(
+@@ -414,25 +625,43 @@ const layer = Layer.effect(
            }
  
            case "tool-error": {
@@ -3740,7 +3813,7 @@ index 20aa8a8404..c8170dbd24 100644
              const completedSnapshot = yield* snapshot.track()
              yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
              const usage = Session.getUsage({
-@@ -441,10 +663,17 @@ const layer = Layer.effect(
+@@ -441,10 +670,17 @@ const layer = Layer.effect(
                metadata: value.providerMetadata,
              })
              ctx.assistantMessage.finish = value.reason
@@ -3759,7 +3832,7 @@ index 20aa8a8404..c8170dbd24 100644
                reason: value.reason,
                snapshot: completedSnapshot,
                messageID: ctx.assistantMessage.id,
-@@ -453,18 +682,24 @@ const layer = Layer.effect(
+@@ -453,18 +689,24 @@ const layer = Layer.effect(
                tokens: usage.tokens,
                cost: usage.cost,
              })
@@ -3785,7 +3858,7 @@ index 20aa8a8404..c8170dbd24 100644
                }
                ctx.snapshot = undefined
              }
-@@ -480,10 +715,12 @@ const layer = Layer.effect(
+@@ -480,10 +722,12 @@ const layer = Layer.effect(
              ) {
                ctx.needsCompaction = true
              }
@@ -3798,7 +3871,7 @@ index 20aa8a8404..c8170dbd24 100644
              ctx.currentText = {
                id: PartID.ascending(),
                messageID: ctx.assistantMessage.id,
-@@ -493,12 +730,16 @@ const layer = Layer.effect(
+@@ -493,12 +737,16 @@ const layer = Layer.effect(
                time: { start: Date.now() },
                metadata: value.providerMetadata,
              }
@@ -3816,7 +3889,7 @@ index 20aa8a8404..c8170dbd24 100644
              if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
              yield* session.updatePartDelta({
                sessionID: ctx.currentText.sessionID,
-@@ -532,6 +773,7 @@ const layer = Layer.effect(
+@@ -532,6 +780,7 @@ const layer = Layer.effect(
              return
  
            case "finish":
@@ -3824,7 +3897,7 @@ index 20aa8a8404..c8170dbd24 100644
              return
          }
        })
-@@ -603,7 +845,8 @@ const layer = Layer.effect(
+@@ -603,7 +852,8 @@ const layer = Layer.effect(
            error: errorMessage(e),
            stack: e instanceof Error ? e.stack : undefined,
          })
@@ -3834,7 +3907,7 @@ index 20aa8a8404..c8170dbd24 100644
          if (SessionV1.ContextOverflowError.isInstance(error)) {
            if ((yield* config.get()).compaction?.auto === false && !ctx.assistantMessage.summary) {
              ctx.assistantMessage.error = error
-@@ -624,6 +867,84 @@ const layer = Layer.effect(
+@@ -624,6 +874,85 @@ const layer = Layer.effect(
          yield* status.set(ctx.sessionID, { type: "idle" })
        })
  
@@ -3863,7 +3936,8 @@ index 20aa8a8404..c8170dbd24 100644
 +
 +      const recoverRetryableError = (error: unknown): Effect.Effect<unknown> =>
 +        Effect.gen(function* () {
-+          const candidate = normalizeNativeResponseStreamError(error) ?? error
++          const candidate =
++            normalizeNativeResponseStreamError(error) ?? normalizeJsonParseResponseStreamError(error) ?? error
 +          yield* refreshCancelledByUser()
 +          if (cancelledByUser && cancelInducedTransportCandidate(candidate)) {
 +            aborted = true
@@ -3919,7 +3993,7 @@ index 20aa8a8404..c8170dbd24 100644
        const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
          yield* Effect.logInfo("process", {
            "session.id": input.sessionID,
-@@ -633,9 +954,11 @@ const layer = Layer.effect(
+@@ -633,9 +962,11 @@ const layer = Layer.effect(
          ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
  
          return yield* Effect.gen(function* () {
@@ -3932,7 +4006,7 @@ index 20aa8a8404..c8170dbd24 100644
              yield* status.set(ctx.sessionID, { type: "busy" })
              const stream = llm.stream(streamInput)
  
-@@ -648,6 +971,7 @@ const layer = Layer.effect(
+@@ -648,6 +979,7 @@ const layer = Layer.effect(
              Effect.onInterrupt(() =>
                Effect.gen(function* () {
                  aborted = true
@@ -3940,7 +4014,7 @@ index 20aa8a8404..c8170dbd24 100644
                  if (!ctx.assistantMessage.error) {
                    yield* halt(new DOMException("Aborted", "AbortError"))
                  }
-@@ -657,6 +981,27 @@ const layer = Layer.effect(
+@@ -657,6 +989,27 @@ const layer = Layer.effect(
                (cause) => !Cause.hasInterruptsOnly(cause),
                (cause) => Effect.fail(Cause.squash(cause)),
              ),
@@ -3968,7 +4042,7 @@ index 20aa8a8404..c8170dbd24 100644
              Effect.retry(
                SessionRetry.policy({
                  provider: input.model.providerID,
-@@ -672,10 +1017,12 @@ const layer = Layer.effect(
+@@ -672,10 +1025,12 @@ const layer = Layer.effect(
                  },
                }),
              ),
@@ -3981,7 +4055,7 @@ index 20aa8a8404..c8170dbd24 100644
            if (ctx.needsCompaction) return "compact"
            if (ctx.blocked || ctx.assistantMessage.error) return "stop"
            return "continue"
-@@ -686,6 +1033,7 @@ const layer = Layer.effect(
+@@ -686,6 +1041,7 @@ const layer = Layer.effect(
          get message() {
            return ctx.assistantMessage
          },
@@ -3989,7 +4063,7 @@ index 20aa8a8404..c8170dbd24 100644
          updateToolCall,
          completeToolCall,
          process,
-@@ -696,6 +1044,57 @@ const layer = Layer.effect(
+@@ -696,6 +1052,57 @@ const layer = Layer.effect(
    }),
  )
  
@@ -6838,6 +6912,70 @@ index 0b88fa59df..c66c91b964 100644
        { id: "gpt-5.4-pro", releaseDate: "2026-03-05", efforts: ["medium", "high", "xhigh"] },
        { id: "gpt-5.5-pro", releaseDate: "2026-04-23", efforts: ["medium", "high", "xhigh"] },
        { id: "gpt-5-codex", releaseDate: "2025-09-23", efforts: ["low", "medium", "high"] },
+diff --git a/packages/opencode/test/session/llm-native.test.ts b/packages/opencode/test/session/llm-native.test.ts
+index dd4d9cc174..e82706b333 100644
+--- a/packages/opencode/test/session/llm-native.test.ts
++++ b/packages/opencode/test/session/llm-native.test.ts
+@@ -332,6 +332,59 @@ describe("session.llm-native.request", () => {
+     ])
+   })
+ 
++  it.effect("replays supported OpenAI-compatible reasoning through native request lowering", () =>
++    Effect.gen(function* () {
++      const prepared = yield* prepareNativeRequest({
++        model: {
++          ...baseModel,
++          providerID: ProviderV2.ID.make("opencode"),
++          api: {
++            ...baseModel.api,
++            url: "https://ai.example.test/v1",
++            npm: "@ai-sdk/openai-compatible",
++          },
++          capabilities: { ...baseModel.capabilities, interleaved: { field: "reasoning_content" } },
++        },
++        apiKey: "test-key",
++        messages: [
++          {
++            role: "assistant",
++            content: [{ type: "text", text: "answer" }],
++            providerOptions: { openaiCompatible: { reasoning_content: "thinking" } },
++          },
++        ],
++      })
++
++      expect(prepared.body).toMatchObject({
++        messages: [{ role: "assistant", content: "answer", reasoning_content: "thinking" }],
++      })
++    }),
++  )
++
++  test("falls back from native OpenAI-compatible models with unsupported reasoning fields", () => {
++    const provider = {
++      ...providerInfo,
++      id: ProviderV2.ID.make("opencode"),
++      options: { apiKey: "test-key", baseURL: "https://ai.example.test/v1" },
++    }
++    const model = (field: string): Provider.Model => ({
++      ...baseModel,
++      providerID: provider.id,
++      api: { ...baseModel.api, url: "https://ai.example.test/v1", npm: "@ai-sdk/openai-compatible" },
++      capabilities: { ...baseModel.capabilities, interleaved: { field } },
++    })
++
++    expect(LLMNativeRuntime.status({ model: model("reasoning_content"), provider, auth: undefined })).toMatchObject({
++      type: "supported",
++    })
++    for (const field of ["reasoning_text", "vendor_reasoning"]) {
++      expect(LLMNativeRuntime.status({ model: model(field), provider, auth: undefined })).toEqual({
++        type: "unsupported",
++        reason: `native OpenAI-compatible runtime does not support ${field}`,
++      })
++    }
++  })
++
+   test("selects native request routes for provider packages", () => {
+     const openai = LLMNative.model({
+       model: { ...baseModel, api: { ...baseModel.api, url: "", npm: "@ai-sdk/openai" } },
 diff --git a/packages/opencode/test/session/message-v2.test.ts b/packages/opencode/test/session/message-v2.test.ts
 index 9bb688aedd..a89c17fa79 100644
 --- a/packages/opencode/test/session/message-v2.test.ts
@@ -7106,7 +7244,7 @@ index 9bb688aedd..a89c17fa79 100644
  
  describe("session.message-v2.latest", () => {
 diff --git a/packages/opencode/test/session/processor-effect.test.ts b/packages/opencode/test/session/processor-effect.test.ts
-index 5287605436..58c4a2c66a 100644
+index 5287605436..ee6b3b65be 100644
 --- a/packages/opencode/test/session/processor-effect.test.ts
 +++ b/packages/opencode/test/session/processor-effect.test.ts
 @@ -1,13 +1,16 @@
@@ -7117,7 +7255,7 @@ index 5287605436..58c4a2c66a 100644
  import { EventV2Bridge } from "@/event-v2-bridge"
  import { expect } from "bun:test"
 -import { tool } from "ai"
-+import { APICallError, tool } from "ai"
++import { APICallError, JSONParseError, tool } from "ai"
 +import { InvalidProviderOutputReason, InvalidRequestReason, LLMError, LLMEvent } from "@opencode-ai/llm"
  import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
  import path from "path"
@@ -7241,7 +7379,7 @@ index 5287605436..58c4a2c66a 100644
  
          const chat = yield* session.create({})
          const parent = yield* user(chat.id, "retry")
-@@ -658,6 +719,1893 @@ it.live("session.processor effect tests publish retry status updates", () =>
+@@ -658,6 +719,1970 @@ it.live("session.processor effect tests publish retry status updates", () =>
    ),
  )
  
@@ -7453,6 +7591,83 @@ index 5287605436..58c4a2c66a 100644
 +          expect(llm.calls).toBe(1)
 +          expect(states).toStrictEqual([])
 +          expect(handle.message.error?.name).toBe("MessageAbortedError")
++        })
++
++        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
++      }),
++    { config: cfg },
++  ),
++)
++
++isolatedIt.live("session.processor effect tests rollback partial output before malformed stream retry", () =>
++  provideTmpdirInstance(
++    (dir) =>
++      Effect.gen(function* () {
++        const llm = llmStub()
++        llm.push(
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.textStart({ id: "text_1" }),
++            LLMEvent.textDelta({ id: "text_1", text: "partial" }),
++          ).pipe(
++            Stream.concat(
++              Stream.fail(
++                new JSONParseError({
++                  text: '{"choices":[{"index":0data: {"id":"abc"}',
++                  cause: new SyntaxError("Expected ','"),
++                }),
++              ),
++            ),
++          ),
++          Stream.make(
++            LLMEvent.stepStart({ index: 0 }),
++            LLMEvent.textStart({ id: "text_2" }),
++            LLMEvent.textDelta({ id: "text_2", text: "after" }),
++            LLMEvent.textEnd({ id: "text_2" }),
++            LLMEvent.stepFinish({ index: 0, reason: "stop" }),
++            LLMEvent.finish({ reason: "stop" }),
++          ),
++        )
++
++        const effect = Effect.gen(function* () {
++          const { processors, session, provider } = yield* boot()
++
++          const chat = yield* session.create({})
++          const parent = yield* user(chat.id, "retry malformed stream")
++          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
++          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
++          const handle = yield* processors.create({
++            assistantMessage: msg,
++            sessionID: chat.id,
++            model: mdl,
++          })
++
++          const value = yield* handle.process({
++            user: {
++              id: parent.id,
++              sessionID: chat.id,
++              role: "user",
++              time: parent.time,
++              agent: parent.agent,
++              model: { providerID: ref.providerID, modelID: ref.modelID },
++            } satisfies SessionV1.User,
++            sessionID: chat.id,
++            model: mdl,
++            agent: agent(),
++            system: [],
++            messages: [{ role: "user", content: "retry malformed stream" }],
++            tools: {},
++          })
++
++          const parts = yield* MessageV2.parts(msg.id)
++
++          expect(value).toBe("continue")
++          expect(llm.calls).toBe(2)
++          expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
++          expect(parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text)).toEqual([
++            "after",
++          ])
++          expect(handle.message.error).toBeUndefined()
 +        })
 +
 +        yield* effect.pipe(Effect.provide(processorLayer(llm.layer)))
@@ -9911,3 +10126,75 @@ index 90c91e9158..1545d63be8 100644
        | ApiError
    }
  }
+diff --git a/packages/sdk/openapi.json b/packages/sdk/openapi.json
+index afe14bb604..71dd9994fe 100644
+--- a/packages/sdk/openapi.json
++++ b/packages/sdk/openapi.json
+@@ -16187,6 +16187,27 @@
+         "required": ["name", "data"],
+         "additionalProperties": false
+       },
++      "EmptyResponseError": {
++        "type": "object",
++        "properties": {
++          "name": {
++            "type": "string",
++            "enum": ["EmptyResponseError"]
++          },
++          "data": {
++            "type": "object",
++            "properties": {
++              "message": {
++                "type": "string"
++              }
++            },
++            "required": ["message"],
++            "additionalProperties": false
++          }
++        },
++        "required": ["name", "data"],
++        "additionalProperties": false
++      },
+       "APIError": {
+         "type": "object",
+         "properties": {
+@@ -16283,6 +16304,9 @@
+               {
+                 "$ref": "#/components/schemas/ContentFilterError"
+               },
++              {
++                "$ref": "#/components/schemas/EmptyResponseError"
++              },
+               {
+                 "$ref": "#/components/schemas/APIError"
+               }
+@@ -19130,6 +19154,9 @@
+                           {
+                             "$ref": "#/components/schemas/ContentFilterError"
+                           },
++                          {
++                            "$ref": "#/components/schemas/EmptyResponseError"
++                          },
+                           {
+                             "$ref": "#/components/schemas/APIError"
+                           }
+@@ -31652,6 +31679,9 @@
+                   {
+                     "$ref": "#/components/schemas/ContentFilterError"
+                   },
++                  {
++                    "$ref": "#/components/schemas/EmptyResponseError"
++                  },
+                   {
+                     "$ref": "#/components/schemas/APIError"
+                   }
+@@ -35533,6 +35563,9 @@
+                   {
+                     "$ref": "#/components/schemas/ContentFilterError"
+                   },
++                  {
++                    "$ref": "#/components/schemas/EmptyResponseError"
++                  },
+                   {
+                     "$ref": "#/components/schemas/APIError"
+                   }
