@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -ne 2 ]; then
+  printf 'Usage: %s DEB VERSION\n' "${0##*/}" >&2
+  exit 64
+fi
+
+deb=$1
+expected_version=$2
+
+fail() {
+  printf 'DGX Spark validation failed for %s: %s\n' "$deb" "$1" >&2
+  exit 1
+}
+
+[ -f "$deb" ] || fail "package is missing"
+[ "$(. /etc/os-release; printf '%s:%s' "$ID" "$VERSION_ID")" = ubuntu:24.04 ] || fail "validator is not Ubuntu 24.04"
+[ "$(dpkg --print-architecture)" = amd64 ] || fail "validator builder architecture is not amd64"
+case "$(dpkg --print-foreign-architectures)" in
+  *arm64*) ;;
+  *) fail "arm64 is not enabled as a foreign architecture" ;;
+esac
+
+bash /validator/validate-deb "$deb" opencode "$expected_version" arm64 usr/bin/opencode
+
+# The image already contains the package's runtime dependencies. Keep the final
+# target-userspace install and smoke test offline so publication validation
+# cannot silently depend on mutable package repositories.
+dpkg --unpack "$deb" >/dev/null
+dpkg --configure opencode:arm64 >/dev/null
+[ "$(dpkg-query -W -f='${db:Status-Status}' opencode:arm64)" = installed ] || fail "package did not configure successfully"
+[ "$(dpkg-query -W -f='${Version}' opencode:arm64)" = "$expected_version" ] || fail "installed version does not match"
+[ "$(dpkg-query -W -f='${Architecture}' opencode:arm64)" = arm64 ] || fail "installed architecture is not arm64"
+
+actual_version=$(SHELL=/bin/bash qemu-aarch64-static -L / /usr/bin/opencode --version)
+[ "$actual_version" = "${expected_version%%-*}" ] || fail "installed binary version $actual_version != ${expected_version%%-*}"
+
+printf 'Validated DGX Spark target: Ubuntu 24.04 arm64 userspace under qemu-aarch64-static, opencode %s\n' "$actual_version"

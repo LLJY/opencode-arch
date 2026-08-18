@@ -52,6 +52,11 @@ require() {
   fi
 }
 
+die() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
 require bun
 require dpkg
 require dpkg-deb
@@ -249,13 +254,21 @@ bash "$repo_root/validate-deb" \
   opencode \
   "$version" \
   "$deb_arch" \
-  usr/bin/opencode
+  usr/bin/opencode \
+  usr/share/bash-completion/completions/opencode \
+  usr/share/zsh/vendor-completions/_opencode \
+  usr/share/licenses/opencode/LICENSE
 if [ "$build_daemon" -eq 1 ]; then
   bash "$repo_root/validate-deb" \
     "$out_dir/opencode-daemon_${version}_all.deb" \
     opencode-daemon \
     "$version" \
-    all
+    all \
+    - \
+    usr/bin/opencode-daemon \
+    usr/bin/ocd \
+    usr/lib/systemd/user/opencode-daemon.service \
+    usr/share/licenses/opencode-daemon/LICENSE
 fi
 
 printf 'Built:\n'

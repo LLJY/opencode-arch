@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+pkgver=$(awk -F= '/^pkgver=/{ print $2; exit }' "$repo_root/PKGBUILD")
+pkgrel=$(awk -F= '/^pkgrel=/{ print $2; exit }' "$repo_root/PKGBUILD")
+version=$pkgver-$pkgrel
+release_dir=${OUT_DIR:-$repo_root/dist/release-$version}
+arch_main="opencode-${version}-x86_64.pkg.tar.zst"
+arch_daemon="opencode-daemon-${version}-x86_64.pkg.tar.zst"
+deb_main="opencode_${version}_amd64.deb"
+deb_daemon="opencode-daemon_${version}_all.deb"
+deb_arm="opencode_${version}_arm64.deb"
+zip_name="opencode-arch-${version}-x86_64.zip"
+packages=("$arch_main" "$arch_daemon" "$deb_main" "$deb_daemon" "$deb_arm")
+
+if [ -e "$release_dir" ]; then
+  printf 'Refusing to reuse existing release output: %s\n' "$release_dir" >&2
+  exit 73
+fi
+
+for command in docker python3 sha256sum unzip zip; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    printf 'Missing required command: %s\n' "$command" >&2
+    exit 127
+  fi
+done
+
+mkdir -p "$repo_root/dist"
+stage=$(mktemp -d "$repo_root/dist/.release-$version.XXXXXX")
+cleanup() { rm -rf "$stage"; }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+mkdir -p "$stage/arch" "$stage/debian" "$stage/release"
+
+OUT_DIR="$stage/arch" "$repo_root/build-makepkg-docker"
+OUT_DIR="$stage/debian" "$repo_root/build-deb-docker" all
+"$repo_root/validate-dgx-spark-docker" "$stage/debian/$deb_arm"
+
+shopt -s nullglob
+actual=("$stage/arch"/*.pkg.tar.zst "$stage/debian"/*.deb)
+if [ "${#actual[@]}" -ne 5 ]; then
+  printf 'Expected exactly five package artifacts, found %s:\n' "${#actual[@]}" >&2
+  printf '  %s\n' "${actual[@]}" >&2
+  exit 1
+fi
+
+sources=(
+  "$stage/arch/$arch_main"
+  "$stage/arch/$arch_daemon"
+  "$stage/debian/$deb_main"
+  "$stage/debian/$deb_daemon"
+  "$stage/debian/$deb_arm"
+)
+for source in "${sources[@]}"; do
+  if [ ! -s "$source" ]; then
+    printf 'Missing expected final package: %s\n' "$source" >&2
+    exit 1
+  fi
+  cp -- "$source" "$stage/release/${source##*/}"
+done
+
+(
+  cd "$stage/release"
+  sha256sum "${packages[@]}" > SHA256SUMS
+  sha256sum --check SHA256SUMS
+)
+
+zip -X -0 -j "$stage/release/$zip_name" \
+  "$stage/release/$arch_main" \
+  "$stage/release/$arch_daemon"
+unzip -t "$stage/release/$zip_name"
+python3 -c 'import sys, zipfile
+archive, main, daemon = sys.argv[1:]
+with zipfile.ZipFile(archive) as value:
+    expected = [main, daemon]
+    if value.namelist() != expected:
+        raise SystemExit(f"unexpected ZIP members: {value.namelist()!r}")
+    if any(item.compress_type != zipfile.ZIP_STORED for item in value.infolist()):
+        raise SystemExit("Arch ZIP members are not stored")
+' "$stage/release/$zip_name" "$arch_main" "$arch_daemon"
+unzip -p "$stage/release/$zip_name" "$arch_main" | cmp - "$stage/release/$arch_main"
+unzip -p "$stage/release/$zip_name" "$arch_daemon" | cmp - "$stage/release/$arch_daemon"
+
+mv -- "$stage/release" "$release_dir"
+trap - EXIT INT TERM
+rm -rf "$stage"
+
+printf 'Built and validated release %s:\n' "$version"
+printf '  %s\n' "$release_dir/${packages[0]}" "$release_dir/${packages[1]}" \
+  "$release_dir/${packages[2]}" "$release_dir/${packages[3]}" "$release_dir/${packages[4]}" \
+  "$release_dir/SHA256SUMS" "$release_dir/$zip_name"
+printf 'Arch ZIP SHA-256:\n'
+sha256sum "$release_dir/$zip_name"

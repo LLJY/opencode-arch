@@ -37,7 +37,7 @@ done
 built=()
 for deb_arch in "${arches[@]}"; do
   build_daemon=$([ "$deb_arch" = amd64 ] && printf 1 || printf 0)
-  image="opencode-deb:${version}-${deb_arch}"
+  image="opencode-deb:${version}-${deb_arch}-$$"
   container="opencode-deb-${version}-${deb_arch}-$$"
   package="opencode_${version}_${deb_arch}.deb"
 
@@ -54,17 +54,24 @@ for deb_arch in "${arches[@]}"; do
     --env "BUILD_DAEMON=$build_daemon" \
     "$image" >/dev/null
   cleanup() { docker rm -f "$container" >/dev/null 2>&1 || true; }
-  trap cleanup EXIT INT TERM
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
   docker start --attach "$container"
   docker cp "$container:/out/$package" "$out_dir/$package"
   [ -s "$out_dir/$package" ]
   docker run --rm \
     --platform linux/amd64 \
+    --network none \
     --volume "$out_dir:/export:ro" \
     --entrypoint /bin/bash \
     "$image" \
-    /pkg/validate-deb "/export/$package" opencode "$version" "$deb_arch" usr/bin/opencode
+    /pkg/validate-deb "/export/$package" opencode "$version" "$deb_arch" \
+    usr/bin/opencode \
+    usr/share/bash-completion/completions/opencode \
+    usr/share/zsh/vendor-completions/_opencode \
+    usr/share/licenses/opencode/LICENSE
   built+=("$out_dir/$package")
 
   if [ "$build_daemon" -eq 1 ]; then
@@ -73,10 +80,16 @@ for deb_arch in "${arches[@]}"; do
     [ -s "$out_dir/$daemon" ]
     docker run --rm \
       --platform linux/amd64 \
+      --network none \
       --volume "$out_dir:/export:ro" \
       --entrypoint /bin/bash \
       "$image" \
-      /pkg/validate-deb "/export/$daemon" opencode-daemon "$version" all
+      /pkg/validate-deb "/export/$daemon" opencode-daemon "$version" all \
+      - \
+      usr/bin/opencode-daemon \
+      usr/bin/ocd \
+      usr/lib/systemd/user/opencode-daemon.service \
+      usr/share/licenses/opencode-daemon/LICENSE
     built+=("$out_dir/$daemon")
   fi
 

@@ -1,0 +1,43 @@
+ARG TARGETPLATFORM=linux/amd64
+FROM --platform=$TARGETPLATFORM ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea
+
+USER root
+RUN dpkg --add-architecture arm64 \
+    && printf '%s\n' \
+      'Types: deb' \
+      'URIs: http://archive.ubuntu.com/ubuntu' \
+      'Suites: noble noble-updates noble-backports' \
+      'Components: main universe' \
+      'Architectures: amd64' \
+      'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
+      '' \
+      'Types: deb' \
+      'URIs: http://security.ubuntu.com/ubuntu' \
+      'Suites: noble-security' \
+      'Components: main universe' \
+      'Architectures: amd64' \
+      'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
+      > /etc/apt/sources.list.d/ubuntu.sources \
+    && printf '%s\n' \
+      'Types: deb' \
+      'URIs: http://ports.ubuntu.com/ubuntu-ports' \
+      'Suites: noble noble-updates noble-backports noble-security' \
+      'Components: main universe' \
+      'Architectures: arm64' \
+      'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
+      > /etc/apt/sources.list.d/ubuntu-ports.sources \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+      binutils \
+      ca-certificates \
+      curl \
+      file \
+      libc6:arm64 \
+      qemu-user-static \
+      ripgrep:arm64 \
+      tar \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /validator
+
+COPY --chmod=0755 validate-deb validate-dgx-spark /validator/
+ENTRYPOINT ["/validator/validate-dgx-spark"]

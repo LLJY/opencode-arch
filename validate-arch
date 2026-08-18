@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -lt 5 ]; then
+  printf 'Usage: %s PACKAGE NAME VERSION ARCH PATH...\n' "${0##*/}" >&2
+  exit 64
+fi
+
+package=$1
+expected_name=$2
+expected_version=$3
+expected_arch=$4
+shift 4
+
+fail() {
+  printf 'Arch validation failed for %s: %s\n' "$package" "$1" >&2
+  exit 1
+}
+
+[ -s "$package" ] || fail "package is missing or empty"
+pacman -Qip "$package" >/dev/null
+contents=$(pacman -Qlp "$package")
+query=$(pacman -Qp "$package")
+actual_name=${query%% *}
+actual_version=${query#* }
+actual_arch=$(bsdtar -xOf "$package" .PKGINFO | sed -n 's/^arch = //p')
+
+[ "$actual_name" = "$expected_name" ] || fail "package name $actual_name != $expected_name"
+[ "$actual_version" = "$expected_version" ] || fail "package version $actual_version != $expected_version"
+[ "$actual_arch" = "$expected_arch" ] || fail "package architecture $actual_arch != $expected_arch"
+
+for expected_path in "$@"; do
+  found=false
+  while read -r _ path; do
+    if [ "${path#/}" = "${expected_path%/}" ]; then
+      found=true
+      break
+    fi
+  done <<< "$contents"
+  $found || fail "missing package path $expected_path"
+done
+
+if [ "$expected_name" = opencode ]; then
+  extract_dir=$(mktemp -d)
+  cleanup() { rm -rf "$extract_dir"; }
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  bsdtar -xf "$package" -C "$extract_dir" usr/bin/opencode
+  machine=$(readelf -h "$extract_dir/usr/bin/opencode" | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')
+  [ "$machine" = 'Advanced Micro Devices X86-64' ] || fail "main binary is not x86-64"
+  actual_binary_version=$(SHELL=/bin/bash "$extract_dir/usr/bin/opencode" --version)
+  [ "$actual_binary_version" = "${expected_version%-*}" ] || fail "main binary version does not match"
+fi
+
+printf 'Validated %s %s (%s)\n' "$actual_name" "$actual_version" "$actual_arch"

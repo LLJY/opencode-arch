@@ -2,26 +2,64 @@
 set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-image=${MAKEPKG_IMAGE:-opencode-makepkg:arch}
+image=${MAKEPKG_IMAGE:-opencode-makepkg:arch-$$}
 out_dir=${OUT_DIR:-$repo_root/dist/arch}
 container=opencode-makepkg-$$
-
-mkdir -p "$out_dir"
-
-docker build --file "$repo_root/Dockerfile.makepkg" --tag "$image" "$repo_root"
-docker create --name "$container" "$image" >/dev/null
-cleanup() { docker rm -f "$container" >/dev/null 2>&1 || true; }
-trap cleanup EXIT
-
-docker start --attach "$container"
-
 pkgver=$(awk -F= '/^pkgver=/{ print $2; exit }' "$repo_root/PKGBUILD")
 pkgrel=$(awk -F= '/^pkgrel=/{ print $2; exit }' "$repo_root/PKGBUILD")
-opencode_pkg="opencode-${pkgver}-${pkgrel}-x86_64.pkg.tar.zst"
-daemon_pkg="opencode-daemon-${pkgver}-${pkgrel}-x86_64.pkg.tar.zst"
+version=$pkgver-$pkgrel
+opencode_pkg="opencode-${version}-x86_64.pkg.tar.zst"
+daemon_pkg="opencode-daemon-${version}-x86_64.pkg.tar.zst"
 
+mkdir -p "$out_dir"
+out_dir=$(cd -- "$out_dir" && pwd)
+for package in "$out_dir/$opencode_pkg" "$out_dir/$daemon_pkg"; do
+  if [ -e "$package" ]; then
+    printf 'Refusing to reuse existing package output: %s\n' "$package" >&2
+    exit 73
+  fi
+done
+
+docker build --platform linux/amd64 --file "$repo_root/Dockerfile.makepkg" --tag "$image" "$repo_root"
+docker create --platform linux/amd64 --name "$container" "$image" >/dev/null
+cleanup() { docker rm -f "$container" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+docker start --attach "$container"
 docker cp "$container:/build/$opencode_pkg" "$out_dir/$opencode_pkg"
 docker cp "$container:/build/$daemon_pkg" "$out_dir/$daemon_pkg"
+[ -s "$out_dir/$opencode_pkg" ]
+[ -s "$out_dir/$daemon_pkg" ]
 
-printf 'Built Arch packages:\n'
+docker run --rm \
+  --platform linux/amd64 \
+  --network none \
+  --volume "$out_dir:/export:ro" \
+  --entrypoint /bin/bash \
+  "$image" \
+  /build/validate-arch \
+  "/export/$opencode_pkg" opencode "$version" x86_64 \
+  usr/bin/opencode \
+  usr/share/bash-completion/completions/opencode \
+  usr/share/zsh/site-functions/_opencode \
+  usr/share/licenses/opencode/LICENSE
+
+docker run --rm \
+  --platform linux/amd64 \
+  --network none \
+  --volume "$out_dir:/export:ro" \
+  --entrypoint /bin/bash \
+  "$image" \
+  /build/validate-arch \
+  "/export/$daemon_pkg" opencode-daemon "$version" x86_64 \
+  usr/bin/opencode-daemon \
+  usr/bin/ocd \
+  usr/lib/systemd/user/opencode-daemon.service \
+  usr/share/licenses/opencode-daemon/LICENSE
+
+cleanup
+trap - EXIT INT TERM
+printf 'Built and validated Arch packages:\n'
 printf '  %s\n' "$out_dir/$opencode_pkg" "$out_dir/$daemon_pkg"

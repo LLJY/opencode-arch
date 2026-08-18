@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+pkgver=$(awk -F= '/^pkgver=/{ print $2; exit }' "$repo_root/PKGBUILD")
+pkgrel=$(awk -F= '/^pkgrel=/{ print $2; exit }' "$repo_root/PKGBUILD")
+version=$pkgver-$pkgrel
+deb=${1:-$repo_root/dist/debian-final-$version/opencode_${version}_arm64.deb}
+
+if [ ! -s "$deb" ]; then
+  printf 'Missing DGX Spark package: %s\n' "$deb" >&2
+  exit 66
+fi
+
+deb_dir=$(cd -- "$(dirname -- "$deb")" && pwd)
+deb_name=$(basename -- "$deb")
+image="opencode-dgx-validator:ubuntu-24.04-$version"
+
+docker build \
+  --platform linux/amd64 \
+  --file "$repo_root/Dockerfile.ubuntu-arm64-validate" \
+  --tag "$image" \
+  "$repo_root"
+docker run --rm \
+  --platform linux/amd64 \
+  --network none \
+  --volume "$deb_dir:/artifacts:ro" \
+  "$image" \
+  "/artifacts/$deb_name" "$version"
