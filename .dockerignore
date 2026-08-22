@@ -5,7 +5,7 @@ pkg
 opencode
 dist
 downstream-*.patch
-!downstream-1.18.16.patch
+!downstream-1.18.19.patch
 *.pkg.tar.*
 *.deb
 *.log

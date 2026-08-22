@@ -5,6 +5,7 @@ set -euo pipefail
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 pkgver=${PKGVER:-$(awk -F= '/^pkgver=/{ print $2; exit }' "$repo_root/PKGBUILD")}
 pkgrel=${PKGREL:-$(awk -F= '/^pkgrel=/{ print $2; exit }' "$repo_root/PKGBUILD")}
+upstream_commit=${UPSTREAM_COMMIT:-$(awk -F= '/^_commit=/{ print $2; exit }' "$repo_root/PKGBUILD")}
 pkgdesc=${PKGDESC:-"The open source coding agent"}
 homepage=${HOMEPAGE:-https://github.com/anomalyco/opencode}
 maintainer=${DEB_MAINTAINER:-"opencode downstream maintainers <noreply@example.invalid>"}
@@ -23,6 +24,7 @@ Build Debian binary packages for opencode and opencode-daemon.
 Environment overrides:
   PKGVER           Upstream version (default: pkgver from PKGBUILD)
   PKGREL           Debian revision (default: pkgrel from PKGBUILD)
+  UPSTREAM_COMMIT  Exact upstream commit (default: _commit from PKGBUILD)
   DEB_ARCH         Target package architecture: amd64 or arm64 (default: host architecture)
   OPENCODE_REPO    Git repository/path to clone (default: $homepage.git)
   PATCH_FILE       Downstream patch (default: downstream-\$PKGVER.patch)
@@ -125,6 +127,8 @@ mkdir -p "$out_dir" "$pkg_root"
 
 printf 'Cloning %s at v%s\n' "$opencode_repo" "$pkgver"
 git clone --depth 1 --branch "v$pkgver" "$opencode_repo" "$src_dir"
+actual_commit=$(git -C "$src_dir" rev-parse HEAD)
+[ "$actual_commit" = "$upstream_commit" ] || die "upstream tag v$pkgver resolved to $actual_commit, expected $upstream_commit"
 
 printf 'Applying %s\n' "$patch_file"
 patch -d "$src_dir" -Np1 -i "$patch_file"
