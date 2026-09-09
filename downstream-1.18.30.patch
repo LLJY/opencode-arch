@@ -4619,7 +4619,7 @@ index cebd08145d210d008b8a09a797b176061c1f0be7..208dba71a05f4afcea3175c4fcd9db8b
    switch (body?.error?.code) {
      case "context_length_exceeded":
 diff --git a/packages/opencode/src/provider/provider.ts b/packages/opencode/src/provider/provider.ts
-index dba9cbece552227b753272747be7176d9da8c87a..421f28d346ff6e7de106b3ab50515ccd23e51cfe 100644
+index 867ef2ca2fa800b271b42684c26bde7d90776b0a..5ccf8c28c96294ad318c067cab5aca99f2d56112 100644
 --- a/packages/opencode/src/provider/provider.ts
 +++ b/packages/opencode/src/provider/provider.ts
 @@ -40,11 +40,22 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
@@ -4644,7 +4644,7 @@ index dba9cbece552227b753272747be7176d9da8c87a..421f28d346ff6e7de106b3ab50515ccd
 -          const err = new ProviderError.ResponseStreamError("SSE read timed out")
 +          const err = streamError("SSE read timed out")
            ctl.abort(err)
-           void reader.cancel(err)
+           reader.cancel(err).catch(() => {})
            reject(err)
 @@ -57,7 +68,11 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
            },
@@ -4698,7 +4698,7 @@ index dba9cbece552227b753272747be7176d9da8c87a..421f28d346ff6e7de106b3ab50515ccd
  type BundledSDK = {
    languageModel(modelId: string): LanguageModelV3
    chat?: (modelId: string) => LanguageModelV3
-@@ -1585,15 +1625,29 @@ const layer = Layer.effect(
+@@ -1610,15 +1650,29 @@ const layer = Layer.effect(
            if (!plugin.auth) continue
            const providerID = ProviderV2.ID.make(plugin.auth.provider)
            if (disabled.has(providerID)) continue
@@ -4732,7 +4732,7 @@ index dba9cbece552227b753272747be7176d9da8c87a..421f28d346ff6e7de106b3ab50515ccd
              ),
            )
            const opts = options ?? {}
-@@ -1793,6 +1847,28 @@ const layer = Layer.effect(
+@@ -1818,6 +1872,28 @@ const layer = Layer.effect(
            const combined = signals.length === 0 ? null : signals.length === 1 ? signals[0] : AbortSignal.any(signals)
            if (combined) opts.signal = combined
  
@@ -4762,7 +4762,7 @@ index dba9cbece552227b753272747be7176d9da8c87a..421f28d346ff6e7de106b3ab50515ccd
              ...opts,
              // @ts-ignore see here: https://github.com/oven-sh/bun/issues/16682
 diff --git a/packages/opencode/src/provider/transform.ts b/packages/opencode/src/provider/transform.ts
-index b388297aee8044cfbd8c5a323580b3a307300ab8..f52b6fd7d4c58d30a0d68058de400ed1e1e3b68b 100644
+index f0be2d1537517bd9127d283e892ab97612c59689..c48e7e0db830e6b121599491d57e099ef0f139f2 100644
 --- a/packages/opencode/src/provider/transform.ts
 +++ b/packages/opencode/src/provider/transform.ts
 @@ -21,7 +21,6 @@ export const OUTPUT_TOKEN_MAX = 32_000
@@ -4773,7 +4773,7 @@ index b388297aee8044cfbd8c5a323580b3a307300ab8..f52b6fd7d4c58d30a0d68058de400ed1
  export function sanitizeSurrogates(content: string) {
    return content.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "\uFFFD")
  }
-@@ -575,6 +574,7 @@ const WIDELY_SUPPORTED_EFFORTS = ["low", "medium", "high"]
+@@ -574,6 +573,7 @@ const WIDELY_SUPPORTED_EFFORTS = ["low", "medium", "high"]
  const OPENAI_EFFORTS = ["none", "minimal", ...WIDELY_SUPPORTED_EFFORTS, "xhigh"]
  const OPENAI_GPT5_1_EFFORTS = ["none", ...WIDELY_SUPPORTED_EFFORTS]
  const OPENAI_GPT5_2_PLUS_EFFORTS = [...OPENAI_GPT5_1_EFFORTS, "xhigh"]
@@ -4781,7 +4781,7 @@ index b388297aee8044cfbd8c5a323580b3a307300ab8..f52b6fd7d4c58d30a0d68058de400ed1
  const OPENAI_GPT5_PRO_EFFORTS = ["high"]
  const OPENAI_GPT5_PRO_2_PLUS_EFFORTS = ["medium", "high", "xhigh"]
  const OPENAI_GPT5_CHAT_EFFORTS = ["medium"]
-@@ -606,6 +606,7 @@ function versionedGpt5ReasoningEfforts(apiId: string) {
+@@ -605,6 +605,7 @@ function versionedGpt5ReasoningEfforts(apiId: string) {
    const version = gpt5Version(apiId)
    if (version === undefined) return undefined
    if (version === 1) return OPENAI_GPT5_1_EFFORTS
@@ -4789,7 +4789,7 @@ index b388297aee8044cfbd8c5a323580b3a307300ab8..f52b6fd7d4c58d30a0d68058de400ed1
    return OPENAI_GPT5_2_PLUS_EFFORTS
  }
  
-@@ -635,7 +636,7 @@ function openaiReasoningEfforts(apiId: string, releaseDate: string) {
+@@ -634,7 +635,7 @@ function openaiReasoningEfforts(apiId: string, releaseDate: string) {
    if (codexEfforts) return codexEfforts
    const versionedEfforts = versionedGpt5ReasoningEfforts(id)
    // GPT-5.1 replaced GPT-5's `minimal` effort with `none`; GPT-5.2+
@@ -4798,7 +4798,7 @@ index b388297aee8044cfbd8c5a323580b3a307300ab8..f52b6fd7d4c58d30a0d68058de400ed1
    if (versionedEfforts) return versionedEfforts
    const efforts = [...WIDELY_SUPPORTED_EFFORTS]
    if (GPT5_FAMILY_RE.test(id)) efforts.unshift("minimal")
-@@ -1276,6 +1277,21 @@ export function options(input: {
+@@ -1326,6 +1327,21 @@ export function options(input: {
      result["gateway"] = { caching: "auto" }
    }
  
@@ -4820,23 +4820,40 @@ index b388297aee8044cfbd8c5a323580b3a307300ab8..f52b6fd7d4c58d30a0d68058de400ed1
    // Any gpt version above 5.4 in combination with azure does not support reasoningEffort
    // so we should return early here.
    const [, gptMajorVersion, gptMinorVersion] = input.model.api.id.match(/gpt-(\d+)\.(\d+)/) ?? []
-@@ -1303,13 +1319,13 @@ export function options(input: {
-       }
-     }
+diff --git a/packages/opencode/src/question/index.ts b/packages/opencode/src/question/index.ts
+index 8afc141072d535c9d1aa4594094b4df75857cf83..9084a15f683a2c907ac852c360f11920d550e948 100644
+--- a/packages/opencode/src/question/index.ts
++++ b/packages/opencode/src/question/index.ts
+@@ -103,11 +103,24 @@ const layer = Layer.effect(
+       pending.set(id, { info, deferred })
+       yield* events.publish(Event.Asked, info)
  
--    // Only set textVerbosity for non-chat gpt-5.x models
--    // Chat models (e.g. gpt-5.2-chat-latest) only support "medium" verbosity
-+    // Generic OpenAI-compatible APIs do not necessarily support OpenAI's verbosity parameter.
-+    // Only enable the default for integrations known to implement it.
-     if (
-       input.model.api.id.includes("gpt-5.") &&
-       !input.model.api.id.includes("codex") &&
-       !input.model.api.id.includes("-chat") &&
--      input.model.providerID !== "azure"
-+      (input.model.api.npm === "@ai-sdk/openai" || input.model.api.npm === "@ai-sdk/amazon-bedrock/mantle")
-     ) {
-       result["textVerbosity"] = "low"
-     }
+-      return yield* Effect.ensuring(
+-        Deferred.await(deferred),
+-        Effect.sync(() => {
+-          pending.delete(id)
+-        }),
++      return yield* Deferred.await(deferred).pipe(
++        Effect.onInterrupt(() =>
++          Effect.sync(() => pending.delete(id)).pipe(
++            Effect.flatMap((removed) =>
++              removed
++                ? events.publish(Event.Rejected, {
++                    sessionID: input.sessionID,
++                    requestID: id,
++                  })
++                : Effect.void,
++            ),
++          ),
++        ),
++        Effect.ensuring(
++          Effect.sync(() => {
++            pending.delete(id)
++          }),
++        ),
+       )
+     })
+ 
 diff --git a/packages/opencode/src/session/compaction.ts b/packages/opencode/src/session/compaction.ts
 index 75d6374bfa54e5f492c2f0be83fa3029794009eb..dc2e167d3236d4a4528373f5087f0cb370a1eadf 100644
 --- a/packages/opencode/src/session/compaction.ts
@@ -5338,7 +5355,7 @@ index bac385c59137ced710073051ed6388bc376e39ab..81faceffdb313098511af12e1b938e81
    // — if a field ever needs to differ between the two surfaces, the
    // translation belongs here, not split across both packages.
 diff --git a/packages/opencode/src/session/llm/request.ts b/packages/opencode/src/session/llm/request.ts
-index 4f93411107df56e4bab9d153899f756d729f3d38..fc6aebf9c504dd16334f110207baa128f2d1053f 100644
+index e000d6ca49b5f9792cc6ddc30ef25e523a33e9c4..35080d14f510d512f3e405f8cf661130d7beef51 100644
 --- a/packages/opencode/src/session/llm/request.ts
 +++ b/packages/opencode/src/session/llm/request.ts
 @@ -14,6 +14,7 @@ import { Effect, Record } from "effect"
@@ -5672,7 +5689,7 @@ index 9b3f2c46f40578128001957004c67633a18da23a..23ac259c3178d0817be5bbc642050823
  }
  
 diff --git a/packages/opencode/src/session/processor.ts b/packages/opencode/src/session/processor.ts
-index 20aa8a8404d8e5f50b0aafee5034ed6f1fa44382..2a4ee50d5acca383e318b8e40c4a91f3fbc70fe1 100644
+index 9f8530929c154a3718b135bd481d7e2e492cb7ff..303d700bfa63d8ef57b80fad574ee5f7245d2b57 100644
 --- a/packages/opencode/src/session/processor.ts
 +++ b/packages/opencode/src/session/processor.ts
 @@ -18,19 +18,87 @@ import type { SessionID } from "./schema"
@@ -6113,8 +6130,8 @@ index 20aa8a8404d8e5f50b0aafee5034ed6f1fa44382..2a4ee50d5acca383e318b8e40c4a91f3
 +            ctx.attemptCommitted = true
              const completedSnapshot = yield* snapshot.track()
              yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
-             const usage = Session.getUsage({
-@@ -441,10 +729,17 @@ const layer = Layer.effect(
+             // Anthropic reports thinking blocks it removed before the model saw the
+@@ -455,10 +743,17 @@ const layer = Layer.effect(
                metadata: value.providerMetadata,
              })
              ctx.assistantMessage.finish = value.reason
@@ -6133,7 +6150,7 @@ index 20aa8a8404d8e5f50b0aafee5034ed6f1fa44382..2a4ee50d5acca383e318b8e40c4a91f3
                reason: value.reason,
                snapshot: completedSnapshot,
                messageID: ctx.assistantMessage.id,
-@@ -453,18 +748,28 @@ const layer = Layer.effect(
+@@ -467,18 +762,28 @@ const layer = Layer.effect(
                tokens: usage.tokens,
                cost: usage.cost,
              })
@@ -6163,7 +6180,7 @@ index 20aa8a8404d8e5f50b0aafee5034ed6f1fa44382..2a4ee50d5acca383e318b8e40c4a91f3
                }
                ctx.snapshot = undefined
              }
-@@ -480,10 +785,12 @@ const layer = Layer.effect(
+@@ -494,10 +799,12 @@ const layer = Layer.effect(
              ) {
                ctx.needsCompaction = true
              }
@@ -6176,7 +6193,7 @@ index 20aa8a8404d8e5f50b0aafee5034ed6f1fa44382..2a4ee50d5acca383e318b8e40c4a91f3
              ctx.currentText = {
                id: PartID.ascending(),
                messageID: ctx.assistantMessage.id,
-@@ -493,12 +800,16 @@ const layer = Layer.effect(
+@@ -507,12 +814,16 @@ const layer = Layer.effect(
                time: { start: Date.now() },
                metadata: value.providerMetadata,
              }
@@ -6194,7 +6211,7 @@ index 20aa8a8404d8e5f50b0aafee5034ed6f1fa44382..2a4ee50d5acca383e318b8e40c4a91f3
              if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
              yield* session.updatePartDelta({
                sessionID: ctx.currentText.sessionID,
-@@ -513,6 +824,9 @@ const layer = Layer.effect(
+@@ -527,6 +838,9 @@ const layer = Layer.effect(
              if (!ctx.currentText) return
              // oxlint-disable-next-line no-self-assign -- reactivity trigger
              ctx.currentText.text = ctx.currentText.text
@@ -6204,7 +6221,7 @@ index 20aa8a8404d8e5f50b0aafee5034ed6f1fa44382..2a4ee50d5acca383e318b8e40c4a91f3
              ctx.currentText.text = (yield* plugin.trigger(
                "experimental.text.complete",
                {
-@@ -532,6 +846,7 @@ const layer = Layer.effect(
+@@ -546,6 +860,7 @@ const layer = Layer.effect(
              return
  
            case "finish":
@@ -6212,7 +6229,7 @@ index 20aa8a8404d8e5f50b0aafee5034ed6f1fa44382..2a4ee50d5acca383e318b8e40c4a91f3
              return
          }
        })
-@@ -603,7 +918,8 @@ const layer = Layer.effect(
+@@ -617,7 +932,8 @@ const layer = Layer.effect(
            error: errorMessage(e),
            stack: e instanceof Error ? e.stack : undefined,
          })
@@ -6222,7 +6239,7 @@ index 20aa8a8404d8e5f50b0aafee5034ed6f1fa44382..2a4ee50d5acca383e318b8e40c4a91f3
          if (SessionV1.ContextOverflowError.isInstance(error)) {
            if ((yield* config.get()).compaction?.auto === false && !ctx.assistantMessage.summary) {
              ctx.assistantMessage.error = error
-@@ -624,6 +940,118 @@ const layer = Layer.effect(
+@@ -638,6 +954,118 @@ const layer = Layer.effect(
          yield* status.set(ctx.sessionID, { type: "idle" })
        })
  
@@ -6341,7 +6358,7 @@ index 20aa8a8404d8e5f50b0aafee5034ed6f1fa44382..2a4ee50d5acca383e318b8e40c4a91f3
        const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
          yield* Effect.logInfo("process", {
            "session.id": input.sessionID,
-@@ -631,13 +1059,15 @@ const layer = Layer.effect(
+@@ -645,13 +1073,15 @@ const layer = Layer.effect(
          })
          ctx.needsCompaction = false
          ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
@@ -6360,7 +6377,7 @@ index 20aa8a8404d8e5f50b0aafee5034ed6f1fa44382..2a4ee50d5acca383e318b8e40c4a91f3
  
              yield* stream.pipe(
                Stream.tap((event) => handleEvent(event)),
-@@ -648,6 +1078,7 @@ const layer = Layer.effect(
+@@ -662,6 +1092,7 @@ const layer = Layer.effect(
              Effect.onInterrupt(() =>
                Effect.gen(function* () {
                  aborted = true
@@ -6368,7 +6385,7 @@ index 20aa8a8404d8e5f50b0aafee5034ed6f1fa44382..2a4ee50d5acca383e318b8e40c4a91f3
                  if (!ctx.assistantMessage.error) {
                    yield* halt(new DOMException("Aborted", "AbortError"))
                  }
-@@ -657,6 +1088,33 @@ const layer = Layer.effect(
+@@ -671,6 +1102,33 @@ const layer = Layer.effect(
                (cause) => !Cause.hasInterruptsOnly(cause),
                (cause) => Effect.fail(Cause.squash(cause)),
              ),
@@ -6402,7 +6419,7 @@ index 20aa8a8404d8e5f50b0aafee5034ed6f1fa44382..2a4ee50d5acca383e318b8e40c4a91f3
              Effect.retry(
                SessionRetry.policy({
                  provider: input.model.providerID,
-@@ -672,10 +1130,13 @@ const layer = Layer.effect(
+@@ -686,10 +1144,13 @@ const layer = Layer.effect(
                  },
                }),
              ),
@@ -6416,7 +6433,7 @@ index 20aa8a8404d8e5f50b0aafee5034ed6f1fa44382..2a4ee50d5acca383e318b8e40c4a91f3
            if (ctx.needsCompaction) return "compact"
            if (ctx.blocked || ctx.assistantMessage.error) return "stop"
            return "continue"
-@@ -686,6 +1147,7 @@ const layer = Layer.effect(
+@@ -700,6 +1161,7 @@ const layer = Layer.effect(
          get message() {
            return ctx.assistantMessage
          },
@@ -6424,7 +6441,7 @@ index 20aa8a8404d8e5f50b0aafee5034ed6f1fa44382..2a4ee50d5acca383e318b8e40c4a91f3
          updateToolCall,
          completeToolCall,
          process,
-@@ -696,6 +1158,57 @@ const layer = Layer.effect(
+@@ -710,6 +1172,57 @@ const layer = Layer.effect(
    }),
  )
  
@@ -6557,7 +6574,7 @@ index 9068df4778dc1a88c143e3b4a872d20c3341390f..1b7d758a81a4b38505e6e51a14ef4fbc
  ## Editing Approach
  
 diff --git a/packages/opencode/src/session/retry.ts b/packages/opencode/src/session/retry.ts
-index 4bc02a9e9649646be730ba5ddc2b1d7bba495b92..63ad2249e2459d9ed913f6f9577151c54d37df82 100644
+index 284c0f0ade4143df6aae127e60c511f5466c46a6..50afc1f1759007c383a8749ba41735c82d9885b8 100644
 --- a/packages/opencode/src/session/retry.ts
 +++ b/packages/opencode/src/session/retry.ts
 @@ -1,7 +1,7 @@
@@ -6861,6 +6878,38 @@ index 5cefdd04a3f3bb712c67c1f89687644a633509d0..ae042f293f2eeaf13aabb6cf3ddd6f27
  export const node = LayerNode.make({ service: Service, layer: layer, deps: [BackgroundJob.node, SessionStatus.node] })
  
  export * as SessionRunState from "./run-state"
+diff --git a/packages/opencode/src/session/tools.ts b/packages/opencode/src/session/tools.ts
+index 99f7aec4fdfdfc857702b50b0ca3ce7c8651af4c..381eb6642424228ebaf8c3791cc239a51184c4ad 100644
+--- a/packages/opencode/src/session/tools.ts
++++ b/packages/opencode/src/session/tools.ts
+@@ -38,6 +38,16 @@ const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
+   "image/webp",
+ ])
+ 
++function interruptOnAbort(signal: AbortSignal | undefined) {
++  if (!signal) return Effect.never
++  return Effect.callback<never>((resume) => {
++    if (signal.aborted) return resume(Effect.interrupt)
++    const handler = () => resume(Effect.interrupt)
++    signal.addEventListener("abort", handler, { once: true })
++    return Effect.sync(() => signal.removeEventListener("abort", handler))
++  })
++}
++
+ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
+   agent: Agent.Info
+   model: Provider.Model
+@@ -108,7 +118,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
+               { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
+               { args },
+             )
+-            const result = yield* item.execute(args, ctx)
++            const result = yield* item.id === "question"
++              ? Effect.raceFirst(item.execute(args, ctx), interruptOnAbort(options.abortSignal))
++              : item.execute(args, ctx)
+             const output = {
+               ...result,
+               attachments: result.attachments?.map((attachment) => ({
 diff --git a/packages/opencode/src/skill/index.ts b/packages/opencode/src/skill/index.ts
 index 5a04ec213994a65dd25098b843efca1fbd1c4e0e..b8b6d62de7e71104ae33b487278716abc26ef609 100644
 --- a/packages/opencode/src/skill/index.ts
@@ -7142,69 +7191,6 @@ index 0000000000000000000000000000000000000000..6eba279276308f99937712f45d64a50d
 +    120_000,
 +  )
 +})
-diff --git a/packages/opencode/test/cli/run/run-process.test.ts b/packages/opencode/test/cli/run/run-process.test.ts
-index bd5847e2723cfca944ef6f97e6d6fe3ff986c042..d2d4bae879216be6fb79840bea83d2a4054e6bec 100644
---- a/packages/opencode/test/cli/run/run-process.test.ts
-+++ b/packages/opencode/test/cli/run/run-process.test.ts
-@@ -82,10 +82,10 @@ describe("opencode run (non-interactive subprocess)", () => {
-   )
- 
-   // The test provider's SSE error item is interpreted by the SDK as an unknown
--  // finish, not a fatal provider/session error. Lock that distinction in so it
--  // is not accidentally used as the failure compatibility oracle.
-+  // finish, not a fatal provider/session error. Unknown finishes should continue
-+  // the prompt loop so a subsequent response can complete the run.
-   cliIt.concurrent(
--    "unknown stream finish preserves partial output and exits 0",
-+    "unknown stream finish preserves partial output and continues",
-     ({ llm, opencode }) =>
-       Effect.gen(function* () {
-         yield* llm.push(
-@@ -95,9 +95,10 @@ describe("opencode run (non-interactive subprocess)", () => {
-           }),
-         )
-         yield* llm.fail("upstream provider exploded mid-stream")
-+        yield* llm.text("recovered")
-         const result = yield* opencode.run("trigger midstream error", { timeoutMs: 30_000 })
-         expect(result.exitCode).toBe(0)
--        expect(result.stdout).toBe("partial response\n")
-+        expect(result.stdout).toBe("partial response\nrecovered\n")
-         expect(result.stderr).not.toContain("upstream provider exploded mid-stream")
-       }),
-     60_000,
-@@ -213,7 +214,7 @@ describe("opencode run (non-interactive subprocess)", () => {
-   )
- 
-   cliIt.concurrent(
--    "--format json records partial output for an unknown stream finish",
-+    "--format json records an unknown stream finish and continuation",
-     ({ llm, opencode }) =>
-       Effect.gen(function* () {
-         yield* llm.push(
-@@ -223,6 +224,7 @@ describe("opencode run (non-interactive subprocess)", () => {
-           }),
-         )
-         yield* llm.fail("provider failed")
-+        yield* llm.text("recovered")
-         const result = yield* opencode.run("fail after output", { format: "json" })
- 
-         const events = opencode.parseJsonEvents(result.stdout)
-@@ -234,9 +236,14 @@ describe("opencode run (non-interactive subprocess)", () => {
-           "step_finish",
-           "step_start",
-           "step_finish",
-+          "step_start",
-+          "text",
-+          "step_finish",
-         ])
-         expect(events[1]?.part).toEqual(expect.objectContaining({ type: "text", text: "partial json" }))
--        expect(events.at(-1)?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "unknown" }))
-+        expect(events[5]?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "unknown" }))
-+        expect(events[7]?.part).toEqual(expect.objectContaining({ type: "text", text: "recovered" }))
-+        expect(events.at(-1)?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "stop" }))
-       }),
-     60_000,
-   )
 diff --git a/packages/opencode/test/mcp/headers.test.ts b/packages/opencode/test/mcp/headers.test.ts
 index 31cfc20d51c63250fa14c56e54463f57d1654ba3..cb546402584289d6d4fd4bf6eb3f3af91686a73e 100644
 --- a/packages/opencode/test/mcp/headers.test.ts
@@ -8733,7 +8719,7 @@ index 0000000000000000000000000000000000000000..d5dc0340a6282f1d8f836dc7a4389d49
 +  return { type: "remote" as const, url, oauth: false as const, timeout: 2_000 }
 +}
 diff --git a/packages/opencode/test/plugin/codex.test.ts b/packages/opencode/test/plugin/codex.test.ts
-index fbc9df593289467c5cb840167f5aeea0de3d2b62..0506cedc17d8ea75f9153b1b18e428936cdc421e 100644
+index 159f7806a75e1279c073eefe46b1b8dc15f09a7a..12c3a755b23a0990ca715ad16f3ed8f6a587eca6 100644
 --- a/packages/opencode/test/plugin/codex.test.ts
 +++ b/packages/opencode/test/plugin/codex.test.ts
 @@ -283,6 +283,21 @@ describe("plugin.codex", () => {
@@ -10265,18 +10251,18 @@ index 32d4e3a39b106b1fd76a2ffef3ded479f1e56672..7c1538223a2bb3cb61cdc312d834b32e
    "disabled_providers excludes provider",
    Effect.gen(function* () {
 diff --git a/packages/opencode/test/provider/transform.test.ts b/packages/opencode/test/provider/transform.test.ts
-index 77aa38ad73a752e4ab92726e31e0825fb771fb20..d82eb98943c4ce33c78285179694c66bd51ecdfa 100644
+index 2f3e4a10c6463c1b75d887ef1f4c08782a6ffb6b..55c684657095d1c40dc687526877645dc2d64d7e 100644
 --- a/packages/opencode/test/provider/transform.test.ts
 +++ b/packages/opencode/test/provider/transform.test.ts
-@@ -6,6 +6,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
- import { ModelV2 } from "@opencode-ai/core/model"
- import { ModelsDev } from "@opencode-ai/core/models-dev"
- import { jsonSchema } from "ai"
+@@ -9,6 +9,7 @@ import { generateText, jsonSchema, type ModelMessage } from "ai"
+ import { createAmazonBedrock, type AmazonBedrockLanguageModelOptions } from "@ai-sdk/amazon-bedrock"
+ import { createAnthropic } from "@ai-sdk/anthropic"
+ import { createVertexAnthropic } from "@ai-sdk/google-vertex/anthropic"
 +import { MAX_STEPS_PROMPT } from "@opencode-ai/core/session/runner/max-steps"
  
  describe("ProviderTransform.options - setCacheKey", () => {
    const sessionID = "test-session-123"
-@@ -453,6 +454,79 @@ describe("ProviderTransform.options - google thinkingConfig gating", () => {
+@@ -456,6 +457,79 @@ describe("ProviderTransform.options - google thinkingConfig gating", () => {
    })
  })
  
@@ -10356,7 +10342,7 @@ index 77aa38ad73a752e4ab92726e31e0825fb771fb20..d82eb98943c4ce33c78285179694c66b
  describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
    const sessionID = "test-session-123"
  
-@@ -489,6 +563,22 @@ describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
+@@ -492,6 +566,22 @@ describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
      expect(result.include).toEqual(["reasoning.encrypted_content"])
    })
  
@@ -10379,7 +10365,7 @@ index 77aa38ad73a752e4ab92726e31e0825fb771fb20..d82eb98943c4ce33c78285179694c66b
    test("Bedrock Mantle gpt-5.5 uses OpenAI Responses defaults", () => {
      const model = {
        ...createGpt5Model("openai.gpt-5.5"),
-@@ -508,6 +598,144 @@ describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
+@@ -511,6 +601,144 @@ describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
      expect(result.textVerbosity).toBe("low")
    })
  
@@ -10524,15 +10510,7 @@ index 77aa38ad73a752e4ab92726e31e0825fb771fb20..d82eb98943c4ce33c78285179694c66b
    test("openai-compatible gpt-5 models omit Responses-only reasoningSummary", () => {
      const model = {
        ...createGpt5Model("gpt-5.4"),
-@@ -523,6 +751,7 @@ describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
-     expect(result.reasoningEffort).toBe("medium")
-     expect(result.reasoningSummary).toBeUndefined()
-     expect(result.include).toBeUndefined()
-+    expect(result.textVerbosity).toBeUndefined()
-   })
- 
-   test("azure chat completions omit Responses-only reasoning options after variants merge", async () => {
-@@ -3973,6 +4202,7 @@ describe("ProviderTransform.variants", () => {
+@@ -4503,6 +4731,7 @@ describe("ProviderTransform.variants", () => {
      for (const testCase of [
        { id: "openai/o3-mini", efforts: ["none", "minimal", "low", "medium", "high", "xhigh"] },
        { id: "openai/gpt-5.4", efforts: ["none", "low", "medium", "high", "xhigh"] },
@@ -10540,7 +10518,7 @@ index 77aa38ad73a752e4ab92726e31e0825fb771fb20..d82eb98943c4ce33c78285179694c66b
        { id: "openai/gpt-5-pro", efforts: ["high"] },
        { id: "openai/gpt-5.5-pro", efforts: ["medium", "high", "xhigh"] },
        { id: "openai/gpt-5.2-codex", efforts: ["low", "medium", "high", "xhigh"] },
-@@ -4713,6 +4943,11 @@ describe("ProviderTransform.variants", () => {
+@@ -5243,6 +5472,11 @@ describe("ProviderTransform.variants", () => {
          releaseDate: "2026-04-23",
          efforts: ["none", "low", "medium", "high", "xhigh"],
        },
@@ -10552,6 +10530,52 @@ index 77aa38ad73a752e4ab92726e31e0825fb771fb20..d82eb98943c4ce33c78285179694c66b
        { id: "gpt-5.4-pro", releaseDate: "2026-03-05", efforts: ["medium", "high", "xhigh"] },
        { id: "gpt-5.5-pro", releaseDate: "2026-04-23", efforts: ["medium", "high", "xhigh"] },
        { id: "gpt-5-codex", releaseDate: "2025-09-23", efforts: ["low", "medium", "high"] },
+diff --git a/packages/opencode/test/question/question.test.ts b/packages/opencode/test/question/question.test.ts
+index 9adb1e0c9ff74c415d5299909afcb877355b9414..21390fe11d8ecf89cc24d9121dfca98b223e6106 100644
+--- a/packages/opencode/test/question/question.test.ts
++++ b/packages/opencode/test/question/question.test.ts
+@@ -119,6 +119,41 @@ it.instance(
+   { git: true },
+ )
+ 
++it.instance(
++  "ask - interruption publishes rejection so clients remove the pending question",
++  () =>
++    Effect.gen(function* () {
++      const sessionID = SessionID.make("ses_interrupted")
++      const events = yield* EventV2Bridge.Service
++      const rejected = yield* Queue.unbounded<QuestionID>()
++      const off = yield* events.listen((event) => {
++        if (event.type !== Question.Event.Rejected.type) return Effect.void
++        const data = event.data as typeof Question.Event.Rejected.data.Type
++        if (data.sessionID === sessionID) Queue.offerUnsafe(rejected, data.requestID)
++        return Effect.void
++      })
++      yield* Effect.addFinalizer(() => off)
++
++      const fiber = yield* askEffect({
++        sessionID,
++        questions: [
++          {
++            question: "Should this disappear?",
++            header: "Cleanup",
++            options: [{ label: "Yes", description: "Remove the stale dock" }],
++          },
++        ],
++      }).pipe(Effect.forkScoped)
++
++      const [pending] = yield* waitForPending(1)
++      yield* Fiber.interrupt(fiber)
++
++      expect(yield* Queue.take(rejected).pipe(Effect.timeout("500 millis"))).toBe(pending.id)
++      expect(yield* listEffect).toEqual([])
++    }),
++  { git: true },
++)
++
+ // reply tests
+ 
+ it.instance(
 diff --git a/packages/opencode/test/script/build-target.test.ts b/packages/opencode/test/script/build-target.test.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..0f7e03b2ee87eca11711cd0361a2141a9a28c355
@@ -10993,7 +11017,7 @@ index 0000000000000000000000000000000000000000..ac6fc0d792f9e5e2362a91698fe7573c
 +  })
 +})
 diff --git a/packages/opencode/test/session/llm.test.ts b/packages/opencode/test/session/llm.test.ts
-index 635e697517c3ee3dccf6028dd7d4c7f34180ad26..bfc2fc2507e6985a861b5672c526bf48c13f7220 100644
+index fcb536f46d919e82282cf7c0bfa69ca82e3baaf1..519897db20c77ec1094e7830728bd03eef4439cc 100644
 --- a/packages/opencode/test/session/llm.test.ts
 +++ b/packages/opencode/test/session/llm.test.ts
 @@ -21,6 +21,7 @@ import { SessionID, MessageID } from "../../src/session/schema"
@@ -11087,7 +11111,7 @@ index 635e697517c3ee3dccf6028dd7d4c7f34180ad26..bfc2fc2507e6985a861b5672c526bf48
        { type: "reasoning-delta", id: "reasoning-0", text: "second reasoning" },
        { type: "reasoning-end", id: "reasoning-0" },
      ])
-@@ -1213,6 +1251,10 @@ describe("session.llm.stream", () => {
+@@ -1282,6 +1320,10 @@ describe("session.llm.stream", () => {
      },
    )
  
@@ -11098,7 +11122,7 @@ index 635e697517c3ee3dccf6028dd7d4c7f34180ad26..bfc2fc2507e6985a861b5672c526bf48
    it.instance(
      "sends responses API payload for OpenAI models",
      () =>
-@@ -1263,7 +1305,7 @@ describe("session.llm.stream", () => {
+@@ -1332,7 +1374,7 @@ describe("session.llm.stream", () => {
          ]
          const request = waitRequest("/responses", createEventResponse(responseChunks, true))
  
@@ -11107,7 +11131,7 @@ index 635e697517c3ee3dccf6028dd7d4c7f34180ad26..bfc2fc2507e6985a861b5672c526bf48
          const sessionID = SessionID.make("session-test-2")
          const agent = {
            name: "test",
-@@ -1279,7 +1321,7 @@ describe("session.llm.stream", () => {
+@@ -1348,7 +1390,7 @@ describe("session.llm.stream", () => {
            role: "user",
            time: { created: Date.now() },
            agent: agent.name,
@@ -11116,7 +11140,7 @@ index 635e697517c3ee3dccf6028dd7d4c7f34180ad26..bfc2fc2507e6985a861b5672c526bf48
          } satisfies SessionV1.User
  
          yield* drain({
-@@ -1301,10 +1343,15 @@ describe("session.llm.stream", () => {
+@@ -1370,10 +1412,15 @@ describe("session.llm.stream", () => {
          expect((body.reasoning as { effort?: string } | undefined)?.effort).toBe("high")
          expect((body.reasoning as { mode?: string } | undefined)?.mode).toBe("pro")
  
@@ -11134,7 +11158,7 @@ index 635e697517c3ee3dccf6028dd7d4c7f34180ad26..bfc2fc2507e6985a861b5672c526bf48
    )
  
    it.instance(
-@@ -1405,7 +1452,16 @@ describe("session.llm.stream", () => {
+@@ -1474,7 +1521,16 @@ describe("session.llm.stream", () => {
          expect(capture.url.pathname.endsWith("/responses")).toBe(true)
          expect(capture.body.model).toBe(resolved.api.id)
        }),
@@ -11152,7 +11176,7 @@ index 635e697517c3ee3dccf6028dd7d4c7f34180ad26..bfc2fc2507e6985a861b5672c526bf48
    )
  
    it.instance(
-@@ -1735,7 +1791,7 @@ describe("session.llm.stream", () => {
+@@ -1804,7 +1860,7 @@ describe("session.llm.stream", () => {
            ),
          ).toString("base64")}`
  
@@ -11161,7 +11185,7 @@ index 635e697517c3ee3dccf6028dd7d4c7f34180ad26..bfc2fc2507e6985a861b5672c526bf48
          const sessionID = SessionID.make("session-test-data-url")
          const agent = {
            name: "test",
-@@ -1750,7 +1806,7 @@ describe("session.llm.stream", () => {
+@@ -1819,7 +1875,7 @@ describe("session.llm.stream", () => {
            role: "user",
            time: { created: Date.now() },
            agent: agent.name,
@@ -11170,7 +11194,7 @@ index 635e697517c3ee3dccf6028dd7d4c7f34180ad26..bfc2fc2507e6985a861b5672c526bf48
          } satisfies SessionV1.User
  
          yield* drain({
-@@ -1774,7 +1830,10 @@ describe("session.llm.stream", () => {
+@@ -1843,7 +1899,10 @@ describe("session.llm.stream", () => {
          const capture = yield* Effect.promise(() => request)
          expect(capture.url.pathname.endsWith("/responses")).toBe(true)
        }),
@@ -15663,7 +15687,7 @@ index 0000000000000000000000000000000000000000..988109b299e88fd003a5c1335b6556ba
 +  })
 +})
 diff --git a/packages/opencode/test/session/prompt.test.ts b/packages/opencode/test/session/prompt.test.ts
-index da6e0f8d036fea5ea2257cb2a5ffa37924c23306..65ee5e226059deb5c5a9f5b40b8860e28c87f10b 100644
+index da6e0f8d036fea5ea2257cb2a5ffa37924c23306..2272bb2b8bb1ad368f97376eaa7b23a484536507 100644
 --- a/packages/opencode/test/session/prompt.test.ts
 +++ b/packages/opencode/test/session/prompt.test.ts
 @@ -52,7 +52,7 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
@@ -15714,7 +15738,65 @@ index da6e0f8d036fea5ea2257cb2a5ffa37924c23306..65ee5e226059deb5c5a9f5b40b8860e2
  it.instance("loop stops provider overflow instead of auto-compacting when disabled", () =>
    Effect.gen(function* () {
      const { llm } = yield* useServerConfig((url) => ({
-@@ -945,6 +977,44 @@ it.instance("loop continues when finish is stop but assistant has tool parts", (
+@@ -850,6 +882,57 @@ it.instance("loop continues when finish is tool-calls", () =>
+   }),
+ )
+ 
++it.instance("interrupted question tools notify clients and clear pending state", () =>
++  Effect.gen(function* () {
++    const { llm } = yield* useServerConfig(providerCfg)
++    const prompt = yield* SessionPrompt.Service
++    const sessions = yield* Session.Service
++    const question = yield* Question.Service
++    const events = yield* EventV2Bridge.Service
++    const rejected = yield* Deferred.make<string>()
++    const session = yield* sessions.create({
++      title: "Pinned",
++      permission: [{ permission: "*", pattern: "*", action: "allow" }],
++    })
++    const off = yield* events.listen((event) => {
++      if (event.type !== Question.Event.Rejected.type) return Effect.void
++      const data = event.data as typeof Question.Event.Rejected.data.Type
++      if (data.sessionID !== session.id) return Effect.void
++      return Deferred.succeed(rejected, data.requestID).pipe(Effect.asVoid)
++    })
++    yield* Effect.addFinalizer(() => off)
++
++    yield* prompt.prompt({
++      sessionID: session.id,
++      agent: "build",
++      noReply: true,
++      parts: [{ type: "text", text: "ask me before continuing" }],
++    })
++    yield* llm.tool("question", {
++      questions: [
++        {
++          question: "Continue?",
++          header: "Confirm",
++          options: [{ label: "Yes", description: "Continue the task" }],
++        },
++      ],
++    })
++
++    const fiber = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
++    const pending = yield* pollWithTimeout(
++      question.list().pipe(Effect.map((items) => items[0])),
++      "question tool never became pending",
++      "2 seconds",
++    )
++
++    yield* prompt.cancel(session.id)
++    yield* Fiber.await(fiber)
++
++    expect(yield* question.list()).toEqual([])
++    expect(yield* Deferred.await(rejected).pipe(Effect.timeout("2 seconds"))).toBe(pending.id)
++  }),
++)
++
+ it.instance("loop continues when finish is unknown", () =>
+   Effect.gen(function* () {
+     const { llm } = yield* useServerConfig(providerCfg)
+@@ -945,6 +1028,44 @@ it.instance("loop continues when finish is stop but assistant has tool parts", (
    }),
  )
  
@@ -15760,7 +15842,7 @@ index da6e0f8d036fea5ea2257cb2a5ffa37924c23306..65ee5e226059deb5c5a9f5b40b8860e2
    Effect.gen(function* () {
      const { llm } = yield* useServerConfig((url) => ({
 diff --git a/packages/opencode/test/session/retry.test.ts b/packages/opencode/test/session/retry.test.ts
-index 10032b8112fd087d746c264e6c8cebf4864944dd..b6aea1d81d65a44954a2db92b059e8f526a687ce 100644
+index 20c8678cf0a7b8c82f772d5431576723c6ca9b92..eb3d73e3077d72ef6bdeb26baf52650626ed8eee 100644
 --- a/packages/opencode/test/session/retry.test.ts
 +++ b/packages/opencode/test/session/retry.test.ts
 @@ -2,7 +2,15 @@ import { describe, expect, test } from "bun:test"
@@ -16671,7 +16753,7 @@ index 75e9282f117cb25078b087661434fcf5e6660620..57df4743b07187f17652fc1e018a1abc
  ]).annotate({ discriminator: "name" })
  type AssistantError = Schema.Schema.Type<typeof AssistantErrorSchema>
 diff --git a/packages/sdk/js/src/v2/gen/types.gen.ts b/packages/sdk/js/src/v2/gen/types.gen.ts
-index 90c91e9158ccd1c0f16f4087da72b9a4fd3f7014..1545d63be8dff9caccd9329cd0abd62f8d664e8a 100644
+index f06c20cc413e95c79f397a34d8d9d3e8871b6ab4..c98f91ff0fc6b05be7fe3a9d027177d08f6b144e 100644
 --- a/packages/sdk/js/src/v2/gen/types.gen.ts
 +++ b/packages/sdk/js/src/v2/gen/types.gen.ts
 @@ -314,6 +314,13 @@ export type ContentFilterError = {
@@ -16704,7 +16786,7 @@ index 90c91e9158ccd1c0f16f4087da72b9a4fd3f7014..1545d63be8dff9caccd9329cd0abd62f
              | ApiError
          }
        }
-@@ -5361,6 +5370,7 @@ export type SessionError = {
+@@ -5364,6 +5373,7 @@ export type SessionError = {
        | StructuredOutputError
        | ContextOverflowError
        | ContentFilterError
@@ -16712,7 +16794,7 @@ index 90c91e9158ccd1c0f16f4087da72b9a4fd3f7014..1545d63be8dff9caccd9329cd0abd62f
        | ApiError
    }
  }
-@@ -6686,6 +6696,7 @@ export type EventSessionError = {
+@@ -6689,6 +6699,7 @@ export type EventSessionError = {
        | StructuredOutputError
        | ContextOverflowError
        | ContentFilterError
@@ -16721,10 +16803,10 @@ index 90c91e9158ccd1c0f16f4087da72b9a4fd3f7014..1545d63be8dff9caccd9329cd0abd62f
    }
  }
 diff --git a/packages/sdk/openapi.json b/packages/sdk/openapi.json
-index afe14bb604cc2d8542672d2d56990a3dcaeba1ef..71dd9994fe005bd2e272492ed1413c1d5f9a1d0e 100644
+index e66d140505585ab0bab62640360eb08f249f35c0..744cebac47e5387dbb88de3990907e37ab2e6cb6 100644
 --- a/packages/sdk/openapi.json
 +++ b/packages/sdk/openapi.json
-@@ -16187,6 +16187,27 @@
+@@ -16188,6 +16188,27 @@
          "required": ["name", "data"],
          "additionalProperties": false
        },
@@ -16752,7 +16834,7 @@ index afe14bb604cc2d8542672d2d56990a3dcaeba1ef..71dd9994fe005bd2e272492ed1413c1d
        "APIError": {
          "type": "object",
          "properties": {
-@@ -16283,6 +16304,9 @@
+@@ -16284,6 +16305,9 @@
                {
                  "$ref": "#/components/schemas/ContentFilterError"
                },
@@ -16762,7 +16844,7 @@ index afe14bb604cc2d8542672d2d56990a3dcaeba1ef..71dd9994fe005bd2e272492ed1413c1d
                {
                  "$ref": "#/components/schemas/APIError"
                }
-@@ -19130,6 +19154,9 @@
+@@ -19131,6 +19155,9 @@
                            {
                              "$ref": "#/components/schemas/ContentFilterError"
                            },
@@ -16772,7 +16854,7 @@ index afe14bb604cc2d8542672d2d56990a3dcaeba1ef..71dd9994fe005bd2e272492ed1413c1d
                            {
                              "$ref": "#/components/schemas/APIError"
                            }
-@@ -31652,6 +31679,9 @@
+@@ -31662,6 +31689,9 @@
                    {
                      "$ref": "#/components/schemas/ContentFilterError"
                    },
@@ -16782,7 +16864,7 @@ index afe14bb604cc2d8542672d2d56990a3dcaeba1ef..71dd9994fe005bd2e272492ed1413c1d
                    {
                      "$ref": "#/components/schemas/APIError"
                    }
-@@ -35533,6 +35563,9 @@
+@@ -35543,6 +35573,9 @@
                    {
                      "$ref": "#/components/schemas/ContentFilterError"
                    },
