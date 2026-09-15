@@ -2,7 +2,7 @@
 # Maintainer: Sven-Hendrik Haase <svenstaro@archlinux.org>
 
 pkgname=opencode
-pkgver=1.18.31
+pkgver=2.0.3
 pkgrel=1
 pkgdesc='The open source coding agent'
 arch=('x86_64')
@@ -31,15 +31,16 @@ options=(
   '!strip'
 )
 source=("git+$url.git#tag=v$pkgver")
-b2sums=('b3eedbdef2670c527c39e0254d52c33811677644a82ab04aa1582565213517edfdc6dc5d8879f5f9039785c1c429891dc9bdc42bcac8b08d18a163e263f3478d')
+b2sums=('5f35d16c154758d3bde015f497e3293aae589b22dddcdca7c54cd9c9eb340251ed005ed08261fa3093be4e738b16e4519b59f5df8f60c4f5d9d3edad4d93b59a')
 
 prepare() {
   cd $pkgname
+  sed -i 's|"packageManager": "bun@1.4.2"|"packageManager": "bun@1.4.0"|' package.json
   bun install --frozen-lockfile --ignore-scripts
 }
 
 build() {
-  cd $pkgname/packages/opencode
+  cd $pkgname/packages/cli
   OPENCODE_VERSION=$pkgver bun run ./script/build.ts --single --baseline --skip-install
 }
 
@@ -59,10 +60,10 @@ build() {
 package() {
   cd $pkgname
   case $CARCH in
-  aarch64) dir=opencode-linux-arm64 ;;
-  x86_64) dir=opencode-linux-x64-baseline ;;
+  aarch64) dir=cli-linux-arm64 ;;
+  x86_64) dir=cli-linux-x64-baseline ;;
   esac
-  install -vDm755 -t "$pkgdir/usr/bin" "packages/opencode/dist/$dir/bin/opencode"
+  install -vDm755 -t "$pkgdir/usr/bin" "packages/cli/dist/$dir/bin/opencode"
 
   install -vDm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE
 
