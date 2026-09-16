@@ -67,8 +67,8 @@ package() {
 
   install -vDm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE
 
-  SHELL=/bin/bash "$pkgdir/usr/bin/opencode" completion \
+  "$pkgdir/usr/bin/opencode" --completions bash \
     | install -vDm644 /dev/stdin "$pkgdir/usr/share/bash-completion/completions/opencode"
-  SHELL=/bin/zsh "$pkgdir/usr/bin/opencode" completion \
+  "$pkgdir/usr/bin/opencode" --completions zsh \
     | install -vDm644 /dev/stdin "$pkgdir/usr/share/zsh/site-functions/_opencode"
 }
