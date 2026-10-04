@@ -1,3 +1,4 @@
+FROM oven/bun:1.3.14@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4 AS bun-toolchain
 FROM archlinux:base-devel
 
 RUN pacman -Syu --noconfirm --needed bun git \
@@ -5,6 +6,11 @@ RUN pacman -Syu --noconfirm --needed bun git \
     && useradd --create-home --shell /bin/bash builder \
     && printf 'builder ALL=(ALL) NOPASSWD: /usr/bin/pacman\n' >/etc/sudoers.d/builder-makepkg \
     && chmod 0440 /etc/sudoers.d/builder-makepkg
+
+# Keep pacman's bun dependency installed, but compile with the source's exact
+# packageManager version rather than Arch's rolling compiler.
+COPY --from=bun-toolchain /usr/local/bin/bun /opt/bun-1.3.14/bin/bun
+ENV PATH="/opt/bun-1.3.14/bin:${PATH}"
 
 RUN mkdir -p /build && chown builder:builder /build
 WORKDIR /build
