@@ -126,6 +126,15 @@ class Contracts(unittest.TestCase):
             self.assertEqual(args, ['qemu-aarch64-static', '-L', '/', '/fixture/opencode', '--completions', shell])
             self.assertEqual(kwargs['env']['SHELL'], '/bin/' + shell)
 
+    def test_smoke_accepts_native_cli_version_label(self):
+        binary = self.work / 'opencode-version-fixture'
+        binary.write_text('#!/bin/sh\ncase "$1" in --version) printf "opencode v2.0.22\\n";; --help) printf "CLI fixture\\n";; esac\n')
+        binary.chmod(0o755)
+        # Execute the real process boundary; ELF/UI/completions have separate
+        # checks and require a compiled release binary rather than this fixture.
+        with patch.object(self.module, 'check_elf'), patch.object(self.module, 'completions'), patch.object(self.module, 'smoke_ui'):
+            self.module.smoke(binary, 'amd64', '2.0.22-1')
+
     def test_empty_completion_fails(self):
         with patch.object(self.module, 'run', return_value=''), patch.object(self.module.platform, 'machine', return_value='x86_64'):
             with self.assertRaisesRegex(ValueError, 'empty bash completion'):

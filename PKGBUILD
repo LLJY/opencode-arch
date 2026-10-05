@@ -2,7 +2,7 @@
 # Packaging checker and explicit build authorization are still required.
 # Upstream Arch maintainers: Carl Smedstad, Sven-Hendrik Haase
 pkgname=opencode
-pkgver=2.0.22
+pkgver=2.0.23
 pkgrel=1
 pkgdesc='The open source coding agent (V2 native CLI with bundled web UI)'
 arch=('x86_64')
@@ -15,7 +15,7 @@ optdepends=(
   'xclip: clipboard support on X11'
 )
 options=('!debug' '!strip')
-_commit=527f0b931d1f9b3ebd34e106c51b31ce5db5b075
+_commit=0fd7e2829449b052abf0078666669302923d77af
 _srcname=opencode-$_commit
 source=(
   "opencode-$pkgver.tar.gz::https://codeload.github.com/anomalyco/opencode/tar.gz/$_commit"
@@ -24,10 +24,10 @@ source=(
   'packaging.py'
 )
 sha256sums=(
-  '910b87aa2521583773312e207bf6a9e7990ebb7cb70d6e7aa928a2b6b5573641'
-  '009e46adedb3b0ed102a64ae7db8d50645a58c2815f32542996560370b1f5f2e'
-  'd1732c3d008e01a794f1f07b61701356415ff874a7b17407c5183225417e9f91'
-  '2b74b5b76cc74a6adff5974519720c233a7fdd36b1dd04b2b6c1cc0d96f90139'
+  'b2af2db700690328f5a9382124cfc63bda4821f3fc9e79c0edbb614acdee46a9'
+  '76c84f496c6b8bcdf999b0e6988a5796fb7aae948c653ddaaa1ff39c2545b4a6'
+  'ff87ce034da890652e0e75f83f67e252cbe7a24e695e017865ce3d83cb031528'
+  '9286d36f67ab08014cad2ab7037bd948b52b053d49072dfac953b86e11dde073'
 )
 
 prepare() {

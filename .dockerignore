@@ -3,7 +3,7 @@
 !.SRCINFO
 !release.json
 !packaging.py
-!downstream-2.0.22.patch
+!downstream-2.0.23.patch
 !Dockerfile.*
 !build-deb
 !build-deb-docker

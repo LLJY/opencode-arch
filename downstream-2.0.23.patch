@@ -1,5 +1,17 @@
+diff --git a/packages/ai/src/providers/google-vertex-messages.ts b/packages/ai/src/providers/google-vertex-messages.ts
+index 33101cc03897ff32840aca612eabc0c2a3afb231..a07d58b36c6244838cebc5c08b1d3b5a0dccbb93 100644
+--- a/packages/ai/src/providers/google-vertex-messages.ts
++++ b/packages/ai/src/providers/google-vertex-messages.ts
+@@ -54,6 +54,7 @@ const route = Route.make({
+         ),
+     },
+     stream: AnthropicMessages.protocol.stream,
++    supportsEffortUpdates: AnthropicMessages.protocol.supportsEffortUpdates,
+   }),
+   endpoint: Endpoint.path(({ request }) => `/${request.model.id}:streamRawPredict`),
+   auth: Auth.none,
 diff --git a/packages/ai/src/route/client.ts b/packages/ai/src/route/client.ts
-index 83e762160a190ef7b9d5fe2f69b59fdf72d021b1..e7965beb9b3f9196165b4758b08b26c6525cd208 100644
+index 7addb1a04266fa09e29de3c030acf9ec8ecd52a4..122416163e7779e8e72260038b7a4ced7866d9bc 100644
 --- a/packages/ai/src/route/client.ts
 +++ b/packages/ai/src/route/client.ts
 @@ -1,4 +1,4 @@
@@ -8,7 +20,7 @@ index 83e762160a190ef7b9d5fe2f69b59fdf72d021b1..e7965beb9b3f9196165b4758b08b26c6
  import { Auth } from "./auth.js"
  import { Endpoint, type EndpointPatch } from "./endpoint.js"
  import { RequestExecutor } from "./executor.js"
-@@ -424,80 +424,87 @@ function makeFromTransport<Body, Prepared, Frame, Event, State>(
+@@ -423,80 +423,87 @@ function makeFromTransport<Body, Prepared, Frame, Event, State>(
        streamPrepared: (prepared: Prepared, request: LLMRequest, runtime: TransportRuntime, options?: StreamOptions) => {
          const route = `${request.model.provider}/${request.model.route.id}`
          return Stream.unwrap(
@@ -322,6 +334,46 @@ index 0000000000000000000000000000000000000000..c130b8e396380b792391f9fafe7597b6
 +  // Leap seconds are offsets, not rolled calendar fields.
 +  return midnight + (hour * 3600 + minute * 60 + second) * 1000
 +}
+diff --git a/packages/ai/test/effort-updates.test.ts b/packages/ai/test/effort-updates.test.ts
+index 9453dd1768afb837c726731b75991b028068ba4e..3031a9886562028f7c06e57494e9b50a9fb1ece4 100644
+--- a/packages/ai/test/effort-updates.test.ts
++++ b/packages/ai/test/effort-updates.test.ts
+@@ -293,20 +293,28 @@ describe("Anthropic Messages effort updates", () => {
+     }),
+   )
+ 
+-  it.effect("strips markers on the Vertex Anthropic route, whose protocol wrapper does not forward support", () =>
++  it.effect("lowers markers on the Vertex Anthropic route for models that support them", () =>
+     Effect.gen(function* () {
+-      const prepared = yield* compileRequest(
++      const vertex = GoogleVertexMessages.configure({ accessToken: "test", location: "global", project: "test" })
++      const opus5 = yield* compileRequest(
+         LLM.request({
+-          model: GoogleVertexMessages.configure({ accessToken: "test", location: "global", project: "test" }).model(
+-            "claude-opus-5",
+-          ),
++          model: vertex.model("claude-opus-5"),
++          messages: conversation,
++          providerOptions: { effort: "low" },
++        }),
++      )
++      const opus48 = yield* compileRequest(
++        LLM.request({
++          model: vertex.model("claude-opus-4-8"),
+           messages: conversation,
+           providerOptions: { effort: "low" },
+         }),
+       )
+ 
+-      expect(systemMessages(prepared.body)).toHaveLength(0)
+-      expect(prepared.body.output_config).toEqual({ effort: "low" })
++      expect(systemMessages(opus5.body)).toEqual([{ role: "system", content: [], output_config: { effort: "low" } }])
++      expect(opus5.body.output_config).toEqual({ effort: "high" })
++      expect(systemMessages(opus48.body)).toHaveLength(0)
++      expect(opus48.body.output_config).toEqual({ effort: "low" })
+     }),
+   )
+ })
 diff --git a/packages/ai/test/executor-retry-after.test.ts b/packages/ai/test/executor-retry-after.test.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..3cec1fa43f6d5ce8cd1130d6224264d83fc2b367
@@ -760,20 +812,24 @@ index 0000000000000000000000000000000000000000..04348851e8d664f79dc069633e64ab3a
 +})
 diff --git a/packages/app/test-browser/fixtures/terminal-reconnect.ts b/packages/app/test-browser/fixtures/terminal-reconnect.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..a45d94239b0cfee2583022bc2b69a20d62a1c1db
+index 0000000000000000000000000000000000000000..9187c4d1ffde83772440a5a712acb71cf9664aaf
 --- /dev/null
 +++ b/packages/app/test-browser/fixtures/terminal-reconnect.ts
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,156 @@
 +import { expect, mock, test } from "bun:test"
 +import { createRequire } from "node:module"
 +import { createComponent } from "solid-js"
 +import { render } from "solid-js/web"
 +import { OpenCode } from "@opencode/client/promise"
++import { createKeyed } from "../../../gui-extensions/src/sdk/reactive"
 +
 +// Use the same Solid transform already used by the model-selection fixture.
 +const require = createRequire(import.meta.url)
++
 +const solid = createRequire(require.resolve("vite-plugin-solid"))
++
 +const { transformSync } = solid("@babel/core")
++
 +Bun.plugin({
 +  name: "terminal-reconnect-solid",
 +  setup(build) {
@@ -790,25 +846,23 @@ index 0000000000000000000000000000000000000000..a45d94239b0cfee2583022bc2b69a20d
 +mock.module("@opencode/ui/theme/context", () => ({
 +  useTheme: () => ({ mode: () => "dark", themes: () => ({}), themeId: () => "default" }),
 +}))
++
 +mock.module("../../../gui-extensions/src/sdk", () => ({
-+  App: "app",
-+  System: "system",
-+  Native: "native",
++  createKeyed,
 +  useExtension: () => ({
-+    use: (service: string) =>
-+      service === "app"
-+        ? { font: () => "monospace", matches: () => false }
-+        : service === "system"
-+          ? { open() {} }
-+          : undefined,
++    appearance: { font: () => "monospace" },
++    keybinds: { matches: () => false },
++    system: { openExternal() {} },
 +    t: (key: string) => key,
 +  }),
 +}))
++
 +mock.module("@opencode/ui/toast", () => ({ showToast() {} }))
++
 +const { Terminal } = await import("../../../gui-extensions/src/terminal/terminal")
 +
 +class Socket extends EventTarget {
-+  binaryType = "blob"
++  binaryType: WebSocket["binaryType"] = "blob"
 +  readyState: number = WebSocket.OPEN
 +  close() {
 +    this.readyState = WebSocket.CLOSED
@@ -819,16 +873,19 @@ index 0000000000000000000000000000000000000000..a45d94239b0cfee2583022bc2b69a20d
 +test("transient failures retry the same PTY and preserve the native ticket-first handshake", async () => {
 +  const tickets: string[] = []
 +  const opened: string[] = []
-+  const cloned: unknown[] = []
++  const cloned: Error[] = []
 +  const inspected: string[] = []
 +  const socket = new Socket()
++
 +  const api = OpenCode.make({
 +    baseUrl: "https://server.example",
 +    fetch: Object.assign(
 +      async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
 +        const request = input instanceof Request ? input : new Request(input, init)
 +        tickets.push(request.url)
++
 +        if (tickets.length === 1) return new Response(null, { status: 503 })
++
 +        return Response.json({
 +          location: { directory: "/repo", project: { id: "project_1", directory: "/repo", canonical: "/repo" } },
 +          data: { ticket: "fixture-ticket", expires_in: 60 },
@@ -837,10 +894,12 @@ index 0000000000000000000000000000000000000000..a45d94239b0cfee2583022bc2b69a20d
 +      { preconnect: fetch.preconnect },
 +    ),
 +  })
++
 +  // The production extension constructs its native PTY client internally. Replace only
 +  // the browser socket boundary; ticket acquisition still runs through the real client.
 +  const NativeWebSocket = globalThis.WebSocket
-+  // Safety: this isolated child substitutes only the browser socket constructor and
++
++  // SAFETY: this isolated child substitutes only the browser socket constructor and
 +  // restores it below. Static ready-state constants retain their native values.
 +  globalThis.WebSocket = class {
 +    static OPEN = NativeWebSocket.OPEN
@@ -849,10 +908,15 @@ index 0000000000000000000000000000000000000000..a45d94239b0cfee2583022bc2b69a20d
 +    static CONNECTING = NativeWebSocket.CONNECTING
 +    constructor(url: string | URL) {
 +      opened.push(url.toString())
++
 +      if (opened.length === 1) throw new Error("temporary connect failure")
-+      return socket as unknown as WebSocket
++
++      // SAFETY: the fixture socket implements the EventTarget, state, send and close
++      // surface used by the real PTY client; no native network connection is opened.
++      return socket as WebSocket
 +    }
-+  } as unknown as typeof WebSocket
++  } as typeof WebSocket
++
 +  const server = {
 +    url: "https://server.example",
 +    client: {
@@ -861,17 +925,20 @@ index 0000000000000000000000000000000000000000..a45d94239b0cfee2583022bc2b69a20d
 +        ...api.pty,
 +        get: async (input: { ptyID: string }) => {
 +          inspected.push(input.ptyID)
++
 +          return { data: { status: "running" } }
 +        },
 +        update: async () => undefined,
 +      },
 +    },
 +  }
++
 +  const host = document.createElement("div")
 +  document.body.append(host)
 +  const pty = { id: "pty_1", title: "Terminal 1", titleNumber: 1, cursor: 42 }
 +  const mod = await import("ghostty-web")
 +  const ghostty = await mod.Ghostty.load()
++
 +  const dispose = render(
 +    () =>
 +      createComponent(Terminal, {
@@ -879,16 +946,18 @@ index 0000000000000000000000000000000000000000..a45d94239b0cfee2583022bc2b69a20d
 +        server,
 +        directory: "/repo",
 +        ghostty: async () => ({ mod, ghostty }),
-+        onConnectError: (error: unknown) => cloned.push(error),
++        onConnectError: (error: Error) => cloned.push(error),
 +      }),
 +    host,
 +  )
++
 +  try {
 +    for (let i = 0; i < 100 && tickets.length === 0; i++) await Bun.sleep(10)
 +    await Bun.sleep(30)
 +    expect(tickets.length).toBe(1)
 +    expect(opened.length).toBe(0)
 +    expect(cloned).toEqual([])
++
 +    for (let i = 0; i < 200 && opened.length < 2; i++) await Bun.sleep(10)
 +    expect(tickets.length).toBe(3)
 +    expect(opened.length).toBe(2)
@@ -1239,8 +1308,52 @@ index 0000000000000000000000000000000000000000..179d7ba84c2ef0b9ec0e042bf0ec8370
 +    expect(stream.listenerCount("close")).toBe(0)
 +  }
 +})
+diff --git a/packages/core/src/aisdk-native.ts b/packages/core/src/aisdk-native.ts
+index f172565a31f4eabb80f3f0a13c400c784636e730..5515bcbcb7872d55cdf624bcc0659d9d7144c545 100644
+--- a/packages/core/src/aisdk-native.ts
++++ b/packages/core/src/aisdk-native.ts
+@@ -14,7 +14,12 @@ type Target<ID extends string> = Overlays & {
+   variants?: (Overlays & { id: ID })[]
+ }
+ 
+-type Context = { readonly providerID: string; readonly canonical?: string; readonly modelID?: string }
++type Context = {
++  readonly providerID: string
++  readonly canonical?: string
++  readonly modelID?: string
++  readonly shape?: "responses" | "completions"
++}
+ 
+ export function rewrite<ID extends string>(
+   target: Target<ID>,
+@@ -126,11 +131,13 @@ export function native(npm: string, context: Context & { readonly settings?: Pro
+   const host = HOSTS[context.providerID]?.[npm]
+   if (host) return host
+   if (npm === "@ai-sdk/amazon-bedrock/mantle") return mantle(context.modelID)
+-  if (npm === "@ai-sdk/azure" && context.settings?.useCompletionUrls === true)
+-    return "@opencode/ai/providers/azure/chat"
++  if (npm === "@ai-sdk/azure" && azureChat(context)) return "@opencode/ai/providers/azure/chat"
+   return PACKAGES[npm]
+ }
+ 
++const azureChat = (context: Context & { readonly settings?: Provider.Settings }) =>
++  context.shape === "completions" || context.settings?.useCompletionUrls === true
++
+ const mantle = (modelID: string | undefined) => {
+   if (modelID === undefined) return "@opencode/ai/providers/amazon-bedrock/mantle"
+   return `@opencode/ai/providers/amazon-bedrock/mantle/${modelID.includes("gpt-oss") ? "chat" : "responses"}`
+@@ -141,8 +148,7 @@ function resolve(specifier: string, context: Context & { readonly settings?: Pro
+   if (Provider.isAISDK(specifier) || npm in PACKAGES || npm in (HOSTS[context.providerID] ?? {}))
+     return native(npm, context)
+   if (npm === "@opencode/ai/providers/amazon-bedrock/mantle") return mantle(context.modelID)
+-  if (npm === "@opencode/ai/providers/azure/responses" && context.settings?.useCompletionUrls === true)
+-    return "@opencode/ai/providers/azure/chat"
++  if (npm === "@opencode/ai/providers/azure/responses" && azureChat(context)) return "@opencode/ai/providers/azure/chat"
+   return NATIVE.has(npm) ? npm : undefined
+ }
+ 
 diff --git a/packages/core/src/codemode/tool.ts b/packages/core/src/codemode/tool.ts
-index 74742f64997e085aee5e8ee15dba30ee63bf5a6a..e15007b36c8950f24019e776a7dcee5a292cbc1c 100644
+index ef0d5d635b1f7c6341da16ee610fd00621e1b65f..5578b646799b3e650396967f738abf5ca5d853df 100644
 --- a/packages/core/src/codemode/tool.ts
 +++ b/packages/core/src/codemode/tool.ts
 @@ -1,16 +1,10 @@
@@ -1387,10 +1500,10 @@ index 74742f64997e085aee5e8ee15dba30ee63bf5a6a..e15007b36c8950f24019e776a7dcee5a
  
  function getNode<T>(root: Node<T>, path: string) {
 diff --git a/packages/core/src/config/plugin/compatibility.ts b/packages/core/src/config/plugin/compatibility.ts
-index c25cbce42dfa30d643cee626c1ea5db29c7b7c7f..741e60c02f5a998c83d441fc8bb411ced4bf7aed 100644
+index 792048dd429c2324ba7ec44c2a541bbf35d96e51..9b25a73c7121caf04ba3d34393dc63010e7cfc27 100644
 --- a/packages/core/src/config/plugin/compatibility.ts
 +++ b/packages/core/src/config/plugin/compatibility.ts
-@@ -20,6 +20,11 @@ export const Plugin = define({
+@@ -19,6 +19,11 @@ export const Plugin = define({
      const changes = yield* PubSub.sliding<string>(1)
      const lock = Semaphore.makeUnsafe(1)
      const skills: Skill.Info[] = []
@@ -1402,7 +1515,7 @@ index c25cbce42dfa30d643cee626c1ea5db29c7b7c7f..741e60c02f5a998c83d441fc8bb411ce
  
      const watch = Effect.fn("ConfigCompatibilityPlugin.watch")(function* (
        target: string,
-@@ -41,11 +46,12 @@ export const Plugin = define({
+@@ -40,11 +45,12 @@ export const Plugin = define({
          const directories = [...roots.claude, ...roots.agents].map((root) => path.join(root, "skills"))
          const loaded = new Map<Skill.ID, Skill.Info>()
          for (const directory of directories) {
@@ -1441,7 +1554,7 @@ index 2a78031ad3a57a6dd1f16980e00ab9b9ce1942d3..9bd95ecfb7aaf9c5b68177dae159cd1f
      },
      time: { created: part.state.status === "running" ? part.state.time.start : fallback },
 diff --git a/packages/core/src/mcp/client.ts b/packages/core/src/mcp/client.ts
-index bd294bbe17110a6eeb3c578f5504aadd0506e822..9466ca25f14ec0619b9c5f81e2f3dc82eddfe9c5 100644
+index 39a7085ec6b12ea1c346e863ea7a9cca25d0c022..6349c42208fce2d95911754083540629924d55bd 100644
 --- a/packages/core/src/mcp/client.ts
 +++ b/packages/core/src/mcp/client.ts
 @@ -4,6 +4,7 @@ import path from "node:path"
@@ -1452,12 +1565,7 @@ index bd294bbe17110a6eeb3c578f5504aadd0506e822..9466ca25f14ec0619b9c5f81e2f3dc82
    SdkError,
    SdkErrorCode,
    SdkHttpError,
-@@ -26,10 +27,11 @@ import {
-   type Transport,
-   type VersionNegotiationOptions,
- } from "@modelcontextprotocol/client"
--import { Cause, Effect, Exit, Schema } from "effect"
-+import { Cause, Effect, Exit, Schedule, Schema } from "effect"
+@@ -30,6 +31,7 @@ import { Cause, Clock, Duration, Effect, Exit, Schedule, Schema } from "effect"
  import { ConfigMCP } from "@opencode/schema/config/mcp"
  import type { Session } from "@opencode/schema/session"
  import { McpStdio } from "./stdio.js"
@@ -1465,16 +1573,35 @@ index bd294bbe17110a6eeb3c578f5504aadd0506e822..9466ca25f14ec0619b9c5f81e2f3dc82
  
  const DEFAULT_STARTUP_TIMEOUT = 30_000
  const DEFAULT_CATALOG_TIMEOUT = 30_000
-@@ -248,7 +250,7 @@ export const connect = Effect.fnUntraced(function* (
-     const open = (url: URL) => {
+@@ -270,14 +272,15 @@ export const connect = Effect.fnUntraced(function* (
+     const open = Effect.fnUntraced(function* (url: URL) {
        session.transport = new StreamableHTTPClientTransport(url, {
          requestInit: config.headers ? { headers: config.headers } : undefined,
 -        authProvider,
 +        authProvider: McpConfig.oauthDisabled(config) ? undefined : authProvider,
          fetch,
        })
-       return initialize(session.transport)
-@@ -265,6 +267,15 @@ export const connect = Effect.fnUntraced(function* (
+       return yield* initialize(session.transport)
+     })
+ 
+-    // Every attempt opens a fresh transport; no retry starts once the startup timeout has passed.
+-    const deadline = (yield* Clock.currentTimeMillis) + (config.timeout?.startup ?? DEFAULT_STARTUP_TIMEOUT)
++    // Every attempt opens a fresh transport; retries and the query fallback share one startup budget.
++    const startup = config.timeout?.startup ?? DEFAULT_STARTUP_TIMEOUT
++    const deadline = (yield* Clock.currentTimeMillis) + startup
+     return yield* retrying(
+       "MCP connect",
+       open(url).pipe(
+@@ -289,10 +292,24 @@ export const connect = Effect.fnUntraced(function* (
+         }),
+       ),
+       deadline,
++    ).pipe(
++      Effect.timeoutOrElse({
++        duration: startup,
++        orElse: () => Effect.fail(new Error(`MCP startup timed out after ${startup}ms`)),
++      }),
+     )
    }).pipe(Effect.exit)
    if (Exit.isSuccess(exit)) {
      const client = exit.value
@@ -1490,7 +1617,7 @@ index bd294bbe17110a6eeb3c578f5504aadd0506e822..9466ca25f14ec0619b9c5f81e2f3dc82
      yield* Effect.addFinalizer(() =>
        Effect.gen(function* () {
          // Close only aborts streams; the legacy session lives on until the server expires it unless
-@@ -319,17 +330,45 @@ export const connect = Effect.fnUntraced(function* (
+@@ -350,17 +367,45 @@ export const connect = Effect.fnUntraced(function* (
            client.getPrompt({ name: input.name, arguments: input.args ?? {} }, { signal, timeout: execution }),
          ),
        callTool: (input) =>
@@ -1612,6 +1739,107 @@ index ee8d99c3f1b5ac73d36ca21c144ab06c83e9794e..e8c35614555ecc809a827d0c7776afce
      const fields = { server: input.name, methodID: input.methodID, oauthAttemptID: crypto.randomUUID() }
      const context = yield* Effect.context()
      const run = Effect.runPromiseWith(context)
+diff --git a/packages/core/src/model-resolver.ts b/packages/core/src/model-resolver.ts
+index aa111cb0f5f68abb3ccb3f6400d703cdc279b1de..9c05aae3126ab8560513d77dae1ffc13231e9597 100644
+--- a/packages/core/src/model-resolver.ts
++++ b/packages/core/src/model-resolver.ts
+@@ -288,7 +288,10 @@ function prepareProviderSettings(
+   )
+ }
+ 
+-function prepareProviderURL(model: RuntimeInfo, baseURL: string): Effect.Effect<string, UnresolvedProviderVariablesError> {
++function prepareProviderURL(
++  model: RuntimeInfo,
++  baseURL: string,
++): Effect.Effect<string, UnresolvedProviderVariablesError> {
+   if (!baseURL.includes("${")) return Effect.succeed(baseURL)
+   const prepared = baseURL.replace(/\$\{([^}]+)\}/g, (placeholder, name: string) => process.env[name] ?? placeholder)
+   const failure = unresolvedProviderVariables(model, prepared)
+@@ -408,7 +411,9 @@ export const layer = Layer.effect(
+                 Effect.flatMap((model) =>
+                   model && hasPackage(model)
+                     ? Effect.succeed(model)
+-                    : Effect.map(models.available(), (models) => models.find(hasPackage)),
++                    : Effect.map(models.available(), (models) =>
++                        models.find((model) => hasPackage(model) && Model.supportsText(model)),
++                      ),
+                 ),
+               )
+         if (!selected) return undefined
+diff --git a/packages/core/src/model.ts b/packages/core/src/model.ts
+index a440578a3667fe057bf4b557f2bcb33fd1c49b33..88c0821800b8e24c53f7fe2fa21c296875d77437 100644
+--- a/packages/core/src/model.ts
++++ b/packages/core/src/model.ts
+@@ -261,7 +261,7 @@ const layer = Layer.effect(
+         const value = yield* read()
+         const requested = value.data.defaultModel
+         const model = requested && value.byProvider.get(requested.providerID)?.get(requested.modelID)
+-        return model?.enabled ? model : value.available[0]
++        return model?.enabled ? model : value.available.find(supportsText)
+       }),
+       small: Effect.fn("Model.small")(function* (providerID) {
+         const value = yield* read()
+@@ -282,6 +282,13 @@ const layer = Layer.effect(
+ 
+ export const node = makeLocationNode({ service: Service, layer, deps: [Provider.node, Bus.node, Location.node] })
+ 
++export function supportsText(model: Pick<Info, "capabilities">) {
++  return (
++    (model.capabilities.input.length === 0 || model.capabilities.input.some((item) => item.startsWith("text"))) &&
++    (model.capabilities.output.length === 0 || model.capabilities.output.some((item) => item.startsWith("text")))
++  )
++}
++
+ export function compatibility(input: unknown): Compatibility | undefined {
+   if (typeof input === "string") return { reasoningField: input }
+   if (typeof input !== "object" || input === null || Array.isArray(input) || !("field" in input)) return undefined
+diff --git a/packages/core/src/models-dev.ts b/packages/core/src/models-dev.ts
+index f11f07c79dbdb9b9bd6ee223fba24d2a4c6fc0e6..ce0c1963ca4a3d54a4a8de75b9cfdc4e673248bb 100644
+--- a/packages/core/src/models-dev.ts
++++ b/packages/core/src/models-dev.ts
+@@ -60,7 +60,11 @@ type SourceModel = {
+     >
+   }
+   readonly status?: CatalogModelStatus
+-  readonly provider?: { readonly npm?: string; readonly api?: string }
++  readonly provider?: {
++    readonly npm?: string
++    readonly api?: string
++    readonly shape?: "responses" | "completions"
++  }
+ }
+ 
+ type SourceProvider = {
+@@ -80,7 +84,13 @@ export type Snapshot = {
+ 
+ function nativePackage(provider: SourceProvider, model?: SourceModel) {
+   const npm = model?.provider?.npm ?? provider.npm
+-  return AISDKNative.native(npm, { providerID: provider.id, modelID: model?.id }) ?? Provider.aisdk(npm)
++  return (
++    AISDKNative.native(npm, {
++      providerID: provider.id,
++      modelID: model?.id,
++      shape: model?.provider?.shape,
++    }) ?? Provider.aisdk(npm)
++  )
+ }
+ 
+ function normalize(input: Record<string, SourceProvider>): readonly Snapshot[] {
+@@ -203,11 +213,12 @@ function modelInfo(
+   } = {},
+ ): Model.Info {
+   const providerID = Provider.ID.make(provider.id)
+-  const pkg = model.provider?.npm ? nativePackage(provider, model) : undefined
++  const resolved = nativePackage(provider, model)
++  const pkg = model.provider?.npm || resolved !== nativePackage(provider) ? resolved : undefined
+   // Per model, so it never merges into a model that overrides to a different package.
+   const settings = {
+     ...(model.provider?.api ? { baseURL: model.provider.api } : {}),
+-    ...(nativePackage(provider, model) === "@opencode/ai/providers/openai-compatible" ? { provider: providerID } : {}),
++    ...(resolved === "@opencode/ai/providers/openai-compatible" ? { provider: providerID } : {}),
+   }
+   return {
+     id,
 diff --git a/packages/core/src/plugin/identity.ts b/packages/core/src/plugin/identity.ts
 index 3ad57050e97d9c9e7132de736bafd0ad4ef665ed..3eb719682aa63d7a4e04546c3792b0e688a9c42f 100644
 --- a/packages/core/src/plugin/identity.ts
@@ -1640,11 +1868,63 @@ index 3ad57050e97d9c9e7132de736bafd0ad4ef665ed..3eb719682aa63d7a4e04546c3792b0e6
        }).pipe(Effect.catch(() => Effect.void))
      yield* ctx.session.hook("context", hook)
      yield* ctx.session.hook("compaction", hook)
+diff --git a/packages/core/src/plugin/models-dev.ts b/packages/core/src/plugin/models-dev.ts
+index 9a517c38634589afdf74f63a392d36a67806c93c..f2ed1817fb887a7fddb52232d2be5dcff6d002d2 100644
+--- a/packages/core/src/plugin/models-dev.ts
++++ b/packages/core/src/plugin/models-dev.ts
+@@ -3,6 +3,7 @@ import { Integration } from "@opencode/schema/integration"
+ import { Provider } from "@opencode/schema/provider"
+ import { Effect, Stream } from "effect"
+ import { Bus } from "../bus.js"
++import { Model } from "../model.js"
+ import { ModelsDev } from "../models-dev.js"
+ 
+ // These catalog entries require inference profiles on Bedrock Runtime.
+@@ -100,6 +101,7 @@ function snapshots(data: readonly ModelsDev.Snapshot[]) {
+       models: provider.models.filter(
+         (model) =>
+           model.status !== "deprecated" &&
++          Model.supportsText(model) &&
+           !(
+             provider.info.id === Provider.ID.amazonBedrock &&
+             BEDROCK_PROFILE_ONLY_IDS.includes(model.modelID ?? model.id)
+diff --git a/packages/core/src/plugin/provider/opencode.ts b/packages/core/src/plugin/provider/opencode.ts
+index 303cfecda178432667972afb431f4bd0c9a71f69..7bd6a39fad1d0e6d9f1918cc36c372773b54292d 100644
+--- a/packages/core/src/plugin/provider/opencode.ts
++++ b/packages/core/src/plugin/provider/opencode.ts
+@@ -461,16 +461,13 @@ export const OpencodePlugin = define<HttpClient.HttpClient | Bus.Service | Manag
+ 
+     // Console config can change independently of local credential activity, so re-fetch
+     // periodically and only rebuild the catalog and search providers when the snapshot differs.
+-    yield* Effect.sleep(Duration.minutes(1)).pipe(
+-      Effect.andThen(check()),
+-      Effect.forever,
+-      Effect.forkScoped,
+-    )
++    yield* Effect.sleep(Duration.minutes(1)).pipe(Effect.andThen(check()), Effect.forever, Effect.forkScoped)
+   }),
+ })
+ 
+ function fetchConfig(http: HttpClient.HttpClient, value: Credential.Value) {
+-  return http
++  // Scoped so responses whose body is never read (404, errors) are released here instead of by a GC-time abort.
++  return HttpClient.withScope(http)
+     .execute(
+       HttpClientRequest.get(`${serverUrl(value)}/api/v2/config`).pipe(
+         HttpClientRequest.acceptJson,
+@@ -498,6 +495,7 @@ function fetchConfig(http: HttpClient.HttpClient, value: Credential.Value) {
+           )
+         }),
+       ),
++      Effect.scoped,
+     )
+ }
+ 
 diff --git a/packages/core/src/session/compaction.ts b/packages/core/src/session/compaction.ts
-index 5de1ef8dc1b4d8725683de2fe8674f942303c0c8..5bae8b205566ecfb10935ed9751aa94d86d79e40 100644
+index 7afb5a469d0aef5c56f441c2c7cd950dfa80a1cd..938bf2852c732b3a2da75a25e375bbd861c0cb12 100644
 --- a/packages/core/src/session/compaction.ts
 +++ b/packages/core/src/session/compaction.ts
-@@ -137,6 +137,8 @@ const SUMMARY_RULES = `Rules:
+@@ -140,6 +140,8 @@ const SUMMARY_RULES = `Rules:
  - Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers.
  - Carry forward only user questions or requests that remain unanswered or require further action. Do not repeat ones that newer history has answered or resolved. Preserve exact wording when carrying one forward.
  - Preserve consequential workflow state, including whether changes are uncommitted, committed, pushed, under review, or merged.
@@ -1667,7 +1947,7 @@ index eeed241ae14e30645d4e0904c69d3ebfe919ef38..00985130c6c347f8d9b1303415926659
  }
  
 diff --git a/packages/core/src/session/model-request.ts b/packages/core/src/session/model-request.ts
-index cf6d4ac4dfab724e16bcdd9b26995e8ae26def15..abce3a69e296c798be068ab2d7ceb415a3617fd0 100644
+index 2340dc407c83e0a9261ca0f15915762e858292af..4136cc9ef4930fe6146d4b0f191fd68d5753abb9 100644
 --- a/packages/core/src/session/model-request.ts
 +++ b/packages/core/src/session/model-request.ts
 @@ -4,6 +4,7 @@ import {
@@ -1678,7 +1958,7 @@ index cf6d4ac4dfab724e16bcdd9b26995e8ae26def15..abce3a69e296c798be068ab2d7ceb415
    LanguageModel,
    LLM,
    LLMRequest,
-@@ -274,19 +275,23 @@ export const layer = Layer.effect(
+@@ -261,19 +262,23 @@ export const layer = Layer.effect(
        const affinity = SessionAffinity.get(session)
        const base = LLM.request({
          model: model.model,
@@ -1715,7 +1995,7 @@ index cf6d4ac4dfab724e16bcdd9b26995e8ae26def15..abce3a69e296c798be068ab2d7ceb415
          // TODO: Persist cache lineage so nested forks reuse the root session's cache key.
          promptCacheKey: /^ses_[0-9a-f]{64}$/.test(affinity) ? affinity.slice(4) : affinity,
          system: shaped.system,
-@@ -405,7 +410,15 @@ export const layer = Layer.effect(
+@@ -392,7 +397,15 @@ export const layer = Layer.effect(
                      ? [r.defect]
                      : [],
                  )[0]
@@ -1780,10 +2060,10 @@ index 3ffe4ed6e900cdcea5f0e26f157318b658d77108..b6d2b917b725ec9bbb9d4a3e67703e1f
  
      return Service.of({ drain })
 diff --git a/packages/core/src/session/runner/publish-llm-event.ts b/packages/core/src/session/runner/publish-llm-event.ts
-index 988afb70b0ee7ff2e524733716fe9155812f73b6..1068d199c87dbfef0c74671b01af21d33179364e 100644
+index bceffb612023d330642b81b14bd971fc482531a3..5c8fb19d1bd6000665c3b179c1e1daf6f5848427 100644
 --- a/packages/core/src/session/runner/publish-llm-event.ts
 +++ b/packages/core/src/session/runner/publish-llm-event.ts
-@@ -31,6 +31,7 @@ const asRecord = (value: unknown): Record<string, unknown> =>
+@@ -32,6 +32,7 @@ const asRecord = (value: unknown): Record<string, unknown> =>
  export interface StepRecord {
    /** The model produced visible output this attempt, which bars transparent retries and overflow recovery. */
    readonly outputStarted: boolean
@@ -1791,7 +2071,7 @@ index 988afb70b0ee7ff2e524733716fe9155812f73b6..1068d199c87dbfef0c74671b01af21d3
    readonly providerFailed: boolean
    /** The step's recorded assistant failure, if any. */
    readonly failure?: SessionError.Error
-@@ -74,7 +75,21 @@ const hostedContent = (result: ToolResultValue): NonEmptyContent => {
+@@ -75,7 +76,21 @@ const hostedContent = (result: ToolResultValue): NonEmptyContent => {
   * order: each publishing fiber is sequential, so per-source order holds by construction,
   * and consumers fold by id/ordinal rather than global position.
   */
@@ -1814,7 +2094,7 @@ index 988afb70b0ee7ff2e524733716fe9155812f73b6..1068d199c87dbfef0c74671b01af21d3
    const deltaBatchInterval = 100
    type ToolState = {
      readonly name: string
-@@ -93,6 +108,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
+@@ -94,6 +109,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
    let stepStarted = false
    let providerFailed = false
    let outputStarted = false
@@ -1822,7 +2102,7 @@ index 988afb70b0ee7ff2e524733716fe9155812f73b6..1068d199c87dbfef0c74671b01af21d3
    let stepFailure: SessionError.Error | undefined
    let stepSettlement: StepRecord["finish"]
  
-@@ -214,6 +230,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
+@@ -215,6 +231,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
            text: value,
            state,
          })
@@ -1830,7 +2110,7 @@ index 988afb70b0ee7ff2e524733716fe9155812f73b6..1068d199c87dbfef0c74671b01af21d3
        }),
      (_textID, value, ordinal) =>
        Effect.gen(function* () {
-@@ -616,6 +633,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
+@@ -609,6 +626,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
      /** Immutable snapshot of everything recorded for this step so far. */
      record: (): StepRecord => ({
        outputStarted,
@@ -2163,6 +2443,63 @@ index f21c67a533ed942c06747f51474908bce099fc33..9ab6243da65d0e2d59ac59c69a49fb7e
      return {
        output,
        content: normalizeContent(result.content, output),
+diff --git a/packages/core/src/variant.ts b/packages/core/src/variant.ts
+index cd36b5ee06cb70325f4e4d5394b3bbf78ed4757a..9ecafafd6fdecd912b0aa4ba3309d5a8fde0a499 100644
+--- a/packages/core/src/variant.ts
++++ b/packages/core/src/variant.ts
+@@ -575,6 +575,7 @@ const PROTOCOLS: Readonly<Record<string, Protocol>> = {
+   "@opencode/ai/providers/zai-coding-plan/responses": openaiResponses,
+ 
+   "@opencode/ai/providers/openai-compatible": openaiCompatible,
++  "@opencode/ai/providers/azure/chat": openaiChat,
+   "@opencode/ai/providers/google-vertex/chat": openaiChat,
+   "@opencode/ai/providers/alibaba/chat": alibabaChat,
+   "@opencode/ai/providers/baseten": basetenChat,
+diff --git a/packages/core/test/aisdk-native.test.ts b/packages/core/test/aisdk-native.test.ts
+index 82a1c740c1866dba166ae22ac56745244e7af763..643e4966f04d8892d33d2a198a703a3e09b8f921 100644
+--- a/packages/core/test/aisdk-native.test.ts
++++ b/packages/core/test/aisdk-native.test.ts
+@@ -224,6 +224,9 @@ describe("AISDKNative", () => {
+     const chat = map("@ai-sdk/azure", { ...settings, useCompletionUrls: true }, "custom-deployment")
+     expect(chat?.package).toBe("@opencode/ai/providers/azure/chat")
+     expect(chat?.settings).not.toHaveProperty("useCompletionUrls")
++    expect(AISDKNative.native("@ai-sdk/azure", { providerID: "azure", shape: "completions" })).toBe(
++      "@opencode/ai/providers/azure/chat",
++    )
+   })
+ 
+   test("maps Bedrock provider and request options", () => {
+diff --git a/packages/core/test/catalog.test.ts b/packages/core/test/catalog.test.ts
+index f8e47eb3c5f5f42405133f828dfc3797ad90f017..422daab67ac4e64b1882b6d692a3b2f34a3b0d01 100644
+--- a/packages/core/test/catalog.test.ts
++++ b/packages/core/test/catalog.test.ts
+@@ -201,8 +201,7 @@ describe("Provider and Model", () => {
+       yield* settle(
+         Ref.get(log).pipe(
+           Effect.map(
+-            (types) =>
+-              types.lastIndexOf(Model.Event.Updated.type) > types.lastIndexOf(Credential.Event.Updated.type),
++            (types) => types.lastIndexOf(Model.Event.Updated.type) > types.lastIndexOf(Credential.Event.Updated.type),
+           ),
+         ),
+       )
+@@ -553,6 +552,16 @@ describe("Provider and Model", () => {
+         editor.models.update(providerID, Model.ID.make("new"), (model) => {
+           model.time.released = 2000
+         })
++        editor.models.update(providerID, Model.ID.make("newest-video"), (model) => {
++          model.capabilities.input = ["text", "image"]
++          model.capabilities.output = ["video"]
++          model.time.released = 3000
++        })
++        editor.models.update(providerID, Model.ID.make("newest-stt"), (model) => {
++          model.capabilities.input = ["audio"]
++          model.capabilities.output = ["text"]
++          model.time.released = 4000
++        })
+       })
+ 
+       expect((yield* models.default())?.id).toMatch("new")
 diff --git a/packages/core/test/codemode-safety.test.ts b/packages/core/test/codemode-safety.test.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..110c3b6b2ae2a263529c05d3c1ca18ca539297b4
@@ -2688,10 +3025,10 @@ index 0000000000000000000000000000000000000000..110c3b6b2ae2a263529c05d3c1ca18ca
 +  )
 +})
 diff --git a/packages/core/test/config/skill.test.ts b/packages/core/test/config/skill.test.ts
-index d226842e9464e3f99378f57dc4363734b88f936f..43617aa66dabc69f6665d840d4c0e9cd45e828fb 100644
+index b172222e69710c18e190dad7509af47e1936da80..c59096fdf1228549cb3fd086fe49e29b96e43838 100644
 --- a/packages/core/test/config/skill.test.ts
 +++ b/packages/core/test/config/skill.test.ts
-@@ -163,6 +163,36 @@ metadata:
+@@ -175,6 +175,36 @@ metadata:
  })
  
  describe("ConfigSkillPlugin.Plugin", () => {
@@ -2804,7 +3141,7 @@ index 7f03641f4d84092515c25636588175bcc74f9d9f..cf15b411368073288147e3fd898d9cbc
  const authorizationServer = (metadata: Record<string, unknown>) => {
    const registrations: unknown[] = []
 diff --git a/packages/core/test/mcp.test.ts b/packages/core/test/mcp.test.ts
-index 81785d1d36985faa6937215e532019ac2956e252..47a384b7bc3904f702e5c3a604f315087d75f0f0 100644
+index 314b81fcb8aa12a2969bc2e6fbc0a800c700775c..b1292b9b2b69453924f816ce88e61bec8f71e924 100644
 --- a/packages/core/test/mcp.test.ts
 +++ b/packages/core/test/mcp.test.ts
 @@ -36,6 +36,7 @@ import { McpResourceTools } from "@opencode/core/tool/plugin/mcp-resource"
@@ -2961,7 +3298,174 @@ index 81785d1d36985faa6937215e532019ac2956e252..47a384b7bc3904f702e5c3a604f31508
  test("passes session IDs as MCP request metadata", async () => {
    await Effect.runPromise(
      Effect.scoped(
-@@ -1542,20 +1682,70 @@ it.live("discovers and reads MCP resources through Code Mode", () =>
+@@ -976,6 +1116,166 @@ test("applies configured MCP timeouts to resource operations", async () => {
+   await expect(read).rejects.toThrow("Request timed out")
+ })
+ 
++testEffect(Layer.empty).live("MCP startup budget caps a stalled remote retry", () =>
++  Effect.gen(function* () {
++    let attempts = 0
++    let aborted = 0
++    const server = yield* resourceServer({
++      respond: async (request) => {
++        if (request.method !== "POST") return
++        const body = (await request.clone().json()) as { method?: string }
++        if (body.method !== "initialize") return
++        attempts += 1
++        if (attempts === 1) return new Response("restarting", { status: 503 })
++        return new Promise<Response>((resolve) => {
++          request.signal.addEventListener(
++            "abort",
++            () => {
++              aborted += 1
++              resolve(new Response("aborted", { status: 503 }))
++            },
++            { once: true },
++          )
++        })
++      },
++    })
++    const started = performance.now()
++    const error = yield* connect(
++      "startup-budget",
++      new ConfigMCP.Remote({
++        type: "remote",
++        url: server.url,
++        oauth: false,
++        timeout: new ConfigMCP.Timeout({ startup: 400 }),
++      }),
++      import.meta.dir,
++    ).pipe(Effect.flip)
++    const elapsed = performance.now() - started
++    console.info("MCP stalled retry receipt", { elapsed, attempts })
++    // Allow 200 ms for real SDK/fetch scheduling, but not a second 400 ms initialize timeout.
++    expect(elapsed).toBeLessThan(600)
++    expect(error).toBeInstanceOf(McpClient.ConnectError)
++    yield* Effect.promise(() => Bun.sleep(50))
++    expect(aborted).toBe(1)
++    yield* Effect.promise(() => Bun.sleep(300))
++    expect(attempts).toBe(2)
++    expect(server.state.initializations).toBe(2)
++    expect(server.state.toolLists).toBe(0)
++  }),
++)
++
++for (const firstStatus of [503, 404]) {
++  testEffect(Layer.empty).live(`MCP startup budget rejects late success after ${firstStatus}`, () =>
++    Effect.gen(function* () {
++      let attempts = 0
++      let aborted = 0
++      let successfulResponses = 0
++      const server = yield* resourceServer({
++        respond: async (request) => {
++          if (request.method !== "POST") return
++          const body = (await request.clone().json()) as { method?: string }
++          if (body.method !== "initialize") return
++          attempts += 1
++          if (attempts === 1) {
++            // A 503 consumes the retry backoff; a 404 consumes time before the Code Mode query fallback.
++            if (firstStatus === 404) await Bun.sleep(250)
++            return new Response("try again", { status: firstStatus })
++          }
++          return new Promise<Response | undefined>((resolve) => {
++            const timer = setTimeout(() => {
++              request.signal.removeEventListener("abort", abort)
++              successfulResponses += 1
++              resolve(undefined)
++            }, 250)
++            const abort = () => {
++              clearTimeout(timer)
++              aborted += 1
++              resolve(new Response("aborted", { status: 503 }))
++            }
++            request.signal.addEventListener("abort", abort, { once: true })
++          })
++        },
++      })
++      const started = performance.now()
++      const result = yield* connect(
++        "startup-budget",
++        new ConfigMCP.Remote({
++          type: "remote",
++          url: server.url,
++          oauth: false,
++          timeout: new ConfigMCP.Timeout({ startup: 400 }),
++        }),
++        import.meta.dir,
++      ).pipe(Effect.exit)
++      console.info("MCP late success receipt", { firstStatus, elapsed: performance.now() - started, attempts })
++      expect(Exit.isFailure(result)).toBe(true)
++      if (Exit.isFailure(result)) {
++        const error = Cause.squash(result.cause)
++        expect(error).toBeInstanceOf(McpClient.ConnectError)
++        expect(error).toMatchObject({ message: "MCP startup timed out after 400ms" })
++      }
++      yield* Effect.promise(() => Bun.sleep(350))
++      expect(aborted).toBe(1)
++      expect(successfulResponses).toBe(0)
++      expect(attempts).toBe(2)
++      expect(server.state.initializations).toBe(2)
++      if (firstStatus === 404) {
++        expect(new URL(server.state.urls[0]).searchParams.get("codemode")).toBe("false")
++        expect(server.state.urls[1]).toBe(server.url)
++      }
++      expect(server.state.toolLists).toBe(0)
++    }),
++  )
++}
++
++testEffect(Layer.empty).live("MCP startup budget preserves caller cancellation during a retry", () =>
++  Effect.gen(function* () {
++    let attempts = 0
++    let aborted = 0
++    const retryStarted = yield* Deferred.make<void>()
++    const server = yield* resourceServer({
++      respond: async (request) => {
++        if (request.method !== "POST") return
++        const body = (await request.clone().json()) as { method?: string }
++        if (body.method !== "initialize") return
++        attempts += 1
++        if (attempts === 1) return new Response("restarting", { status: 503 })
++        return new Promise<Response>((resolve) => {
++          request.signal.addEventListener(
++            "abort",
++            () => {
++              aborted += 1
++              resolve(new Response("aborted", { status: 503 }))
++            },
++            { once: true },
++          )
++          Deferred.doneUnsafe(retryStarted, Exit.void)
++        })
++      },
++    })
++    const fiber = yield* connect(
++      "startup-budget",
++      new ConfigMCP.Remote({
++        type: "remote",
++        url: server.url,
++        oauth: false,
++        timeout: new ConfigMCP.Timeout({ startup: 1_000 }),
++      }),
++      import.meta.dir,
++    ).pipe(Effect.forkScoped)
++    yield* Deferred.await(retryStarted)
++    yield* Fiber.interrupt(fiber)
++    const result = yield* Fiber.await(fiber)
++    expect(Exit.isFailure(result) && Cause.hasInterrupts(result.cause)).toBe(true)
++    // Wait past the aggregate deadline as well as the next retry's backoff.
++    yield* Effect.promise(() => Bun.sleep(1_100))
++    expect(aborted).toBe(1)
++    expect(attempts).toBe(2)
++    expect(server.state.initializations).toBe(2)
++    expect(server.state.toolLists).toBe(0)
++  }),
++)
++
+ for (const entry of [
+   { name: "default", query: "", codemode: undefined, expected: "?codemode=false" },
+   { name: "explicit local code mode", query: "", codemode: true, expected: "?codemode=false" },
+@@ -1542,20 +1842,69 @@ it.live("discovers and reads MCP resources through Code Mode", () =>
        )
        expect(missing.metadata?.error).toBe(true)
        expect(missing.output.output).toContain("MCP server not found: missing")
@@ -3015,11 +3519,10 @@ index 81785d1d36985faa6937215e532019ac2956e252..47a384b7bc3904f702e5c3a604f31508
 +        expect(Exit.isFailure(exit)).toBe(true)
 +        if (Exit.isFailure(exit))
 +          expect(
-+            exit.cause.reasons.some(
-+              (reason) =>
-+                negative instanceof Permission.DeclinedError
-+                  ? Cause.isDieReason(reason) && reason.defect === negative
-+                  : Cause.isFailReason(reason) && reason.error instanceof Tool.Error && reason.error.error === negative,
++            exit.cause.reasons.some((reason) =>
++              negative instanceof Permission.DeclinedError
++                ? Cause.isDieReason(reason) && reason.defect === negative
++                : Cause.isFailReason(reason) && reason.error instanceof Tool.Error && reason.error.error === negative,
 +            ),
 +          ).toBe(true)
 +        expect(server.state.resourceReads).toEqual([])
@@ -3042,6 +3545,46 @@ index 81785d1d36985faa6937215e532019ac2956e252..47a384b7bc3904f702e5c3a604f31508
  test("adds, disconnects, and reconnects MCP servers at runtime", async () => {
    const published: string[] = []
    await Effect.runPromise(
+diff --git a/packages/core/test/models.test.ts b/packages/core/test/models.test.ts
+index c0780e57f7a455b185c0bbad316830e001e55c8f..d1caf7c0c2fa103e1445242f4597835198fd7fbf 100644
+--- a/packages/core/test/models.test.ts
++++ b/packages/core/test/models.test.ts
+@@ -255,6 +255,23 @@ describe("ModelsDev Service", () => {
+           api: "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1",
+           models: {},
+         },
++        azure: {
++          id: "azure",
++          name: "Azure",
++          env: ["AZURE_RESOURCE_NAME", "AZURE_API_KEY"],
++          npm: "@ai-sdk/azure",
++          models: {
++            "gpt-5": {
++              ...fixture.acme.models["acme-1"],
++              id: "gpt-5",
++            },
++            "custom-chat": {
++              ...fixture.acme.models["acme-1"],
++              id: "custom-chat",
++              provider: { shape: "completions" },
++            },
++          },
++        },
+       })
+       const state = yield* Ref.make(initialState)
+       const result = yield* provided(
+@@ -266,6 +283,11 @@ describe("ModelsDev Service", () => {
+       expect(result[0]?.models[0]?.package).toBe("@opencode/ai/providers/openai")
+       expect(result[1]?.info.package).toBe("@opencode/ai/providers/cloudflare-workers-ai")
+       expect(result[1]?.info.settings).toBeUndefined()
++      expect(result[2]?.info.package).toBe("@opencode/ai/providers/azure/responses")
++      expect(result[2]?.models.find((model) => model.id === "gpt-5")?.package).toBeUndefined()
++      expect(result[2]?.models.find((model) => model.id === "custom-chat")?.package).toBe(
++        "@opencode/ai/providers/azure/chat",
++      )
+     }),
+   )
+ 
 diff --git a/packages/core/test/plugin/identity.test.ts b/packages/core/test/plugin/identity.test.ts
 index fe5aab2e43897058673b2b3373aef160c1ce9e9d..a64a5287acd053b48c3bfeb9a9341bc59c0db09c 100644
 --- a/packages/core/test/plugin/identity.test.ts
@@ -3096,11 +3639,105 @@ index fe5aab2e43897058673b2b3373aef160c1ce9e9d..a64a5287acd053b48c3bfeb9a9341bc5
        "Initial context",
      ])
    }),
+diff --git a/packages/core/test/plugin/models-dev.test.ts b/packages/core/test/plugin/models-dev.test.ts
+index 59c38eb6626124f01c0ea68e9fe9d49fa35b1113..7038d011422e42a508dd1e025ed93e14b2584013 100644
+--- a/packages/core/test/plugin/models-dev.test.ts
++++ b/packages/core/test/plugin/models-dev.test.ts
+@@ -624,7 +624,7 @@ describe("ModelsDevPlugin", () => {
+     }),
+   )
+ 
+-  it.effect("omits deprecated model definitions", () =>
++  it.effect("omits deprecated and non-text model definitions", () =>
+     Effect.gen(function* () {
+       const integrations = yield* Integration.Service
+       const providers = yield* Provider.Service
+@@ -632,11 +632,13 @@ describe("ModelsDevPlugin", () => {
+       const providerID = Provider.ID.make("acme")
+       const activeID = Model.ID.make("current")
+       const deprecatedID = Model.ID.make("legacy")
++      const videoID = Model.ID.make("video-gen")
++      const sttID = Model.ID.make("transcribe")
+       const model = {
+         modelID: activeID,
+         providerID,
+         name: "Current",
+-        capabilities: { tools: true, input: [], output: [] },
++        capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+         variants: [],
+         time: { released: Date.parse("2026-01-01") },
+         cost: [],
+@@ -662,6 +664,21 @@ describe("ModelsDevPlugin", () => {
+               name: "Legacy",
+               status: "deprecated" as const,
+             },
++            {
++              id: videoID,
++              ...model,
++              modelID: videoID,
++              name: "Video Gen",
++              capabilities: { tools: false, input: ["text", "image"], output: ["video"] },
++              limit: { context: 1_024, output: 0 },
++            },
++            {
++              id: sttID,
++              ...model,
++              modelID: sttID,
++              name: "Transcribe",
++              capabilities: { tools: false, input: ["audio"], output: ["text"] },
++            },
+           ],
+         },
+       ] satisfies readonly ModelsDev.Snapshot[]
+@@ -684,6 +701,8 @@ describe("ModelsDevPlugin", () => {
+       yield* activate(providers)
+       expect(yield* modelState.get(providerID, activeID)).toBeDefined()
+       expect(yield* modelState.get(providerID, deprecatedID)).toBeUndefined()
++      expect(yield* modelState.get(providerID, videoID)).toBeUndefined()
++      expect(yield* modelState.get(providerID, sttID)).toBeUndefined()
+     }),
+   )
+ 
+diff --git a/packages/core/test/plugin/provider-opencode.test.ts b/packages/core/test/plugin/provider-opencode.test.ts
+index 3ce2960dbb510dc355141d4593246582b94e4cc8..edb391975492bfd8a600e3e74368f1f573386457 100644
+--- a/packages/core/test/plugin/provider-opencode.test.ts
++++ b/packages/core/test/plugin/provider-opencode.test.ts
+@@ -1072,6 +1072,30 @@ describe("OpencodePlugin", () => {
+     ),
+   )
+ 
++  it.effect("releases unread Console config responses when the fetch completes", () =>
++    Effect.gen(function* () {
++      const credentials = yield* Credential.Service
++      const signals: AbortSignal[] = []
++      const state = { status: 404 }
++      const http = HttpClient.make((request, _url, signal) => {
++        signals.push(signal)
++        return Effect.succeed(HttpClientResponse.fromWeb(request, new Response("unavailable", state)))
++      })
++      yield* credentials.create({
++        integrationID: Integration.ID.make("opencode"),
++        value: Credential.Key.make({ type: "key", key: "secret", metadata: { server: "https://console.test" } }),
++      })
++      yield* addPlugin().pipe(Effect.provideService(HttpClient.HttpClient, http))
++      yield* drain
++      state.status = 503
++      yield* TestClock.adjust("1 minute")
++      yield* drain
++
++      // An unreleased response is only aborted when garbage collected, which fails outside a request on workerd.
++      expect(signals.map((signal) => signal.aborted)).toEqual([true, true])
++    }),
++  )
++
+   it.effect("reports a rejected Console refresh token as signed out without removing the credential", () =>
+     Effect.acquireUseRelease(
+       Effect.sync(() =>
 diff --git a/packages/core/test/session-compaction.test.ts b/packages/core/test/session-compaction.test.ts
-index 329b891d2e6ad57317b740e1a3b5b27ad31646bd..de5dd6dc152c2e48665c92f7a34af6174f332c1e 100644
+index 93ff3d5fed311ebb2fd67e7d56dc50ffff447f7d..74c8b3f2992f7072fde9f1666cf955ade268a90f 100644
 --- a/packages/core/test/session-compaction.test.ts
 +++ b/packages/core/test/session-compaction.test.ts
-@@ -134,6 +134,16 @@ it.effect("compaction truncation does not split surrogate pairs", () =>
+@@ -139,6 +139,16 @@ it.effect("compaction truncation does not split surrogate pairs", () =>
    }),
  )
  
@@ -3139,10 +3776,10 @@ index 19728224936c0468ae60129d40f2e78f10704a55..a3703e4af51f73e1e16f71479b6d52f6
    })
  })
 diff --git a/packages/core/test/session-execution.test.ts b/packages/core/test/session-execution.test.ts
-index 063c5fedfbc9d620fd8564df5632b942bf193288..fadee3fa20bd64d9ae63f1a51799b9423c1721b9 100644
+index d6cafcf7b5b1628c71fc4465a14f489f6d8990e9..463083ab7820f052d3808ac58ee34dbdb501e1aa 100644
 --- a/packages/core/test/session-execution.test.ts
 +++ b/packages/core/test/session-execution.test.ts
-@@ -45,6 +45,16 @@ describe("SessionExecution lifecycle", () => {
+@@ -46,6 +46,16 @@ describe("SessionExecution lifecycle", () => {
      ).toEqual({ type: "failed", error: { type: "provider.transport", message: "Disconnected" } })
    })
  
@@ -3428,7 +4065,7 @@ index 0000000000000000000000000000000000000000..df23576cc4d08298743d2f97119219e7
 +  ).toEqual({ retry: false })
 +})
 diff --git a/packages/core/test/session-runner.test.ts b/packages/core/test/session-runner.test.ts
-index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999fa5a63298 100644
+index 68c8f3eb13524e0f715747ec167b20a34ffd8706..5b62c3d182b9d27efdec65cde5b801fa85e5fc80 100644
 --- a/packages/core/test/session-runner.test.ts
 +++ b/packages/core/test/session-runner.test.ts
 @@ -84,6 +84,7 @@ import { promptLocationNode } from "./fixture/prompt-location"
@@ -3492,7 +4129,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
          ),
        ),
        Stream.fromIterable(TestLLM.text("Handled completion", "text-completion")),
-@@ -3258,8 +3276,8 @@ describe("SessionRunnerLLM", () => {
+@@ -3284,8 +3302,8 @@ describe("SessionRunnerLLM", () => {
        [LLMEvent.providerError({ message: "prompt too long", classification: "context-overflow" })],
        TestLLM.text("## Objective\n- Overflow summary", "overflow-summary"),
        TestLLM.text("Recovered", "overflow-recovered"),
@@ -3503,7 +4140,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      )
      const first = yield* s.llm.gate
      const run = yield* s.resume.pipe(Effect.forkChild)
-@@ -3666,7 +3684,7 @@ describe("SessionRunnerLLM", () => {
+@@ -3692,7 +3710,7 @@ describe("SessionRunnerLLM", () => {
    scenario("reloads a model switch before a tool-driven continuation step", function* (s) {
      yield* s.admit("Echo this")
  
@@ -3512,7 +4149,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      const tools = yield* s.blockTools()
      const run = yield* Effect.forkChild(s.resume)
      yield* tools.started
-@@ -3706,7 +3724,7 @@ describe("SessionRunnerLLM", () => {
+@@ -3732,7 +3750,7 @@ describe("SessionRunnerLLM", () => {
          ),
          Stream.onEnd(Deferred.succeed(finished, undefined)),
        ),
@@ -3521,7 +4158,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      )
      const tools = yield* s.blockTools()
      const streamed = yield* s.bus.subscribe(SessionEvent.Step.Streamed).pipe(
-@@ -3756,6 +3774,9 @@ describe("SessionRunnerLLM", () => {
+@@ -3782,6 +3800,9 @@ describe("SessionRunnerLLM", () => {
  
      yield* s.llm.push(
        TestLLM.stop(
@@ -3531,7 +4168,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
          LLMEvent.reasoningStart({ id: "reasoning-anthropic" }),
          LLMEvent.reasoningDelta({ id: "reasoning-anthropic", text: "Signed thought" }),
          LLMEvent.reasoningEnd({
-@@ -3785,6 +3806,7 @@ describe("SessionRunnerLLM", () => {
+@@ -3811,6 +3832,7 @@ describe("SessionRunnerLLM", () => {
      expect(yield* s.context).toMatchObject([
        Expected.user("Think first"),
        Expected.assistant({}, [
@@ -3539,7 +4176,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
          {
            type: "reasoning",
            text: "Signed thought",
-@@ -3803,6 +3825,7 @@ describe("SessionRunnerLLM", () => {
+@@ -3829,6 +3851,7 @@ describe("SessionRunnerLLM", () => {
      yield* s.resume
  
      expect(s.requests[1]?.messages[1]?.content).toEqual([
@@ -3547,7 +4184,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
        {
          type: "reasoning",
          text: "Signed thought",
-@@ -4055,7 +4078,7 @@ describe("SessionRunnerLLM", () => {
+@@ -4081,7 +4104,7 @@ describe("SessionRunnerLLM", () => {
    scenario("steers an active step with newly recorded prompts", function* (s) {
      yield* s.admit("Start working")
  
@@ -3556,7 +4193,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
  
      const first = yield* s.resumePaused
      yield* s.session.prompt({ sessionID, text: "Change direction" })
-@@ -4071,7 +4094,11 @@ describe("SessionRunnerLLM", () => {
+@@ -4097,7 +4120,11 @@ describe("SessionRunnerLLM", () => {
    scenario("promotes queued input after continuation ends", function* (s) {
      yield* s.admit("Start working")
  
@@ -3569,7 +4206,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
  
      const first = yield* s.resumePaused
      yield* s.session.prompt({
-@@ -4090,7 +4117,11 @@ describe("SessionRunnerLLM", () => {
+@@ -4116,7 +4143,11 @@ describe("SessionRunnerLLM", () => {
    scenario("keeps queued input parked when a steer is cancelled during preparation", function* (s) {
      const runner = yield* SessionRunner.Service
      yield* s.admit("A")
@@ -3582,7 +4219,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      const stream = yield* s.llm.gate
      const run = yield* runner.drain({ sessionID, force: false }).pipe(Effect.forkChild)
      yield* stream.started
-@@ -4114,7 +4145,7 @@ describe("SessionRunnerLLM", () => {
+@@ -4140,7 +4171,7 @@ describe("SessionRunnerLLM", () => {
  
      const location = Location.Ref.make({ directory: AbsolutePath.make("/moved") })
      yield* s.admit("A")
@@ -3591,7 +4228,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      const stream = yield* s.llm.gate
      const run = yield* runner.drain({ sessionID, force: false }).pipe(Effect.forkChild)
      yield* stream.started
-@@ -4148,7 +4179,7 @@ describe("SessionRunnerLLM", () => {
+@@ -4174,7 +4205,7 @@ describe("SessionRunnerLLM", () => {
    scenario("preserves durable queued input for a later wake after interruption", function* (s) {
      yield* s.admit("Interrupt current work")
  
@@ -3600,7 +4237,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      const stream = yield* s.llm.gate
  
      const run = yield* s.resume.pipe(Effect.forkChild)
-@@ -4175,7 +4206,7 @@ describe("SessionRunnerLLM", () => {
+@@ -4201,7 +4232,7 @@ describe("SessionRunnerLLM", () => {
    scenario("preserves durable steering input for a later resume after interruption", function* (s) {
      yield* s.admit("Interrupt current work")
  
@@ -3609,7 +4246,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      const stream = yield* s.llm.gate
  
      const run = yield* s.resume.pipe(Effect.forkChild)
-@@ -4202,7 +4233,11 @@ describe("SessionRunnerLLM", () => {
+@@ -4228,7 +4259,11 @@ describe("SessionRunnerLLM", () => {
    scenario("promotes queued inputs one at a time in FIFO order", function* (s) {
      yield* s.admit("Start working")
  
@@ -3622,7 +4259,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
  
      const first = yield* s.resumePaused
      yield* s.session.prompt({ sessionID, text: "Queue first", delivery: "queue" })
-@@ -4218,7 +4253,7 @@ describe("SessionRunnerLLM", () => {
+@@ -4244,7 +4279,7 @@ describe("SessionRunnerLLM", () => {
    scenario("stops a steer-scoped drain before queued input", function* (s) {
      yield* s.session.prompt({ sessionID, text: "Queue for later", delivery: "queue", resume: false })
      yield* s.session.prompt({ sessionID, text: "Steer now", resume: false })
@@ -3631,7 +4268,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
  
      const runner = yield* SessionRunner.Service
      yield* runner.drain({ sessionID, force: false, promotable: "steer" })
-@@ -4276,7 +4311,7 @@ describe("SessionRunnerLLM", () => {
+@@ -4302,7 +4337,7 @@ describe("SessionRunnerLLM", () => {
        resume: false,
      })
  
@@ -3640,7 +4277,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
  
      yield* s.resume
  
-@@ -4288,7 +4323,12 @@ describe("SessionRunnerLLM", () => {
+@@ -4314,7 +4349,12 @@ describe("SessionRunnerLLM", () => {
    scenario("promotes steers before the next queued input", function* (s) {
      yield* s.admit("Start working")
  
@@ -3654,7 +4291,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      const firstStream = yield* s.llm.gate
  
      const first = yield* s.resume.pipe(Effect.forkChild)
-@@ -4331,7 +4371,7 @@ describe("SessionRunnerLLM", () => {
+@@ -4357,7 +4397,7 @@ describe("SessionRunnerLLM", () => {
      const execution = yield* SessionExecution.Service
      yield* s.admit("Start working")
  
@@ -3663,7 +4300,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
  
      const first = yield* s.resumePaused
      yield* s.session.prompt({ sessionID, text: "First steer" })
-@@ -4440,7 +4480,7 @@ describe("SessionRunnerLLM", () => {
+@@ -4466,7 +4506,7 @@ describe("SessionRunnerLLM", () => {
      yield* s.session.wait(sessionID)
    })
  
@@ -3672,7 +4309,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      yield* s.admit("Recover interrupted tool")
      yield* SessionInbox.promote(s.db, s.bus, sessionID, "steer")
      const assistantMessageID = SessionMessage.ID.create()
-@@ -4472,22 +4512,18 @@ describe("SessionRunnerLLM", () => {
+@@ -4498,22 +4538,18 @@ describe("SessionRunnerLLM", () => {
      })
      s.requests.length = 0
      yield* s.llm.push([])
@@ -3699,7 +4336,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      yield* s.admit("Recover interrupted subagent")
      yield* SessionInbox.promote(s.db, s.bus, sessionID, "steer")
      const assistantMessageID = SessionMessage.ID.create()
-@@ -4531,7 +4567,7 @@ describe("SessionRunnerLLM", () => {
+@@ -4557,7 +4593,7 @@ describe("SessionRunnerLLM", () => {
        .pipe(Effect.orDie)
      s.requests.length = 0
      yield* s.llm.push([])
@@ -3708,7 +4345,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
  
      expect(yield* s.context).toMatchObject([
        Expected.user("Recover interrupted subagent"),
-@@ -4540,20 +4576,20 @@ describe("SessionRunnerLLM", () => {
+@@ -4566,20 +4602,20 @@ describe("SessionRunnerLLM", () => {
            { id: "call-interrupted-subagent" },
            {
              error: {
@@ -3734,7 +4371,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      yield* s.admit("Recover interrupted hosted tool")
      yield* SessionInbox.promote(s.db, s.bus, sessionID, "steer")
      const assistantMessageID = SessionMessage.ID.create()
-@@ -4586,18 +4622,13 @@ describe("SessionRunnerLLM", () => {
+@@ -4612,18 +4648,13 @@ describe("SessionRunnerLLM", () => {
      })
      s.requests.length = 0
      yield* s.llm.push([])
@@ -3760,7 +4397,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      ])
    })
  
-@@ -4658,7 +4689,7 @@ describe("SessionRunnerLLM", () => {
+@@ -4684,7 +4715,7 @@ describe("SessionRunnerLLM", () => {
      expect(yield* s.resume.pipe(Effect.catchDefect(Effect.succeed))).toBe(defect)
      fail = false
      s.requests.length = 0
@@ -3769,7 +4406,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
  
      const stream = yield* s.llm.gate
      yield* execution.wake(sessionID)
-@@ -4783,6 +4814,77 @@ describe("SessionRunnerLLM", () => {
+@@ -4809,6 +4840,77 @@ describe("SessionRunnerLLM", () => {
      expect(s.requests).toHaveLength(2)
    })
  
@@ -3847,7 +4484,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
    scenario("durably settles local tool failures before continuing", function* (s) {
      yield* s.admit("Call missing")
  
-@@ -4808,29 +4910,24 @@ describe("SessionRunnerLLM", () => {
+@@ -4834,29 +4936,24 @@ describe("SessionRunnerLLM", () => {
      ])
    })
  
@@ -3886,7 +4523,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      ])
    })
  
-@@ -4854,7 +4951,7 @@ describe("SessionRunnerLLM", () => {
+@@ -4880,7 +4977,7 @@ describe("SessionRunnerLLM", () => {
      )
      yield* s.admit("Call blocked")
  
@@ -3895,7 +4532,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
  
      yield* s.resume
  
-@@ -4928,7 +5025,7 @@ describe("SessionRunnerLLM", () => {
+@@ -4954,7 +5051,7 @@ describe("SessionRunnerLLM", () => {
            output: Schema.Struct({}),
            execute: () =>
              Effect.fail(new Permission.CorrectedError({ feedback: "Use another tool" })).pipe(
@@ -3904,7 +4541,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
              ),
          },
        },
-@@ -4936,7 +5033,7 @@ describe("SessionRunnerLLM", () => {
+@@ -4962,7 +5059,7 @@ describe("SessionRunnerLLM", () => {
      )
      yield* s.admit("Call corrected")
  
@@ -3913,7 +4550,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
  
      yield* s.resume
  
-@@ -4944,24 +5041,25 @@ describe("SessionRunnerLLM", () => {
+@@ -4970,24 +5067,25 @@ describe("SessionRunnerLLM", () => {
      expect(yield* s.context).toMatchObject([
        Expected.user("Call corrected"),
        Expected.assistant({}, [
@@ -3947,7 +4584,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      expect(yield* s.context).toMatchObject([
        { type: "user" },
        Expected.assistant({}, [
-@@ -4975,9 +5073,8 @@ describe("SessionRunnerLLM", () => {
+@@ -5001,9 +5099,8 @@ describe("SessionRunnerLLM", () => {
            },
          ),
        ]),
@@ -3958,7 +4595,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
    })
  
    scenario("interrupts runner continuation when a question is cancelled", function* (s) {
-@@ -5016,6 +5113,47 @@ describe("SessionRunnerLLM", () => {
+@@ -5042,6 +5139,47 @@ describe("SessionRunnerLLM", () => {
      ])
    })
  
@@ -4006,7 +4643,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
    scenario("awaits started local tools before surfacing provider stream failure", function* (s) {
      yield* s.admit("Settle before failing")
      // Non-retryable so the step settles terminally instead of continuing after tool output.
-@@ -5070,10 +5208,7 @@ describe("SessionRunnerLLM", () => {
+@@ -5096,10 +5234,7 @@ describe("SessionRunnerLLM", () => {
      expect(context).toMatchObject([
        Expected.user("Interrupt blocked tool"),
        Expected.assistant({}, [
@@ -4018,7 +4655,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
        ]),
      ])
      const assistant = requireAssistant(context)
-@@ -5092,8 +5227,8 @@ describe("SessionRunnerLLM", () => {
+@@ -5118,8 +5253,8 @@ describe("SessionRunnerLLM", () => {
      ])
      s.requests.length = 0
      yield* s.llm.push([])
@@ -4029,7 +4666,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
    })
  
    scenario("interrupts a blocked step without local tool execution", function* (s) {
-@@ -5136,10 +5271,7 @@ describe("SessionRunnerLLM", () => {
+@@ -5162,10 +5297,7 @@ describe("SessionRunnerLLM", () => {
      expect(yield* s.context).toMatchObject([
        Expected.user("Interrupt tool settlement"),
        Expected.assistant({ finish: "error", error: { type: "aborted", message: "Step interrupted" } }, [
@@ -4041,7 +4678,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
        ]),
      ])
      const eventTypes = yield* recordedEventTypes(sessionID)
-@@ -5195,7 +5327,7 @@ describe("SessionRunnerLLM", () => {
+@@ -5221,7 +5353,7 @@ describe("SessionRunnerLLM", () => {
      yield* s.llm.push(
        TestLLM.tool("call-before-steer", "echo", { text: "before" }),
        TestLLM.tool("call-after-steer", "echo", { text: "after" }),
@@ -4050,7 +4687,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      )
  
      const run = yield* s.resumePaused
-@@ -5777,7 +5909,99 @@ describe("SessionRunnerLLM", () => {
+@@ -5803,7 +5935,99 @@ describe("SessionRunnerLLM", () => {
      ])
    })
  
@@ -4151,7 +4788,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      yield* s.admit("Continue after tool defect")
      yield* s.llm.push(
        TestLLM.failAfter(
-@@ -5788,24 +6012,14 @@ describe("SessionRunnerLLM", () => {
+@@ -5814,24 +6038,14 @@ describe("SessionRunnerLLM", () => {
      )
      yield* s.llm.push(TestLLM.text("Recovered", "tool-defect-recovery"))
  
@@ -4183,7 +4820,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
    })
  
    scenario(
-@@ -5922,7 +6136,10 @@ describe("SessionRunnerLLM", () => {
+@@ -5948,7 +6162,10 @@ describe("SessionRunnerLLM", () => {
      yield* s.admit("Retry without consuming a step")
      const failure = providerUnavailable()
      yield* s.llm.push(Stream.fail(failure))
@@ -4195,7 +4832,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
  
      const scheduled = yield* subscribeRetries(s)
      const run = yield* s.resume.pipe(Effect.forkChild)
-@@ -5978,7 +6195,7 @@ describe("SessionRunnerLLM", () => {
+@@ -6004,7 +6221,7 @@ describe("SessionRunnerLLM", () => {
      expect(yield* s.runPrompt("Call a malformed tool").pipe(Effect.flip)).toBe(failure)
      const assistant = requireAssistant(yield* s.context)
  
@@ -4204,7 +4841,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      yield* s.runPrompt("Continue")
  
      expect(yield* recordedStepSettlementEvents(sessionID, assistant.id)).toMatchObject([
-@@ -6011,7 +6228,7 @@ describe("SessionRunnerLLM", () => {
+@@ -6037,7 +6254,7 @@ describe("SessionRunnerLLM", () => {
            raw,
          }),
        ),
@@ -4213,7 +4850,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      )
  
      yield* s.runPrompt("Recover malformed tool input")
-@@ -6097,7 +6314,7 @@ describe("SessionRunnerLLM", () => {
+@@ -6123,7 +6340,7 @@ describe("SessionRunnerLLM", () => {
            raw: '{"text":"partial',
          }),
        ),
@@ -4222,7 +4859,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      )
  
      const run = yield* s.resume.pipe(Effect.forkChild)
-@@ -6149,7 +6366,7 @@ describe("SessionRunnerLLM", () => {
+@@ -6175,7 +6392,7 @@ describe("SessionRunnerLLM", () => {
      expect(yield* s.context).toMatchObject([
        Expected.user("Interrupt malformed recovery"),
        Expected.assistant({ error: { type: "aborted", message: "Step interrupted" } }, [
@@ -4231,7 +4868,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
          Expected.failedTool({ id: "call-malformed" }, {}),
        ]),
      ])
-@@ -6214,7 +6431,7 @@ describe("SessionRunnerLLM", () => {
+@@ -6240,7 +6457,7 @@ describe("SessionRunnerLLM", () => {
        malformed("call-first"),
        TestLLM.tool("call-valid-between", "echo", { text: "valid" }),
        malformed("call-second"),
@@ -4240,7 +4877,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      )
  
      yield* s.runPrompt("Keep producing malformed tools")
-@@ -6306,7 +6523,9 @@ describe("SessionRunnerLLM", () => {
+@@ -6332,7 +6549,9 @@ describe("SessionRunnerLLM", () => {
        LLMEvent.providerError({ message: "Provider unavailable" }),
      ])
  
@@ -4251,7 +4888,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
  
      const context = yield* s.context
      const assistant = requireAssistant(context)
-@@ -6317,7 +6536,7 @@ describe("SessionRunnerLLM", () => {
+@@ -6343,7 +6562,7 @@ describe("SessionRunnerLLM", () => {
        "session.tool.failed.2",
        "session.step.failed.1",
      ])
@@ -4260,7 +4897,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
    })
  
    scenario("preserves the provider failure when tool output persistence also fails", function* (s) {
-@@ -6349,7 +6568,7 @@ describe("SessionRunnerLLM", () => {
+@@ -6375,7 +6594,7 @@ describe("SessionRunnerLLM", () => {
      yield* s.llm.push([LLMEvent.stepStart({ index: 0 }), hostedCall("call-hosted-eof", "effect")])
  
      expect((yield* s.runPrompt("Fail hosted tool at EOF").pipe(Effect.flip)).message).toBe(
@@ -4269,7 +4906,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      )
      const assistant = requireAssistant(yield* s.context)
      const events = yield* recordedStepSettlementEvents(sessionID, assistant.id)
-@@ -6366,16 +6585,16 @@ describe("SessionRunnerLLM", () => {
+@@ -6392,16 +6611,16 @@ describe("SessionRunnerLLM", () => {
  
      expect(yield* s.context).toMatchObject([
        Expected.user("Fail hosted tool at EOF"),
@@ -4289,7 +4926,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
  
      const assistant = requireAssistant(yield* s.context)
      const events = yield* recordedStepSettlementEvents(sessionID, assistant.id)
-@@ -6383,7 +6602,7 @@ describe("SessionRunnerLLM", () => {
+@@ -6409,7 +6628,7 @@ describe("SessionRunnerLLM", () => {
        "session.step.started.1",
        "session.tool.called.1",
        "session.tool.failed.2",
@@ -4298,7 +4935,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
      ])
      expect(
        events.filter((event) => event.type.startsWith("session.step.") && event.type !== "session.step.started.1"),
-@@ -6409,7 +6628,9 @@ describe("SessionRunnerLLM", () => {
+@@ -6435,7 +6654,9 @@ describe("SessionRunnerLLM", () => {
      const run = yield* s.resume.pipe(Effect.forkChild)
      yield* Deferred.await(providerFailed)
      yield* tools.release
@@ -4309,7 +4946,7 @@ index ce6058c372049fd0b59e6e3cd8e11fbcf6ce5afc..6fdf4bf8eceeede902cd9dd95240999f
  
      const assistant = requireAssistant(yield* s.context)
      const events = yield* recordedStepSettlementEvents(sessionID, assistant.id)
-@@ -6550,7 +6771,7 @@ describe("SessionRunnerLLM", () => {
+@@ -6576,7 +6797,7 @@ describe("SessionRunnerLLM", () => {
        ),
      )
  
@@ -4656,406 +5293,15 @@ index f0201e6cb683fc2723252f391ec71895a5cf1997..8753eca09b9e273f25d0315aeedbc267
      })
      expect(content[2]).toMatchObject({
 diff --git a/packages/gui-extensions/src/terminal/terminal.tsx b/packages/gui-extensions/src/terminal/terminal.tsx
-index 18be662a04abe375353f49becd0baebe25f5607a..1a4104c680d2e5f76cef44b8cb49513040abba9a 100644
+index a57a0d4d9263bdd89918605a4684e98cc9915bb2..3ed2cc080b5c8ee7925a9cde19b751d2b8a3e9f2 100644
 --- a/packages/gui-extensions/src/terminal/terminal.tsx
 +++ b/packages/gui-extensions/src/terminal/terminal.tsx
-@@ -561,7 +561,7 @@ export const Terminal = (props: TerminalProps) => {
+@@ -648,7 +648,7 @@ export const Terminal = (props: TerminalProps) => {
              cursor: seek,
            })
            .catch((err) => {
 -            fail(err)
 +            retry(err)
+ 
              return undefined
            })
-         if (!socket || once.value) return
-diff --git a/packages/tui/src/routes/session/rows.ts b/packages/tui/src/routes/session/rows.ts
-index 8160e4ae5fc702d7cfccc2038d969627a1cac398..52e45c94a30887c4710682ca34cae102abfeb818 100644
---- a/packages/tui/src/routes/session/rows.ts
-+++ b/packages/tui/src/routes/session/rows.ts
-@@ -21,6 +21,7 @@ import {
-   type Verbosity,
-   defaultVerbosity,
- } from "./grouping/session"
-+import { groupID } from "./anchors"
- export type { CacheUsage, PartRef, SessionRow } from "./grouping/session"
- 
- /**
-@@ -47,7 +48,7 @@ export function createSessionRows(sessionID: Accessor<string>, onSynced?: (sessi
-   const data = useData()
-   const client = useClient()
-   const config = useConfig()
--  const [rows, setRows] = createStore<SessionRow[]>([])
-+  const [rows, setRows] = createStore<(SessionRow & { key?: string })[]>([])
-   const revertBoundary = () => data.session.get(sessionID())?.revert?.messageID
-   const turnTokens = () => Boolean(config.data.debug?.turn_tokens)
-   const verbosity = () => config.data.session?.verbosity ?? defaultVerbosity
-@@ -79,6 +80,25 @@ export function createSessionRows(sessionID: Accessor<string>, onSynced?: (sessi
-     return rows
-   }
- 
-+  // Rows have no `id`, Solid's default reconcile key. Matching by position instead would move every
-+  // row into another store object whenever older history is prepended, remounting the whole transcript.
-+  // Rows inserted live carry no key, so key the current rows too before matching.
-+  function rebuild() {
-+    setRows(
-+      produce((draft) => {
-+        draft.forEach((row) => {
-+          row.key = rowKey(row)
-+        })
-+      }),
-+    )
-+    setRows(
-+      reconcile(
-+        reduce().map((row) => ({ ...row, key: rowKey(row) })),
-+        { key: "key" },
-+      ),
-+    )
-+  }
-+
-   function pendingPermissions() {
-     return new Set(
-       (data.session.permission.list(sessionID()) ?? []).flatMap((request) =>
-@@ -99,13 +119,13 @@ export function createSessionRows(sessionID: Accessor<string>, onSynced?: (sessi
-   createEffect(
-     on([sessionID, () => client.connection.status()], ([id, status]) => {
-       if (status !== "connected") return
--      setRows(reconcile(reduce()))
-+      rebuild()
-       void data.session.pending.sync(id).catch(() => undefined)
-       void data.session.message
-         .sync(id)
-         .then(async () => {
-           if (sessionID() !== id) return
--          setRows(reconcile(reduce()))
-+          rebuild()
-           // Restoration waits for complete boundary groups so saved group IDs resolve.
-           await completeGroupBoundary({
-             rows,
-@@ -122,15 +142,7 @@ export function createSessionRows(sessionID: Accessor<string>, onSynced?: (sessi
- 
-   // Re-reduce when the revert boundary changes (stage/clear/commit). These reactions defer
-   // their first run: the mount effect above has already reduced the same state.
--  createEffect(
--    on(
--      revertBoundary,
--      () => {
--        setRows(reconcile(reduce()))
--      },
--      { defer: true },
--    ),
--  )
-+  createEffect(on(revertBoundary, rebuild, { defer: true }))
- 
-   createEffect(
-     on(
-@@ -140,7 +152,7 @@ export function createSessionRows(sessionID: Accessor<string>, onSynced?: (sessi
-           if (item.type === "user" && item.delivery === "queue") return [`${item.id}:queue`]
-           return []
-         }),
--      () => setRows(reconcile(reduce())),
-+      rebuild,
-       { defer: true },
-     ),
-   )
-@@ -166,12 +178,12 @@ export function createSessionRows(sessionID: Accessor<string>, onSynced?: (sessi
-                 ]
-               : [],
-         ),
--      () => setRows(reconcile(reduce())),
-+      rebuild,
-       { defer: true },
-     ),
-   )
- 
--  createEffect(on([turnTokens, verbosity], () => setRows(reconcile(reduce())), { defer: true }))
-+  createEffect(on([turnTokens, verbosity], rebuild, { defer: true }))
- 
-   const appendMessage = (messageID: string) =>
-     setRows(
-@@ -297,12 +309,12 @@ export function createSessionRows(sessionID: Accessor<string>, onSynced?: (sessi
-     data.on("session.step.ended", (event) => {
-       if (event.data.sessionID !== sessionID() || ["tool-calls", "unknown"].includes(event.data.finish)) return
-       appendFooter(event.data.assistantMessageID)
--      if (turnTokens()) setRows(reconcile(reduce()))
-+      if (turnTokens()) rebuild()
-     }),
-     data.on("session.step.failed", (event) => {
-       if (event.data.sessionID !== sessionID()) return
-       appendFooter(event.data.assistantMessageID)
--      if (turnTokens()) setRows(reconcile(reduce()))
-+      if (turnTokens()) rebuild()
-     }),
-   ]
-   onCleanup(() => subscriptions.forEach((unsubscribe) => unsubscribe()))
-@@ -310,6 +322,24 @@ export function createSessionRows(sessionID: Accessor<string>, onSynced?: (sessi
-   return rows
- }
- 
-+function rowKey(row: SessionRow) {
-+  switch (row.type) {
-+    case "group":
-+      return groupID(row, 0)
-+    case "part":
-+      return JSON.stringify([row.type, row.ref.messageID, row.ref.partID])
-+    case "message":
-+    case "assistant-footer":
-+      return JSON.stringify([row.type, row.messageID])
-+    case "compaction-queued":
-+      return JSON.stringify([row.type, row.inboxID])
-+    case "turn-usage":
-+      return JSON.stringify([row.type, row.messageIDs[0]])
-+    default:
-+      return row satisfies never
-+  }
-+}
-+
- export function reduceSessionRows(
-   messages: SessionMessageInfo[],
-   inputs = new Set<string>(),
-diff --git a/packages/tui/test/cli/tui/data.test.tsx b/packages/tui/test/cli/tui/data.test.tsx
-index 2ff9e6d92175983ad82cc2690d7c00a6b89862a6..91683f14238d5dfcfa74df05db877d85ce740cf9 100644
---- a/packages/tui/test/cli/tui/data.test.tsx
-+++ b/packages/tui/test/cli/tui/data.test.tsx
-@@ -851,7 +851,7 @@ test("reconnects the event stream and resyncs active data", async () => {
-   }
- })
- 
--test("completes exploration when a queued prompt is promoted", async () => {
-+test("completes exploration and keeps live rows when a queued prompt is promoted", async () => {
-   const events = createEventStream()
-   const sessionID = "session-promotion"
-   const calls = createFetch((url) => {
-@@ -859,10 +859,16 @@ test("completes exploration when a queued prompt is promoted", async () => {
-   }, events)
-   let rows!: ReturnType<typeof createSessionRows>
-   let client!: ReturnType<typeof useClient>
-+  let data!: ReturnType<typeof useData>
-+  let synced = false
- 
-   function Probe() {
-     client = useClient()
--    rows = createSessionRows(() => sessionID)
-+    data = useData()
-+    rows = createSessionRows(
-+      () => sessionID,
-+      () => (synced = true),
-+    )
-     return <box />
-   }
- 
-@@ -880,6 +886,9 @@ test("completes exploration when a queued prompt is promoted", async () => {
- 
-   try {
-     await wait(() => client.connection.status() === "connected")
-+    // Rebuilds from the history sync and the new assistant message must land before the parts stream in,
-+    // as they do live; otherwise those rebuilds, not the live append, create the part rows.
-+    await wait(() => synced)
-     emitEvent(events, {
-       id: "evt_step_started",
-       created: 1,
-@@ -893,11 +902,25 @@ test("completes exploration when a queued prompt is promoted", async () => {
-         model: { id: "model", providerID: "provider" },
-       },
-     })
-+    await wait(() => data.session.message.get(sessionID, "message-assistant") !== undefined)
-+    emitEvent(events, {
-+      id: "evt_text_started",
-+      created: 1,
-+      type: "session.text.started",
-+      durable: durable(sessionID, 1),
-+      data: { sessionID, assistantMessageID: "message-assistant", ordinal: 0 },
-+    })
-+    emitEvent(events, {
-+      id: "evt_text_delta",
-+      created: 1,
-+      type: "session.text.delta",
-+      data: { sessionID, assistantMessageID: "message-assistant", ordinal: 0, delta: "Looking" },
-+    })
-     emitEvent(events, {
-       id: "evt_tool_started",
-       created: 2,
-       type: "session.tool.input.started",
--      durable: durable(sessionID, 1),
-+      durable: durable(sessionID, 2),
-       data: {
-         sessionID,
-         assistantMessageID: "message-assistant",
-@@ -906,12 +929,13 @@ test("completes exploration when a queued prompt is promoted", async () => {
-       },
-     })
-     await wait(() => rows.some((row) => row.type === "group" && !row.completed))
-+    const text = rows.find((row) => row.type === "part")
- 
-     emitEvent(events, {
-       id: "evt_prompt_admitted",
-       created: 3,
-       type: "session.inbox.enqueued",
--      durable: durable(sessionID, 2),
-+      durable: durable(sessionID, 3),
-       data: {
-         sessionID,
-         inboxID: "message-user",
-@@ -925,14 +949,17 @@ test("completes exploration when a queued prompt is promoted", async () => {
-       id: "evt_prompt_promoted",
-       created: 4,
-       type: "session.inbox.delivered",
--      durable: durable(sessionID, 3),
-+      durable: durable(sessionID, 4),
-       data: {
-         sessionID,
-         inboxID: "message-user",
-       },
-     })
-     await wait(() => rows.find((row) => row.type === "group")?.completed === true)
--    expect(rows.at(-1)).toEqual({ type: "message", messageID: "message-user" })
-+    expect(rows.at(-1)).toMatchObject({ type: "message", messageID: "message-user" })
-+    // Promotion rebuilds every row; the live text must keep its store object or it remounts.
-+    expect(text).toMatchObject({ type: "part", ref: { messageID: "message-assistant", partID: "text:0" } })
-+    expect(rows.find((row) => row.type === "part")).toBe(text)
-   } finally {
-     app.renderer.destroy()
-   }
-@@ -981,7 +1008,7 @@ test("updates and removes queued inputs from durable lifecycle events", async ()
-       },
-     })
-     await wait(() => data.session.pending.list(sessionID).length === 1)
--    expect(rows).not.toContainEqual({ type: "message", messageID: "message-queued" })
-+    expect(rows).not.toContainEqual(expect.objectContaining({ type: "message", messageID: "message-queued" }))
- 
-     emitEvent(events, {
-       id: "evt_queue_steered",
-@@ -995,7 +1022,7 @@ test("updates and removes queued inputs from durable lifecycle events", async ()
-         .list(sessionID)
-         .some((item) => item.id === "message-queued" && item.type !== "compaction" && item.delivery === "steer"),
-     )
--    expect(rows).toContainEqual({ type: "message", messageID: "message-queued" })
-+    expect(rows).toContainEqual(expect.objectContaining({ type: "message", messageID: "message-queued" }))
- 
-     emitEvent(events, {
-       id: "evt_queue_restored",
-@@ -1009,7 +1036,7 @@ test("updates and removes queued inputs from durable lifecycle events", async ()
-         .list(sessionID)
-         .some((item) => item.id === "message-queued" && item.type !== "compaction" && item.delivery === "queue"),
-     )
--    expect(rows).not.toContainEqual({ type: "message", messageID: "message-queued" })
-+    expect(rows).not.toContainEqual(expect.objectContaining({ type: "message", messageID: "message-queued" }))
- 
-     emitEvent(events, {
-       id: "evt_cancel_admitted",
-@@ -1081,17 +1108,19 @@ test("classifies live tool rows independently of their call ID", async () => {
-     })
- 
-     await wait(() => rows.length > 0)
--    expect(rows).toEqual([{ type: "part", ref: { messageID: "message-assistant", partID: "reasoning:0" } }])
-+    expect(unwrap(rows)).toMatchObject([
-+      { type: "part", ref: { messageID: "message-assistant", partID: "reasoning:0" } },
-+    ])
-   } finally {
-     app.renderer.destroy()
-   }
- })
- 
--test("loads older pages until the oldest exploration group is complete before reporting sync", async () => {
-+test("loads older pages until the oldest exploration group is complete before reporting sync and keeps existing rows", async () => {
-   const events = createEventStream()
-   const sessionID = "session-boundary"
-   const model = { id: "model", providerID: "provider" }
--  // One prompt, then 50 single-read steps: the 20-message first page cuts the group.
-+  // One prompt, 50 single-read steps, then an answer: the 20-message first page cuts the group.
-   const history = [
-     { type: "user", id: "msg_000", text: "Explore", time: { created: 0 } },
-     ...Array.from({ length: 50 }, (_, index) => ({
-@@ -1111,11 +1140,23 @@ test("loads older pages until the oldest exploration group is complete before re
-         },
-       ],
-     })),
-+    {
-+      type: "assistant",
-+      id: "msg_051",
-+      agent: "build",
-+      model,
-+      time: { created: 51, completed: 51 },
-+      finish: "stop",
-+      content: [{ type: "text", text: "Done" }],
-+    },
-   ]
-   const pages: string[] = []
--  const calls = createFetch((url) => {
-+  const older = Promise.withResolvers<void>()
-+  const calls = createFetch(async (url) => {
-     if (url.pathname !== `/api/session/${sessionID}/message`) return
--    const end = Number(url.searchParams.get("cursor") ?? history.length)
-+    const cursor = url.searchParams.get("cursor")
-+    if (cursor) await older.promise
-+    const end = Number(cursor ?? history.length)
-     const start = Math.max(0, end - Number(url.searchParams.get("limit") ?? 20))
-     pages.push(`${start}-${end}`)
-     return json({ data: history.slice(start, end).toReversed(), cursor: start > 0 ? { next: String(start) } : {} })
-@@ -1147,14 +1188,20 @@ test("loads older pages until the oldest exploration group is complete before re
- 
-   try {
-     await wait(() => client.connection.status() === "connected")
-+    const answer = () => rows.find((row) => row.type === "part" && row.ref.messageID === "msg_051")
-+    await wait(() => answer() !== undefined)
-+    const mounted = answer()
-+    older.resolve()
-     await wait(() => synced.length > 0, 4000)
--    expect(pages).toEqual(["31-51", "11-31", "0-11"])
-+    expect(pages).toEqual(["32-52", "12-32", "0-12"])
-     // Sync is reported only once the group's true first read is loaded.
--    expect(synced[0]).toEqual({ type: "message", messageID: "msg_000" })
-+    expect(synced[0]).toMatchObject({ type: "message", messageID: "msg_000" })
-     const group = rows[1]
-     if (group?.type !== "group") throw new Error("Expected exploration group")
-     expect(group.size).toBe(50)
-     expect(groupRefs(group)[0]).toEqual({ messageID: "msg_001", partID: "read-0" })
-+    // The transcript keys rows by store object, so a new object would remount the answer.
-+    expect(answer()).toBe(mounted)
-   } finally {
-     app.renderer.destroy()
-   }
-@@ -1604,7 +1651,7 @@ test("tracks session status from active sessions and execution events", async ()
-       const message = data.session.message.get("session-manual", "message-compaction")
-       return message?.type === "compaction" && message.status === "completed"
-     })
--    expect(manualRows.filter((row) => row.type === "message")).toEqual([
-+    expect(manualRows.filter((row) => row.type === "message")).toMatchObject([
-       { type: "message", messageID: "message-compaction" },
-     ])
-     expect(manualRows.find((row) => row.type === "message" && row.messageID === "message-compaction")).toBe(
-@@ -1707,7 +1754,7 @@ test.each(["before", "between", "after"])("shows compaction admitted %s steers i
-       }),
-     )
-     await wait(() => rows.length === 3)
--    expect(rows).toEqual([
-+    expect(unwrap(rows)).toMatchObject([
-       { type: "compaction-queued", inboxID: "compact" },
-       { type: "message", messageID: "a" },
-       { type: "message", messageID: "b" },
-@@ -1720,7 +1767,7 @@ test.each(["before", "between", "after"])("shows compaction admitted %s steers i
-       data: { sessionID, reason: "manual", recent: "", inputID: "compact" },
-     })
-     await wait(() => rows[0]?.type === "message")
--    expect(rows).toEqual(["compact", "a", "b"].map((messageID) => ({ type: "message", messageID })))
-+    expect(unwrap(rows)).toMatchObject(["compact", "a", "b"].map((messageID) => ({ type: "message", messageID })))
-     emitEvent(events, {
-       id: "evt_compaction_ended",
-       created: 5,
-@@ -1738,7 +1785,7 @@ test.each(["before", "between", "after"])("shows compaction admitted %s steers i
-       })
-     }
-     await app.renderOnce()
--    expect(rows).toEqual(["compact", "a", "b"].map((messageID) => ({ type: "message", messageID })))
-+    expect(unwrap(rows)).toMatchObject(["compact", "a", "b"].map((messageID) => ({ type: "message", messageID })))
-   } finally {
-     app.renderer.destroy()
-   }
-@@ -1800,7 +1847,7 @@ test("restores queued compaction from durable pending input", async () => {
-       "message-compaction-later",
-     ])
-     await wait(() => rows.filter((row) => row.type === "compaction-queued").length === 2)
--    expect(rows.filter((row) => row.type === "compaction-queued")).toEqual([
-+    expect(rows.filter((row) => row.type === "compaction-queued")).toMatchObject([
-       { type: "compaction-queued", inboxID: "message-compaction-queued" },
-       { type: "compaction-queued", inboxID: "message-compaction-later" },
-     ])

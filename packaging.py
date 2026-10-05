@@ -167,7 +167,7 @@ def smoke_ui(binary, arch):
 def smoke(binary, arch, version):
     check_elf(binary, arch)
     actual = run(runner(arch) + [str(binary), '--version'], env={'SHELL': '/bin/bash'}).strip()
-    if actual != version.split('-')[0]:
+    if actual != 'opencode v' + version.split('-')[0]:
         raise ValueError('Binary version mismatch: ' + actual)
     if not run(runner(arch) + [str(binary), '--help'], env={'SHELL': '/bin/bash'}).strip():
         raise ValueError('Empty CLI help')
