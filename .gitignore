@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+dist/
+src/
+pkg/
+*.pkg.tar.*
+*.deb
+opencode-*.tar.gz

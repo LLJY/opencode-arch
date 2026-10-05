@@ -1,0 +1,20 @@
+{
+  "track": "v2-main-only",
+  "version": "2.0.22",
+  "revision": 1,
+  "bun": "1.4.2",
+  "source_approved": true,
+  "upstream_commit": "527f0b931d1f9b3ebd34e106c51b31ce5db5b075",
+  "upstream_tree": "33e613caf8af5b39ad6a6d5d415365faf49c650a",
+  "source_tree": "a7bbcfe9a24aadbc9b0125a870a25f313fb279a5",
+  "source_epoch": 1790914978,
+  "source_url": "https://codeload.github.com/anomalyco/opencode/tar.gz/527f0b931d1f9b3ebd34e106c51b31ce5db5b075",
+  "source_sha256": "910b87aa2521583773312e207bf6a9e7990ebb7cb70d6e7aa928a2b6b5573641",
+  "patch_sha256": "009e46adedb3b0ed102a64ae7db8d50645a58c2815f32542996560370b1f5f2e",
+  "patch_ref": "v2.0.22-downstream-patch",
+  "approval_note": "Independent exact-byte source gate: terminal PASS. Canonical committed source and remote branch HEAD verified. Packaging checker, packaging commit, actual matrix builds/validation and publication remain separately gated; no builds authorized by this checkpoint.",
+  "source_commit": "c0f3281662f1f00a81113c3a74069cdb176725a6",
+  "source_remote": "https://github.com/LLJY/opencode.git",
+  "source_remote_ref": "refs/heads/v2.0.22-downstream-patch",
+  "source_remote_head": "c0f3281662f1f00a81113c3a74069cdb176725a6"
+}

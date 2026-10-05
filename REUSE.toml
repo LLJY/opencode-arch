@@ -23,3 +23,18 @@ path = [
 ]
 SPDX-FileCopyrightText = "Arch Linux contributors"
 SPDX-License-Identifier = "0BSD"
+
+[[annotations]]
+path = [
+    ".dockerignore", "Dockerfile.*", "PACKAGING.md", "release.json",
+    "packaging.py", "tests/**", "build-deb", "build-deb-docker",
+    "build-makepkg-docker", "validate-arch", "validate-deb",
+    "validate-ubuntu-arm64", "validate-ubuntu-arm64-docker",
+]
+SPDX-FileCopyrightText = "opencode downstream maintainers"
+SPDX-License-Identifier = "0BSD"
+
+[[annotations]]
+path = ["downstream-2.0.22.patch"]
+SPDX-FileCopyrightText = "opencode contributors"
+SPDX-License-Identifier = "MIT"

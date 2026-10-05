@@ -1,0 +1,16 @@
+*
+!PKGBUILD
+!.SRCINFO
+!release.json
+!packaging.py
+!downstream-2.0.22.patch
+!Dockerfile.*
+!build-deb
+!build-deb-docker
+!build-makepkg-docker
+!validate-deb
+!validate-arch
+!validate-ubuntu-arm64
+!validate-ubuntu-arm64-docker
+!LICENSE
+!PACKAGING.md

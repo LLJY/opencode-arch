@@ -1,0 +1,15 @@
+FROM oven/bun:1.4.2@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895 AS bun-toolchain
+FROM archlinux:base-devel@sha256:61f7de2dd88cc4ba1fe36c24cfe1a503c3936984492d6405eeab013ce6ac68c5
+
+RUN pacman -Syu --noconfirm --needed bun git python binutils curl ripgrep tar \
+    && pacman -Scc --noconfirm \
+    && useradd --create-home --shell /bin/bash builder
+# Satisfy makepkg's bun dependency with Arch's package, but compile only with
+# the exact glibc compiler required by the source; never rewrite packageManager.
+COPY --from=bun-toolchain /usr/local/bin/bun /opt/bun-1.4.2/bin/bun
+ENV PATH="/opt/bun-1.4.2/bin:${PATH}"
+RUN mkdir -p /build && chown builder:builder /build
+COPY --chown=builder:builder . /build
+USER builder
+WORKDIR /build
+CMD ["makepkg", "--noconfirm", "--cleanbuild", "--clean", "--force"]

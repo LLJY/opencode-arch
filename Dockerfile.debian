@@ -1,0 +1,18 @@
+FROM oven/bun:1.4.2@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895
+ARG DEB_ARCH=amd64
+USER root
+RUN if [ "$DEB_ARCH" = arm64 ]; then dpkg --add-architecture arm64; fi \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+      python3 binutils ca-certificates dpkg-dev git curl ripgrep tar \
+    && if [ "$DEB_ARCH" = arm64 ]; then \
+      DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+        libc6:arm64 libstdc++6:arm64 libgcc-s1:arm64 qemu-user-static; \
+    fi \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /pkg /out && chown bun:bun /pkg /out
+COPY --chown=bun:bun . /pkg
+USER bun
+ENV DEB_ARCH=$DEB_ARCH OUT_DIR=/out
+WORKDIR /tmp
+CMD ["/pkg/build-deb"]
