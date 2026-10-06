@@ -6076,7 +6076,7 @@ index a945b66f7e8d7fb4de4821a325e39c0d367711bc..eeee4450d141ea58313381a3cf358314
    const params = yield* input.plugin.trigger(
      "chat.params",
 diff --git a/packages/opencode/src/session/message-v2.ts b/packages/opencode/src/session/message-v2.ts
-index 2bd0e51715898ec1fbd35eac96671619b1e4aecd..c5974beec597df8375cc251790a00441eb49b3b8 100644
+index 75f2d89379d79a847d684ad7def5b7215474dec7..063e0d2a0408993f9827128bced004689c2276b4 100644
 --- a/packages/opencode/src/session/message-v2.ts
 +++ b/packages/opencode/src/session/message-v2.ts
 @@ -17,7 +17,14 @@ import {
@@ -6103,7 +6103,7 @@ index 2bd0e51715898ec1fbd35eac96671619b1e4aecd..c5974beec597df8375cc251790a00441
  import { iife } from "@/util/iife"
  import { errorMessage } from "@/util/error"
  import { isMedia } from "@/util/media"
-@@ -247,15 +255,13 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
+@@ -253,15 +261,13 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
  
      if (msg.info.role === "assistant") {
        const differentModel = `${model.providerID}/${model.id}` !== `${msg.info.providerID}/${msg.info.modelID}`
@@ -6124,7 +6124,7 @@ index 2bd0e51715898ec1fbd35eac96671619b1e4aecd..c5974beec597df8375cc251790a00441
          continue
        }
        const assistantMessage: UIMessage = {
-@@ -280,6 +286,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
+@@ -286,6 +292,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
        })
        for (const part of msg.parts) {
          if (part.type === "text") {
@@ -6132,7 +6132,7 @@ index 2bd0e51715898ec1fbd35eac96671619b1e4aecd..c5974beec597df8375cc251790a00441
            const text = part.text === "" && hasSignedReasoning ? " " : part.text
            assistantMessage.parts.push({
              type: "text",
-@@ -287,7 +294,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
+@@ -293,7 +300,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
              ...(differentModel ? {} : { providerMetadata: part.metadata }),
            })
          }
@@ -6141,7 +6141,7 @@ index 2bd0e51715898ec1fbd35eac96671619b1e4aecd..c5974beec597df8375cc251790a00441
            assistantMessage.parts.push({
              type: "step-start",
            })
-@@ -327,6 +334,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
+@@ -336,6 +343,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
              })
            }
            if (part.state.status === "error") {
@@ -6149,7 +6149,7 @@ index 2bd0e51715898ec1fbd35eac96671619b1e4aecd..c5974beec597df8375cc251790a00441
              const output = part.state.metadata?.interrupted === true ? part.state.metadata.output : undefined
              if (typeof output === "string") {
                assistantMessage.parts.push({
-@@ -352,7 +360,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
+@@ -361,7 +369,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
            }
            // Handle pending/running tool calls to prevent dangling tool_use blocks
            // Anthropic/Claude APIs require every tool_use to have a corresponding tool_result
@@ -6158,7 +6158,7 @@ index 2bd0e51715898ec1fbd35eac96671619b1e4aecd..c5974beec597df8375cc251790a00441
              assistantMessage.parts.push({
                type: ("tool-" + part.tool) as `tool-${string}`,
                state: "output-error",
-@@ -364,6 +372,10 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
+@@ -373,6 +381,10 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
              })
          }
          if (part.type === "reasoning") {
@@ -6169,7 +6169,7 @@ index 2bd0e51715898ec1fbd35eac96671619b1e4aecd..c5974beec597df8375cc251790a00441
            if (differentModel) {
              if (part.text.trim().length > 0)
                assistantMessage.parts.push({
-@@ -426,6 +438,13 @@ export function toModelMessages(
+@@ -435,6 +447,13 @@ export function toModelMessages(
    return Effect.runPromise(toModelMessagesEffect(input, model, options))
  }
  
@@ -6183,7 +6183,7 @@ index 2bd0e51715898ec1fbd35eac96671619b1e4aecd..c5974beec597df8375cc251790a00441
  export const page = Effect.fn("MessageV2.page")(function* (input: {
    sessionID: SessionID
    limit: number
-@@ -607,10 +626,64 @@ function isAfter(info: Info, other?: Info) {
+@@ -616,10 +635,64 @@ function isAfter(info: Info, other?: Info) {
    return info.id > other.id
  }
  
@@ -6249,7 +6249,7 @@ index 2bd0e51715898ec1fbd35eac96671619b1e4aecd..c5974beec597df8375cc251790a00441
    switch (true) {
      case e instanceof DOMException && e.name === "AbortError":
        return new AbortedError(
-@@ -621,6 +694,30 @@ export function fromError(
+@@ -630,6 +703,30 @@ export function fromError(
        ).toObject()
      case OutputLengthError.isInstance(e):
        return e
@@ -6280,7 +6280,7 @@ index 2bd0e51715898ec1fbd35eac96671619b1e4aecd..c5974beec597df8375cc251790a00441
      case LoadAPIKeyError.isInstance(e):
        return new AuthError(
          {
-@@ -657,25 +754,18 @@ export function fromError(
+@@ -666,25 +763,18 @@ export function fromError(
          },
          { cause: e },
        ).toObject()
@@ -6312,7 +6312,7 @@ index 2bd0e51715898ec1fbd35eac96671619b1e4aecd..c5974beec597df8375cc251790a00441
            },
          },
          { cause: e },
-@@ -706,8 +796,19 @@ export function fromError(
+@@ -715,8 +805,19 @@ export function fromError(
          },
          { cause: e },
        ).toObject()
@@ -6333,7 +6333,7 @@ index 2bd0e51715898ec1fbd35eac96671619b1e4aecd..c5974beec597df8375cc251790a00441
      default:
        try {
          const parsed = ProviderError.parseStreamError(e)
-@@ -733,7 +834,10 @@ export function fromError(
+@@ -742,7 +843,10 @@ export function fromError(
            ).toObject()
          }
        } catch {}
@@ -12473,18 +12473,18 @@ index ed0ad2022e217f342c56026b05e4cecbd2424285..06895eab37a8b8c807b033b87792dc21
  
    const minimaxFixture = { providerID: "minimax", modelID: "MiniMax-M2.5" }
 diff --git a/packages/opencode/test/session/message-v2.test.ts b/packages/opencode/test/session/message-v2.test.ts
-index 734a30e4245477d2df62803f85746a6587f953ae..ac50db466fe724997765d41b521347257da700a7 100644
+index 5ee876210ec173a47a61d755e8244e7a37c19a8a..5eea90fa542dda55b50d9923f31a35f30cfe2bff 100644
 --- a/packages/opencode/test/session/message-v2.test.ts
 +++ b/packages/opencode/test/session/message-v2.test.ts
-@@ -1,6 +1,7 @@
- import { describe, expect, test } from "bun:test"
+@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
  import { SessionV1 } from "@opencode-ai/core/v1/session"
- import { APICallError } from "ai"
+ import { createXai } from "@ai-sdk/xai"
+ import { APICallError, generateText } from "ai"
 +import { InvalidRequestReason, LLMError } from "@opencode-ai/llm"
  import { MessageV2 } from "../../src/session/message-v2"
  import { ProviderTransform } from "@/provider/transform"
  import type { Provider } from "@/provider/provider"
-@@ -9,6 +10,7 @@ import { SessionID, MessageID, PartID } from "../../src/session/schema"
+@@ -10,6 +11,7 @@ import { SessionID, MessageID, PartID } from "../../src/session/schema"
  import { Question } from "../../src/question"
  import { ProviderV2 } from "@opencode-ai/core/provider"
  import { ModelV2 } from "@opencode-ai/core/model"
@@ -12492,7 +12492,7 @@ index 734a30e4245477d2df62803f85746a6587f953ae..ac50db466fe724997765d41b52134725
  
  const sessionID = SessionID.make("session")
  const providerID = ProviderV2.ID.make("test")
-@@ -988,7 +990,7 @@ describe("session.message-v2.toModelMessage", () => {
+@@ -1178,7 +1180,7 @@ describe("session.message-v2.toModelMessage", () => {
      expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([])
    })
  
@@ -12501,7 +12501,7 @@ index 734a30e4245477d2df62803f85746a6587f953ae..ac50db466fe724997765d41b52134725
      const assistantID1 = "m-assistant-1"
      const assistantID2 = "m-assistant-2"
  
-@@ -1030,14 +1032,123 @@ describe("session.message-v2.toModelMessage", () => {
+@@ -1220,14 +1222,123 @@ describe("session.message-v2.toModelMessage", () => {
        },
      ]
  
@@ -12627,7 +12627,7 @@ index 734a30e4245477d2df62803f85746a6587f953ae..ac50db466fe724997765d41b52134725
      ])
    })
  
-@@ -1151,6 +1262,53 @@ describe("session.message-v2.toModelMessage", () => {
+@@ -1341,6 +1452,53 @@ describe("session.message-v2.toModelMessage", () => {
      ])
    })
  
@@ -12681,7 +12681,7 @@ index 734a30e4245477d2df62803f85746a6587f953ae..ac50db466fe724997765d41b52134725
    test("drops messages that only contain step-start parts", async () => {
      const assistantID = "m-assistant"
  
-@@ -1488,6 +1646,24 @@ describe("session.message-v2.fromError", () => {
+@@ -1678,6 +1836,24 @@ describe("session.message-v2.fromError", () => {
      expect(SessionV1.ContextOverflowError.isInstance(result)).toBe(true)
    })
  
@@ -12706,7 +12706,7 @@ index 734a30e4245477d2df62803f85746a6587f953ae..ac50db466fe724997765d41b52134725
    test("does not classify 429 no body as context overflow", () => {
      const result = MessageV2.fromError(
        new APICallError({
-@@ -1552,6 +1728,37 @@ describe("session.message-v2.fromError", () => {
+@@ -1742,6 +1918,37 @@ describe("session.message-v2.fromError", () => {
  
      expect(result.name).toBe("MessageAbortedError")
    })

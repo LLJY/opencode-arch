@@ -88,7 +88,7 @@ printf '%s\n' "$UPSTREAM_COMMIT"
         result = self.deb('amd64')
         self.assertEqual(result.returncode, 77, result.stderr)
         self.assertIn('bun run ./script/build.ts --target=linux-x64-baseline --skip-install', self.calls())
-        self.assertIn('version=1.18.34', self.calls())
+        self.assertIn('version=1.18.35', self.calls())
 
     def test_debian_arm64_keeps_all_target_optional_install(self):
         result = self.deb('arm64')
@@ -113,7 +113,7 @@ printf '%s\n' "$UPSTREAM_COMMIT"
         ignore = (ROOT / '.dockerignore').read_text().splitlines()
         self.assertIn('downstream-*.patch', ignore)
         self.assertEqual([line for line in ignore if line.startswith('!downstream-')],
-                         ['!downstream-1.18.34.patch'])
+                         ['!downstream-1.18.35.patch'])
 
 
 if __name__ == '__main__':

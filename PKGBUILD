@@ -1,3 +1,4 @@
+# Preparation only: parent independent source/package GO pending; no builds authorized.
 # Maintainer: Carl Smedstad <carsme@archlinux.org>
 # Maintainer: Sven-Hendrik Haase <svenstaro@archlinux.org>
 
@@ -6,9 +7,9 @@ pkgname=(
   'opencode'
   'opencode-daemon'
 )
-pkgver=1.18.34
+pkgver=1.18.35
 pkgrel=1
-_commit=aec0b9a6d8898f68f923aaf08b7306d931fd9d76
+_commit=53d1eabb61e21162157817bf677da0a4ad3332e3
 _bun_version=1.3.14
 pkgdesc='The open source coding agent'
 arch=('x86_64')
@@ -27,13 +28,13 @@ options=(
 )
 source=(
   "git+$url.git#commit=$_commit"
-  'downstream-1.18.34.patch'
+  'downstream-1.18.35.patch'
   'opencode-daemon'
   'opencode-daemon.service'
   'LICENSE'
 )
 b2sums=('SKIP'
-        '762433ffb31f0559de125f94c078f0ff520451197b51470f4a94b53127babb1bfb1172462801cd747a2ec2d928dd8ee7df46f9ec7b68b5dbf91112a909d19dcf'
+        'df8f6bc85548e776652576489293fd1e592d13f492b49a08c8b3dcf902fc80e290dff52714eb3a587bb7559ccf414e87168f7e0fe21ebc934e982f982c3176bf'
         '14b099d6f6e2fb6445a5ed52eb53928559603bb15ba1d504ab0b953e2ab6d7c238be0c8a93974b8ed288b2e8353b840c743968769b24e1dde661d0412ef381ec'
         'a4662a1e2caf4b5d24e4bd41a023c29d27590f5da0c881d4ee5570327e269a78652d98a4aa29f8286f808edb1e94b814d7eb145ff24f00fbf8eb07363617aaa7'
         'a29664104e1ee73ca0aee1d633e9095d92a57c92787f8d8740bdb7211ba3205782ed8677f539bdb8cae3dd75a3694be3132e185fa3fc4b3f401e1f88eb776101')
@@ -46,7 +47,7 @@ prepare() {
     return 1
   fi
   cd $pkgbase
-  patch -Np1 -i ../downstream-1.18.34.patch
+  patch -Np1 -i ../downstream-1.18.35.patch
   bun install --frozen-lockfile --ignore-scripts
 }
 
