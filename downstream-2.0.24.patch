@@ -1,15 +1,3 @@
-diff --git a/packages/ai/src/providers/google-vertex-messages.ts b/packages/ai/src/providers/google-vertex-messages.ts
-index 33101cc03897ff32840aca612eabc0c2a3afb231..a07d58b36c6244838cebc5c08b1d3b5a0dccbb93 100644
---- a/packages/ai/src/providers/google-vertex-messages.ts
-+++ b/packages/ai/src/providers/google-vertex-messages.ts
-@@ -54,6 +54,7 @@ const route = Route.make({
-         ),
-     },
-     stream: AnthropicMessages.protocol.stream,
-+    supportsEffortUpdates: AnthropicMessages.protocol.supportsEffortUpdates,
-   }),
-   endpoint: Endpoint.path(({ request }) => `/${request.model.id}:streamRawPredict`),
-   auth: Auth.none,
 diff --git a/packages/ai/src/route/client.ts b/packages/ai/src/route/client.ts
 index 7addb1a04266fa09e29de3c030acf9ec8ecd52a4..122416163e7779e8e72260038b7a4ced7866d9bc 100644
 --- a/packages/ai/src/route/client.ts
@@ -334,46 +322,6 @@ index 0000000000000000000000000000000000000000..c130b8e396380b792391f9fafe7597b6
 +  // Leap seconds are offsets, not rolled calendar fields.
 +  return midnight + (hour * 3600 + minute * 60 + second) * 1000
 +}
-diff --git a/packages/ai/test/effort-updates.test.ts b/packages/ai/test/effort-updates.test.ts
-index 9453dd1768afb837c726731b75991b028068ba4e..3031a9886562028f7c06e57494e9b50a9fb1ece4 100644
---- a/packages/ai/test/effort-updates.test.ts
-+++ b/packages/ai/test/effort-updates.test.ts
-@@ -293,20 +293,28 @@ describe("Anthropic Messages effort updates", () => {
-     }),
-   )
- 
--  it.effect("strips markers on the Vertex Anthropic route, whose protocol wrapper does not forward support", () =>
-+  it.effect("lowers markers on the Vertex Anthropic route for models that support them", () =>
-     Effect.gen(function* () {
--      const prepared = yield* compileRequest(
-+      const vertex = GoogleVertexMessages.configure({ accessToken: "test", location: "global", project: "test" })
-+      const opus5 = yield* compileRequest(
-         LLM.request({
--          model: GoogleVertexMessages.configure({ accessToken: "test", location: "global", project: "test" }).model(
--            "claude-opus-5",
--          ),
-+          model: vertex.model("claude-opus-5"),
-+          messages: conversation,
-+          providerOptions: { effort: "low" },
-+        }),
-+      )
-+      const opus48 = yield* compileRequest(
-+        LLM.request({
-+          model: vertex.model("claude-opus-4-8"),
-           messages: conversation,
-           providerOptions: { effort: "low" },
-         }),
-       )
- 
--      expect(systemMessages(prepared.body)).toHaveLength(0)
--      expect(prepared.body.output_config).toEqual({ effort: "low" })
-+      expect(systemMessages(opus5.body)).toEqual([{ role: "system", content: [], output_config: { effort: "low" } }])
-+      expect(opus5.body.output_config).toEqual({ effort: "high" })
-+      expect(systemMessages(opus48.body)).toHaveLength(0)
-+      expect(opus48.body.output_config).toEqual({ effort: "low" })
-     }),
-   )
- })
 diff --git a/packages/ai/test/executor-retry-after.test.ts b/packages/ai/test/executor-retry-after.test.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..3cec1fa43f6d5ce8cd1130d6224264d83fc2b367
@@ -974,10 +922,10 @@ index 0000000000000000000000000000000000000000..9187c4d1ffde83772440a5a712acb71c
 +}, 10_000)
 diff --git a/packages/app/test-browser/terminal-reconnect.test.ts b/packages/app/test-browser/terminal-reconnect.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..d9a2e162d695eb4f879a5e056a6db8f23e0da9b2
+index 0000000000000000000000000000000000000000..24cf3b96be923cf6cd245c3a25bd602d49979d11
 --- /dev/null
 +++ b/packages/app/test-browser/terminal-reconnect.test.ts
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,24 @@
 +import { expect, test } from "bun:test"
 +import { fileURLToPath } from "node:url"
 +
@@ -993,11 +941,13 @@ index 0000000000000000000000000000000000000000..d9a2e162d695eb4f879a5e056a6db8f2
 +    ],
 +    { cwd: fileURLToPath(new URL("..", import.meta.url)), stdout: "pipe", stderr: "pipe" },
 +  )
++
 +  const [status, stdout, stderr] = await Promise.all([
 +    child.exited,
 +    new Response(child.stdout).text(),
 +    new Response(child.stderr).text(),
 +  ])
++
 +  expect(status, stdout + stderr).toBe(0)
 +}, 30_000)
 diff --git a/packages/cli/script/build-args.ts b/packages/cli/script/build-args.ts
@@ -1308,45 +1258,28 @@ index 0000000000000000000000000000000000000000..179d7ba84c2ef0b9ec0e042bf0ec8370
 +    expect(stream.listenerCount("close")).toBe(0)
 +  }
 +})
+diff --git a/packages/client/src/promise/generated/types.ts b/packages/client/src/promise/generated/types.ts
+index 62a6395c9d6d88e2f1782cc43b37ca50cfa73ca4..2be14d396be537e503842e7d3e7b8b61ad9f0ded 100644
+--- a/packages/client/src/promise/generated/types.ts
++++ b/packages/client/src/promise/generated/types.ts
+@@ -1477,6 +1477,8 @@ export type ModelCompatibility = {
+   requireFinishReason?: boolean
+   requireAssistantAfterTool?: boolean
+   supportsPromptCacheKey?: boolean
++  supportsThinkingBlockBinding?: boolean
++  supportsEffortUpdates?: boolean
+ }
+ 
+ export type ModelCost = {
 diff --git a/packages/core/src/aisdk-native.ts b/packages/core/src/aisdk-native.ts
-index f172565a31f4eabb80f3f0a13c400c784636e730..5515bcbcb7872d55cdf624bcc0659d9d7144c545 100644
+index 51d1b509c405f65e75d22e87a08cc7856838fb2f..7768c0f2d19f6d032d5a5507afdbb32adc01e737 100644
 --- a/packages/core/src/aisdk-native.ts
 +++ b/packages/core/src/aisdk-native.ts
-@@ -14,7 +14,12 @@ type Target<ID extends string> = Overlays & {
-   variants?: (Overlays & { id: ID })[]
- }
- 
--type Context = { readonly providerID: string; readonly canonical?: string; readonly modelID?: string }
-+type Context = {
-+  readonly providerID: string
-+  readonly canonical?: string
-+  readonly modelID?: string
-+  readonly shape?: "responses" | "completions"
-+}
- 
- export function rewrite<ID extends string>(
-   target: Target<ID>,
-@@ -126,11 +131,13 @@ export function native(npm: string, context: Context & { readonly settings?: Pro
-   const host = HOSTS[context.providerID]?.[npm]
-   if (host) return host
-   if (npm === "@ai-sdk/amazon-bedrock/mantle") return mantle(context.modelID)
--  if (npm === "@ai-sdk/azure" && context.settings?.useCompletionUrls === true)
--    return "@opencode/ai/providers/azure/chat"
-+  if (npm === "@ai-sdk/azure" && azureChat(context)) return "@opencode/ai/providers/azure/chat"
-   return PACKAGES[npm]
- }
- 
-+const azureChat = (context: Context & { readonly settings?: Provider.Settings }) =>
-+  context.shape === "completions" || context.settings?.useCompletionUrls === true
-+
- const mantle = (modelID: string | undefined) => {
-   if (modelID === undefined) return "@opencode/ai/providers/amazon-bedrock/mantle"
-   return `@opencode/ai/providers/amazon-bedrock/mantle/${modelID.includes("gpt-oss") ? "chat" : "responses"}`
-@@ -141,8 +148,7 @@ function resolve(specifier: string, context: Context & { readonly settings?: Pro
+@@ -149,8 +149,7 @@ function resolve(specifier: string, context: Context & { readonly settings?: Pro
    if (Provider.isAISDK(specifier) || npm in PACKAGES || npm in (HOSTS[context.providerID] ?? {}))
      return native(npm, context)
    if (npm === "@opencode/ai/providers/amazon-bedrock/mantle") return mantle(context.modelID)
--  if (npm === "@opencode/ai/providers/azure/responses" && context.settings?.useCompletionUrls === true)
+-  if (npm === "@opencode/ai/providers/azure/responses" && azureChat(context))
 -    return "@opencode/ai/providers/azure/chat"
 +  if (npm === "@opencode/ai/providers/azure/responses" && azureChat(context)) return "@opencode/ai/providers/azure/chat"
    return NATIVE.has(npm) ? npm : undefined
@@ -1500,10 +1433,10 @@ index ef0d5d635b1f7c6341da16ee610fd00621e1b65f..5578b646799b3e650396967f738abf5c
  
  function getNode<T>(root: Node<T>, path: string) {
 diff --git a/packages/core/src/config/plugin/compatibility.ts b/packages/core/src/config/plugin/compatibility.ts
-index 792048dd429c2324ba7ec44c2a541bbf35d96e51..9b25a73c7121caf04ba3d34393dc63010e7cfc27 100644
+index 792048dd429c2324ba7ec44c2a541bbf35d96e51..032d56528f54f7f60d98d5494028a8836ab93564 100644
 --- a/packages/core/src/config/plugin/compatibility.ts
 +++ b/packages/core/src/config/plugin/compatibility.ts
-@@ -19,6 +19,11 @@ export const Plugin = define({
+@@ -19,11 +19,13 @@ export const Plugin = define({
      const changes = yield* PubSub.sliding<string>(1)
      const lock = Semaphore.makeUnsafe(1)
      const skills: Skill.Info[] = []
@@ -1513,9 +1446,15 @@ index 792048dd429c2324ba7ec44c2a541bbf35d96e51..9b25a73c7121caf04ba3d34393dc6301
 +        Effect.orElseSucceed(() => false),
 +      )
  
-     const watch = Effect.fn("ConfigCompatibilityPlugin.watch")(function* (
-       target: string,
-@@ -40,11 +45,12 @@ export const Plugin = define({
+-    const watch = Effect.fn("ConfigCompatibilityPlugin.watch")(function* (
+-      target: string,
+-      type: "file" | "directory",
+-    ) {
++    const watch = Effect.fn("ConfigCompatibilityPlugin.watch")(function* (target: string, type: "file" | "directory") {
+       const updates = yield* watcher.subscribe({ path: target, type })
+       yield* FiberMap.run(
+         watches,
+@@ -40,11 +42,12 @@ export const Plugin = define({
          const directories = [...roots.claude, ...roots.agents].map((root) => path.join(root, "skills"))
          const loaded = new Map<Skill.ID, Skill.Info>()
          for (const directory of directories) {
@@ -1711,10 +1650,10 @@ index 0c021a4c95effa2f7d5e26bc5510e475728a64e9..1020480cad243f9b3ac4469f4777b807
          // Key identity on name + url, not url alone: two configs for the same url under different names are
          // distinct logical servers that may hold different accounts, so they must not share a credential row.
 diff --git a/packages/core/src/mcp/oauth.ts b/packages/core/src/mcp/oauth.ts
-index ee8d99c3f1b5ac73d36ca21c144ab06c83e9794e..e8c35614555ecc809a827d0c7776afce5872d27e 100644
+index 8653c166d4044b46a5124e445a9c432ea72a6752..c20c77ebaf0d7c738f8a953bb096e302afe8726b 100644
 --- a/packages/core/src/mcp/oauth.ts
 +++ b/packages/core/src/mcp/oauth.ts
-@@ -22,6 +22,7 @@ import { Credential } from "../credential.js"
+@@ -23,6 +23,7 @@ import { Credential } from "../credential.js"
  import { OauthCallbackPage } from "../oauth/page.js"
  import type { Integration } from "../integration.js"
  import { ErrorSummary } from "../util/error-summary.js"
@@ -1722,7 +1661,18 @@ index ee8d99c3f1b5ac73d36ca21c144ab06c83e9794e..e8c35614555ecc809a827d0c7776afce
  
  /** Client ID Metadata Document: servers that support CIMD accept this URL as the client_id without registration. */
  export const CLIENT_METADATA_URL = "https://opencode.ai/oauth/opencode/client.json"
-@@ -272,6 +273,7 @@ export const connectProvider = Effect.fnUntraced(function* (input: {
+@@ -199,7 +200,9 @@ export const provider = (options: Options): OAuthClientProvider => {
+     redirectToAuthorization: (url) => {
+       if (!redirect) throw refuse("user authorization")
+       if (url.protocol !== "http:" && url.protocol !== "https:")
+-        throw new Error(`MCP server "${options.config.url}" returned a ${url.protocol} authorization URL; only http and https are supported`)
++        throw new Error(
++          `MCP server "${options.config.url}" returned a ${url.protocol} authorization URL; only http and https are supported`,
++        )
+       return redirect.open(url)
+     },
+     ...(options.invalidate ? { invalidateCredentials: options.invalidate } : {}),
+@@ -273,6 +276,7 @@ export const connectProvider = Effect.fnUntraced(function* (input: {
    readonly config: typeof ConfigMCP.Remote.Type
    readonly integrationID: Integration.ID
  }) {
@@ -1730,7 +1680,7 @@ index ee8d99c3f1b5ac73d36ca21c144ab06c83e9794e..e8c35614555ecc809a827d0c7776afce
    const credentials = yield* Credential.Service
    const run = Effect.runPromiseWith(yield* Effect.context())
    const found = (yield* credentials.list(input.integrationID)).at(-1)
-@@ -333,6 +335,8 @@ export const authorize = (input: {
+@@ -334,6 +338,8 @@ export const authorize = (input: {
    readonly methodID: Integration.MethodID
  }) =>
    Effect.gen(function* () {
@@ -1739,8 +1689,19 @@ index ee8d99c3f1b5ac73d36ca21c144ab06c83e9794e..e8c35614555ecc809a827d0c7776afce
      const fields = { server: input.name, methodID: input.methodID, oauthAttemptID: crypto.randomUUID() }
      const context = yield* Effect.context()
      const run = Effect.runPromiseWith(context)
+@@ -376,7 +382,9 @@ export const authorize = (input: {
+       if (!value) return fail("Missing authorization code", "missing_code")
+       // The page waits for the token exchange so the browser never reports success for a rejected code.
+       if (
+-        !Effect.runSync(Deferred.succeed(code, { code: value, iss: url.searchParams.get("iss") ?? undefined, response }))
++        !Effect.runSync(
++          Deferred.succeed(code, { code: value, iss: url.searchParams.get("iss") ?? undefined, response }),
++        )
+       )
+         response.writeHead(409).end("OAuth callback already received")
+     })
 diff --git a/packages/core/src/model-resolver.ts b/packages/core/src/model-resolver.ts
-index aa111cb0f5f68abb3ccb3f6400d703cdc279b1de..9c05aae3126ab8560513d77dae1ffc13231e9597 100644
+index 448b18d8b2aa7652d28ec4e91cff67d5732f4e0e..3541c930e730b472d0ce0e6d7b9fa6bae6e47e69 100644
 --- a/packages/core/src/model-resolver.ts
 +++ b/packages/core/src/model-resolver.ts
 @@ -288,7 +288,10 @@ function prepareProviderSettings(
@@ -1755,91 +1716,6 @@ index aa111cb0f5f68abb3ccb3f6400d703cdc279b1de..9c05aae3126ab8560513d77dae1ffc13
    if (!baseURL.includes("${")) return Effect.succeed(baseURL)
    const prepared = baseURL.replace(/\$\{([^}]+)\}/g, (placeholder, name: string) => process.env[name] ?? placeholder)
    const failure = unresolvedProviderVariables(model, prepared)
-@@ -408,7 +411,9 @@ export const layer = Layer.effect(
-                 Effect.flatMap((model) =>
-                   model && hasPackage(model)
-                     ? Effect.succeed(model)
--                    : Effect.map(models.available(), (models) => models.find(hasPackage)),
-+                    : Effect.map(models.available(), (models) =>
-+                        models.find((model) => hasPackage(model) && Model.supportsText(model)),
-+                      ),
-                 ),
-               )
-         if (!selected) return undefined
-diff --git a/packages/core/src/model.ts b/packages/core/src/model.ts
-index a440578a3667fe057bf4b557f2bcb33fd1c49b33..88c0821800b8e24c53f7fe2fa21c296875d77437 100644
---- a/packages/core/src/model.ts
-+++ b/packages/core/src/model.ts
-@@ -261,7 +261,7 @@ const layer = Layer.effect(
-         const value = yield* read()
-         const requested = value.data.defaultModel
-         const model = requested && value.byProvider.get(requested.providerID)?.get(requested.modelID)
--        return model?.enabled ? model : value.available[0]
-+        return model?.enabled ? model : value.available.find(supportsText)
-       }),
-       small: Effect.fn("Model.small")(function* (providerID) {
-         const value = yield* read()
-@@ -282,6 +282,13 @@ const layer = Layer.effect(
- 
- export const node = makeLocationNode({ service: Service, layer, deps: [Provider.node, Bus.node, Location.node] })
- 
-+export function supportsText(model: Pick<Info, "capabilities">) {
-+  return (
-+    (model.capabilities.input.length === 0 || model.capabilities.input.some((item) => item.startsWith("text"))) &&
-+    (model.capabilities.output.length === 0 || model.capabilities.output.some((item) => item.startsWith("text")))
-+  )
-+}
-+
- export function compatibility(input: unknown): Compatibility | undefined {
-   if (typeof input === "string") return { reasoningField: input }
-   if (typeof input !== "object" || input === null || Array.isArray(input) || !("field" in input)) return undefined
-diff --git a/packages/core/src/models-dev.ts b/packages/core/src/models-dev.ts
-index f11f07c79dbdb9b9bd6ee223fba24d2a4c6fc0e6..ce0c1963ca4a3d54a4a8de75b9cfdc4e673248bb 100644
---- a/packages/core/src/models-dev.ts
-+++ b/packages/core/src/models-dev.ts
-@@ -60,7 +60,11 @@ type SourceModel = {
-     >
-   }
-   readonly status?: CatalogModelStatus
--  readonly provider?: { readonly npm?: string; readonly api?: string }
-+  readonly provider?: {
-+    readonly npm?: string
-+    readonly api?: string
-+    readonly shape?: "responses" | "completions"
-+  }
- }
- 
- type SourceProvider = {
-@@ -80,7 +84,13 @@ export type Snapshot = {
- 
- function nativePackage(provider: SourceProvider, model?: SourceModel) {
-   const npm = model?.provider?.npm ?? provider.npm
--  return AISDKNative.native(npm, { providerID: provider.id, modelID: model?.id }) ?? Provider.aisdk(npm)
-+  return (
-+    AISDKNative.native(npm, {
-+      providerID: provider.id,
-+      modelID: model?.id,
-+      shape: model?.provider?.shape,
-+    }) ?? Provider.aisdk(npm)
-+  )
- }
- 
- function normalize(input: Record<string, SourceProvider>): readonly Snapshot[] {
-@@ -203,11 +213,12 @@ function modelInfo(
-   } = {},
- ): Model.Info {
-   const providerID = Provider.ID.make(provider.id)
--  const pkg = model.provider?.npm ? nativePackage(provider, model) : undefined
-+  const resolved = nativePackage(provider, model)
-+  const pkg = model.provider?.npm || resolved !== nativePackage(provider) ? resolved : undefined
-   // Per model, so it never merges into a model that overrides to a different package.
-   const settings = {
-     ...(model.provider?.api ? { baseURL: model.provider.api } : {}),
--    ...(nativePackage(provider, model) === "@opencode/ai/providers/openai-compatible" ? { provider: providerID } : {}),
-+    ...(resolved === "@opencode/ai/providers/openai-compatible" ? { provider: providerID } : {}),
-   }
-   return {
-     id,
 diff --git a/packages/core/src/plugin/identity.ts b/packages/core/src/plugin/identity.ts
 index 3ad57050e97d9c9e7132de736bafd0ad4ef665ed..3eb719682aa63d7a4e04546c3792b0e688a9c42f 100644
 --- a/packages/core/src/plugin/identity.ts
@@ -1868,31 +1744,11 @@ index 3ad57050e97d9c9e7132de736bafd0ad4ef665ed..3eb719682aa63d7a4e04546c3792b0e6
        }).pipe(Effect.catch(() => Effect.void))
      yield* ctx.session.hook("context", hook)
      yield* ctx.session.hook("compaction", hook)
-diff --git a/packages/core/src/plugin/models-dev.ts b/packages/core/src/plugin/models-dev.ts
-index 9a517c38634589afdf74f63a392d36a67806c93c..f2ed1817fb887a7fddb52232d2be5dcff6d002d2 100644
---- a/packages/core/src/plugin/models-dev.ts
-+++ b/packages/core/src/plugin/models-dev.ts
-@@ -3,6 +3,7 @@ import { Integration } from "@opencode/schema/integration"
- import { Provider } from "@opencode/schema/provider"
- import { Effect, Stream } from "effect"
- import { Bus } from "../bus.js"
-+import { Model } from "../model.js"
- import { ModelsDev } from "../models-dev.js"
- 
- // These catalog entries require inference profiles on Bedrock Runtime.
-@@ -100,6 +101,7 @@ function snapshots(data: readonly ModelsDev.Snapshot[]) {
-       models: provider.models.filter(
-         (model) =>
-           model.status !== "deprecated" &&
-+          Model.supportsText(model) &&
-           !(
-             provider.info.id === Provider.ID.amazonBedrock &&
-             BEDROCK_PROFILE_ONLY_IDS.includes(model.modelID ?? model.id)
 diff --git a/packages/core/src/plugin/provider/opencode.ts b/packages/core/src/plugin/provider/opencode.ts
-index 303cfecda178432667972afb431f4bd0c9a71f69..7bd6a39fad1d0e6d9f1918cc36c372773b54292d 100644
+index da7ea2cd0d776c9e62fa8c0c3cb9243c4b697de9..7bd6a39fad1d0e6d9f1918cc36c372773b54292d 100644
 --- a/packages/core/src/plugin/provider/opencode.ts
 +++ b/packages/core/src/plugin/provider/opencode.ts
-@@ -461,16 +461,13 @@ export const OpencodePlugin = define<HttpClient.HttpClient | Bus.Service | Manag
+@@ -461,11 +461,7 @@ export const OpencodePlugin = define<HttpClient.HttpClient | Bus.Service | Manag
  
      // Console config can change independently of local credential activity, so re-fetch
      // periodically and only rebuild the catalog and search providers when the snapshot differs.
@@ -1904,21 +1760,6 @@ index 303cfecda178432667972afb431f4bd0c9a71f69..7bd6a39fad1d0e6d9f1918cc36c37277
 +    yield* Effect.sleep(Duration.minutes(1)).pipe(Effect.andThen(check()), Effect.forever, Effect.forkScoped)
    }),
  })
- 
- function fetchConfig(http: HttpClient.HttpClient, value: Credential.Value) {
--  return http
-+  // Scoped so responses whose body is never read (404, errors) are released here instead of by a GC-time abort.
-+  return HttpClient.withScope(http)
-     .execute(
-       HttpClientRequest.get(`${serverUrl(value)}/api/v2/config`).pipe(
-         HttpClientRequest.acceptJson,
-@@ -498,6 +495,7 @@ function fetchConfig(http: HttpClient.HttpClient, value: Credential.Value) {
-           )
-         }),
-       ),
-+      Effect.scoped,
-     )
- }
  
 diff --git a/packages/core/src/session/compaction.ts b/packages/core/src/session/compaction.ts
 index 7afb5a469d0aef5c56f441c2c7cd950dfa80a1cd..938bf2852c732b3a2da75a25e375bbd861c0cb12 100644
@@ -2443,34 +2284,51 @@ index f21c67a533ed942c06747f51474908bce099fc33..9ab6243da65d0e2d59ac59c69a49fb7e
      return {
        output,
        content: normalizeContent(result.content, output),
-diff --git a/packages/core/src/variant.ts b/packages/core/src/variant.ts
-index cd36b5ee06cb70325f4e4d5394b3bbf78ed4757a..9ecafafd6fdecd912b0aa4ba3309d5a8fde0a499 100644
---- a/packages/core/src/variant.ts
-+++ b/packages/core/src/variant.ts
-@@ -575,6 +575,7 @@ const PROTOCOLS: Readonly<Record<string, Protocol>> = {
-   "@opencode/ai/providers/zai-coding-plan/responses": openaiResponses,
+diff --git a/packages/core/src/v1/config/migrate.ts b/packages/core/src/v1/config/migrate.ts
+index d831e1b1f872d57afe36d233a71f4b1c74a07540..ec62425e31e0852c1a1c429c5e746f0b9119a827 100644
+--- a/packages/core/src/v1/config/migrate.ts
++++ b/packages/core/src/v1/config/migrate.ts
+@@ -168,7 +168,26 @@ export function providerID(input: string) {
+ }
  
-   "@opencode/ai/providers/openai-compatible": openaiCompatible,
-+  "@opencode/ai/providers/azure/chat": openaiChat,
-   "@opencode/ai/providers/google-vertex/chat": openaiChat,
-   "@opencode/ai/providers/alibaba/chat": alibabaChat,
-   "@opencode/ai/providers/baseten": basetenChat,
-diff --git a/packages/core/test/aisdk-native.test.ts b/packages/core/test/aisdk-native.test.ts
-index 82a1c740c1866dba166ae22ac56745244e7af763..643e4966f04d8892d33d2a198a703a3e09b8f921 100644
---- a/packages/core/test/aisdk-native.test.ts
-+++ b/packages/core/test/aisdk-native.test.ts
-@@ -224,6 +224,9 @@ describe("AISDKNative", () => {
-     const chat = map("@ai-sdk/azure", { ...settings, useCompletionUrls: true }, "custom-deployment")
-     expect(chat?.package).toBe("@opencode/ai/providers/azure/chat")
-     expect(chat?.settings).not.toHaveProperty("useCompletionUrls")
-+    expect(AISDKNative.native("@ai-sdk/azure", { providerID: "azure", shape: "completions" })).toBe(
-+      "@opencode/ai/providers/azure/chat",
-+    )
-   })
- 
-   test("maps Bedrock provider and request options", () => {
+ function migrateModel(info: typeof ConfigProviderV1.Model.Type) {
+-  const settings = info.options && ConfigProviderOptionsV1.model(info.options)
++  const disableThinkingBlockBinding =
++    info.options?.thinking?.blockBinding === false || info.options?.reasoningConfig?.blockBinding === false
++  const options = info.options && { ...info.options }
++
++  // Move the legacy opt-out to compatibility without mutating the input.
++  if (options && disableThinkingBlockBinding) {
++    for (const key of ["thinking", "reasoningConfig"]) {
++      if (options[key]?.blockBinding !== false) continue
++
++      const { blockBinding, ...rest } = options[key]
++      if (Object.keys(rest).length) {
++        options[key] = rest
++        continue
++      }
++      delete options[key]
++    }
++  }
++
++  const settings = options && ConfigProviderOptionsV1.model(options)
++  const compatibility = Model.compatibility(info.interleaved)
+   const costs = info.cost && [
+     {
+       input: info.cost.input,
+@@ -199,7 +218,9 @@ function migrateModel(info: typeof ConfigProviderV1.Model.Type) {
+     modelID: info.id,
+     family: info.family,
+     name: info.name,
+-    compatibility: Model.compatibility(info.interleaved),
++    compatibility: disableThinkingBlockBinding
++      ? { ...compatibility, supportsThinkingBlockBinding: false }
++      : compatibility,
+     package: info.provider?.npm ? Provider.aisdk(info.provider.npm) : undefined,
+     settings: info.provider?.api ? { ...settings, baseURL: info.provider.api } : settings,
+     capabilities,
 diff --git a/packages/core/test/catalog.test.ts b/packages/core/test/catalog.test.ts
-index f8e47eb3c5f5f42405133f828dfc3797ad90f017..422daab67ac4e64b1882b6d692a3b2f34a3b0d01 100644
+index e2b5e2f0b5eb218e3537301c28b02186b4b8ed5e..422daab67ac4e64b1882b6d692a3b2f34a3b0d01 100644
 --- a/packages/core/test/catalog.test.ts
 +++ b/packages/core/test/catalog.test.ts
 @@ -201,8 +201,7 @@ describe("Provider and Model", () => {
@@ -2483,23 +2341,6 @@ index f8e47eb3c5f5f42405133f828dfc3797ad90f017..422daab67ac4e64b1882b6d692a3b2f3
            ),
          ),
        )
-@@ -553,6 +552,16 @@ describe("Provider and Model", () => {
-         editor.models.update(providerID, Model.ID.make("new"), (model) => {
-           model.time.released = 2000
-         })
-+        editor.models.update(providerID, Model.ID.make("newest-video"), (model) => {
-+          model.capabilities.input = ["text", "image"]
-+          model.capabilities.output = ["video"]
-+          model.time.released = 3000
-+        })
-+        editor.models.update(providerID, Model.ID.make("newest-stt"), (model) => {
-+          model.capabilities.input = ["audio"]
-+          model.capabilities.output = ["text"]
-+          model.time.released = 4000
-+        })
-       })
- 
-       expect((yield* models.default())?.id).toMatch("new")
 diff --git a/packages/core/test/codemode-safety.test.ts b/packages/core/test/codemode-safety.test.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..110c3b6b2ae2a263529c05d3c1ca18ca539297b4
@@ -3024,11 +2865,208 @@ index 0000000000000000000000000000000000000000..110c3b6b2ae2a263529c05d3c1ca18ca
 +    }),
 +  )
 +})
+diff --git a/packages/core/test/config/normalization.test.ts b/packages/core/test/config/normalization.test.ts
+index 488156afe64b5289d8e8879a3e58c93070a9e57f..d5cc55be951820fdd1cf8d45bd78a928b663bb78 100644
+--- a/packages/core/test/config/normalization.test.ts
++++ b/packages/core/test/config/normalization.test.ts
+@@ -230,6 +230,33 @@ describe("ConfigNormalize", () => {
+     })
+   })
+ 
++  test("preserves native protocol capability overrides and omits undefined values", () => {
++    for (const supportsEffortUpdates of [false, true, undefined]) {
++      for (const supportsThinkingBlockBinding of [false, true, undefined]) {
++        const wireCompatibility = {
++          ...(supportsEffortUpdates === undefined ? {} : { supportsEffortUpdates }),
++          ...(supportsThinkingBlockBinding === undefined ? {} : { supportsThinkingBlockBinding }),
++        }
++        const result = normalized({
++          providers: {
++            gateway: {
++              models: { custom: { compatibility: wireCompatibility } },
++            },
++          },
++        })
++        expect(result.encoded.providers).toStrictEqual({
++          gateway: {
++            models: {
++              custom: {
++                compatibility: wireCompatibility,
++              },
++            },
++          },
++        })
++      }
++    }
++  })
++
+   test("uses a valid retired provider alias when the canonical legacy entry is malformed", () => {
+     const result = normalized({
+       provider: {
+@@ -508,6 +535,76 @@ describe("ConfigNormalize", () => {
+     ])
+   })
+ 
++  test("migrates the legacy thinking block-binding opt-out into model compatibility", () => {
++    const result = normalized({
++      provider: {
++        gateway: {
++          models: {
++            anthropic: { options: { thinking: { type: "adaptive", blockBinding: false }, effort: "high" } },
++            bedrock: { options: { reasoningConfig: { blockBinding: false } } },
++            both: {
++              options: {
++                thinking: { type: "adaptive", blockBinding: false },
++                reasoningConfig: { type: "adaptive", blockBinding: false },
++              },
++            },
++            untouched: { options: { thinking: { type: "adaptive" } } },
++          },
++        },
++      },
++    })
++    expect(result.encoded.providers).toMatchObject({
++      gateway: {
++        models: {
++          anthropic: {
++            compatibility: { supportsThinkingBlockBinding: false },
++            settings: { thinking: { type: "adaptive" }, effort: "high" },
++          },
++          bedrock: { compatibility: { supportsThinkingBlockBinding: false }, settings: {} },
++          both: {
++            compatibility: { supportsThinkingBlockBinding: false },
++            settings: { thinking: { type: "adaptive" }, reasoningConfig: { type: "adaptive" } },
++          },
++          untouched: { settings: { thinking: { type: "adaptive" } } },
++        },
++      },
++    })
++    expect(result.encoded.providers).not.toHaveProperty(["gateway", "models", "bedrock", "settings", "reasoningConfig"])
++    expect(result.encoded.providers).not.toHaveProperty([
++      "gateway",
++      "models",
++      "both",
++      "settings",
++      "thinking",
++      "blockBinding",
++    ])
++    expect(result.encoded.providers).not.toHaveProperty([
++      "gateway",
++      "models",
++      "both",
++      "settings",
++      "reasoningConfig",
++      "blockBinding",
++    ])
++    expect(result.encoded.providers).not.toHaveProperty(["gateway", "models", "untouched", "compatibility"])
++  })
++
++  test("does not mutate caller input when migrating legacy thinking block-binding opt-outs", () => {
++    const input = {
++      provider: {
++        gateway: {
++          models: {
++            anthropic: { options: { thinking: { type: "adaptive", blockBinding: false } } },
++            bedrock: { options: { reasoningConfig: { blockBinding: false } } },
++          },
++        },
++      },
++    }
++    const before = structuredClone(input)
++    normalized(input)
++    expect(input).toStrictEqual(before)
++  })
++
+   test("invalid legacy provider overlays skip only that provider", () => {
+     const result = normalized({
+       provider: {
+diff --git a/packages/core/test/config/provider.test.ts b/packages/core/test/config/provider.test.ts
+index 462fd755d76ef84cf610958d4f0d2aa5ccee2662..cc2d7d159eb4ceedf2f0a3e86818f129b3060672 100644
+--- a/packages/core/test/config/provider.test.ts
++++ b/packages/core/test/config/provider.test.ts
+@@ -48,7 +48,10 @@ describe("ConfigProviderPlugin.Plugin", () => {
+                 settings: { compaction: { type: "native" } },
+                 models: {
+                   native: {},
+-                  local: { settings: { compaction: { type: "summary" } }, package: "@opencode/ai/providers/openai/chat" },
++                  local: {
++                    settings: { compaction: { type: "summary" } },
++                    package: "@opencode/ai/providers/openai/chat",
++                  },
+                   unsupported: { package: "@opencode/ai/providers/openai/chat" },
+                 },
+               },
+@@ -637,6 +640,8 @@ describe("ConfigProviderPlugin.Plugin", () => {
+                         reasoningField: "vendor_reasoning",
+                         maxTokensField: "max_completion_tokens",
+                         requireFinishReason: false,
++                        supportsEffortUpdates: false,
++                        supportsThinkingBlockBinding: false,
+                       },
+                       capabilities: { tools: true, input: ["text"], output: ["text"] },
+                       disabled: true,
+@@ -670,6 +675,9 @@ describe("ConfigProviderPlugin.Plugin", () => {
+                     default: {
+                       name: "Default",
+                     },
++                    explicit: {
++                      compatibility: { supportsEffortUpdates: true, supportsThinkingBlockBinding: true },
++                    },
+                     chat: {
+                       modelID: "api-chat",
+                       name: "Last",
+@@ -735,6 +743,8 @@ describe("ConfigProviderPlugin.Plugin", () => {
+           reasoningField: "vendor_reasoning",
+           maxTokensField: "max_completion_tokens",
+           requireFinishReason: false,
++          supportsEffortUpdates: false,
++          supportsThinkingBlockBinding: false,
+         })
+         expect(model.capabilities).toEqual({ tools: true, input: ["text"], output: ["text"] })
+         expect(model.enabled).toBe(false)
+@@ -759,6 +769,13 @@ describe("ConfigProviderPlugin.Plugin", () => {
+         expect(model.variants?.[0]?.headers).toEqual({ first: "first", shared: "last", last: "last" })
+         expect(model.variants?.[0]?.settings).toEqual({ effort: "high" })
+         expect(model.variants?.[1]?.headers).toEqual({ slow: "slow" })
++
++        const explicitModel = required(yield* models.get(providerID, Model.ID.make("explicit")))
++        const defaultModel = required(yield* models.get(providerID, Model.ID.make("default")))
++        expect(explicitModel.compatibility?.supportsEffortUpdates).toBe(true)
++        expect(explicitModel.compatibility?.supportsThinkingBlockBinding).toBe(true)
++        expect(defaultModel.compatibility?.supportsEffortUpdates).toBeUndefined()
++        expect(defaultModel.compatibility?.supportsThinkingBlockBinding).toBeUndefined()
+       }),
+     ),
+   )
 diff --git a/packages/core/test/config/skill.test.ts b/packages/core/test/config/skill.test.ts
-index b172222e69710c18e190dad7509af47e1936da80..c59096fdf1228549cb3fd086fe49e29b96e43838 100644
+index b172222e69710c18e190dad7509af47e1936da80..d2f08a196a23b797d9faecd3d24535d8f5ab4087 100644
 --- a/packages/core/test/config/skill.test.ts
 +++ b/packages/core/test/config/skill.test.ts
-@@ -175,6 +175,36 @@ metadata:
+@@ -64,9 +64,7 @@ const startEntries = Effect.fnUntraced(function* (
+   yield* ConfigCompatibilityPlugin.Plugin.effect(pluginHost).pipe(
+     Effect.provide(Config.testLayer(entries, compatibility)),
+   )
+-  yield* ConfigSkillPlugin.Plugin.effect(
+-    pluginHost,
+-  ).pipe(
++  yield* ConfigSkillPlugin.Plugin.effect(pluginHost).pipe(
+     Effect.provide(Config.testLayer(entries, compatibility)),
+     Effect.provideService(SkillDiscovery.Service, discovery),
+     Effect.provideService(Global.Service, Global.Service.of({ ...Global.make(), home })),
+@@ -130,9 +128,9 @@ describe("SkillFile.parse", () => {
+     expect(parse("disable-model-invocation: yes")).toMatchObject({ skill: { autoinvoke: false } })
+     expect(parse("disable-model-invocation: false")).not.toMatchObject({ skill: { autoinvoke: expect.anything() } })
+     expect(parse("disable-model-invocation: maybe")).not.toMatchObject({ skill: { autoinvoke: expect.anything() } })
+-    expect(
+-      parse("disable-model-invocation: true\nmetadata:\n  opencode/autoinvoke: true"),
+-    ).toMatchObject({ skill: { autoinvoke: true } })
++    expect(parse("disable-model-invocation: true\nmetadata:\n  opencode/autoinvoke: true")).toMatchObject({
++      skill: { autoinvoke: true },
++    })
+   })
+ 
+   test("parses root and nested skill ids and metadata flags", () => {
+@@ -175,6 +173,36 @@ metadata:
  })
  
  describe("ConfigSkillPlugin.Plugin", () => {
@@ -3079,10 +3117,10 @@ index 37b7cab486cf202b91711d71e35d2acc8b0654a4..46da61b6da8ec1429d9323df0a652d2d
        "response": {
          "status": 200,
 diff --git a/packages/core/test/mcp-oauth.test.ts b/packages/core/test/mcp-oauth.test.ts
-index 7f03641f4d84092515c25636588175bcc74f9d9f..cf15b411368073288147e3fd898d9cbcd6096857 100644
+index d65ce15f336b7830fedc76d5b02b8585f85c35ef..80f35def7c7e617080d2f5d67845ecaa444fc690 100644
 --- a/packages/core/test/mcp-oauth.test.ts
 +++ b/packages/core/test/mcp-oauth.test.ts
-@@ -54,9 +54,56 @@ const memoryCredentials = (initial: Credential.Info[]) => {
+@@ -54,9 +54,58 @@ const memoryCredentials = (initial: Credential.Info[]) => {
  
  const connectProvider = (config: typeof ConfigMCP.Remote.Type, store: ReturnType<typeof memoryCredentials>) =>
    Effect.runPromise(
@@ -3109,7 +3147,9 @@ index 7f03641f4d84092515c25636588175bcc74f9d9f..cf15b411368073288147e3fd898d9cbc
 +    const store = memoryCredentials([original])
 +    expect(
 +      await Effect.runPromise(
-+        McpOAuth.connectProvider({ config, integrationID }).pipe(Effect.provideService(Credential.Service, store.service)),
++        McpOAuth.connectProvider({ config, integrationID }).pipe(
++          Effect.provideService(Credential.Service, store.service),
++        ),
 +      ),
 +    ).toBeUndefined()
 +    expect(store.rows.get(original.id)).toBe(original)
@@ -3140,6 +3180,18 @@ index 7f03641f4d84092515c25636588175bcc74f9d9f..cf15b411368073288147e3fd898d9cbc
  // Serves authorization server metadata with the given capabilities and records DCR + token requests.
  const authorizationServer = (metadata: Record<string, unknown>) => {
    const registrations: unknown[] = []
+@@ -166,10 +215,7 @@ describe("MCP OAuth", () => {
+       fetch(request) {
+         if (request.method !== "POST" || new URL(request.url).pathname !== "/token")
+           return new Response(null, { status: 404 })
+-        return Response.json(
+-          { error: "invalid_client", error_description: "bad_client_secret" },
+-          { status: 400 },
+-        )
++        return Response.json({ error: "invalid_client", error_description: "bad_client_secret" }, { status: 400 })
+       },
+     })
+ 
 diff --git a/packages/core/test/mcp.test.ts b/packages/core/test/mcp.test.ts
 index 314b81fcb8aa12a2969bc2e6fbc0a800c700775c..b1292b9b2b69453924f816ce88e61bec8f71e924 100644
 --- a/packages/core/test/mcp.test.ts
@@ -3545,62 +3597,28 @@ index 314b81fcb8aa12a2969bc2e6fbc0a800c700775c..b1292b9b2b69453924f816ce88e61bec
  test("adds, disconnects, and reconnects MCP servers at runtime", async () => {
    const published: string[] = []
    await Effect.runPromise(
-diff --git a/packages/core/test/models.test.ts b/packages/core/test/models.test.ts
-index c0780e57f7a455b185c0bbad316830e001e55c8f..d1caf7c0c2fa103e1445242f4597835198fd7fbf 100644
---- a/packages/core/test/models.test.ts
-+++ b/packages/core/test/models.test.ts
-@@ -255,6 +255,23 @@ describe("ModelsDev Service", () => {
-           api: "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1",
-           models: {},
-         },
-+        azure: {
-+          id: "azure",
-+          name: "Azure",
-+          env: ["AZURE_RESOURCE_NAME", "AZURE_API_KEY"],
-+          npm: "@ai-sdk/azure",
-+          models: {
-+            "gpt-5": {
-+              ...fixture.acme.models["acme-1"],
-+              id: "gpt-5",
-+            },
-+            "custom-chat": {
-+              ...fixture.acme.models["acme-1"],
-+              id: "custom-chat",
-+              provider: { shape: "completions" },
-+            },
-+          },
-+        },
-       })
-       const state = yield* Ref.make(initialState)
-       const result = yield* provided(
-@@ -266,6 +283,11 @@ describe("ModelsDev Service", () => {
-       expect(result[0]?.models[0]?.package).toBe("@opencode/ai/providers/openai")
-       expect(result[1]?.info.package).toBe("@opencode/ai/providers/cloudflare-workers-ai")
-       expect(result[1]?.info.settings).toBeUndefined()
-+      expect(result[2]?.info.package).toBe("@opencode/ai/providers/azure/responses")
-+      expect(result[2]?.models.find((model) => model.id === "gpt-5")?.package).toBeUndefined()
-+      expect(result[2]?.models.find((model) => model.id === "custom-chat")?.package).toBe(
-+        "@opencode/ai/providers/azure/chat",
-+      )
-     }),
-   )
- 
 diff --git a/packages/core/test/plugin/identity.test.ts b/packages/core/test/plugin/identity.test.ts
-index fe5aab2e43897058673b2b3373aef160c1ce9e9d..a64a5287acd053b48c3bfeb9a9341bc59c0db09c 100644
+index fe5aab2e43897058673b2b3373aef160c1ce9e9d..dce0f4336565d5a2870fab898dd1df756867fdb3 100644
 --- a/packages/core/test/plugin/identity.test.ts
 +++ b/packages/core/test/plugin/identity.test.ts
-@@ -24,8 +24,8 @@ test("formats the model identity part", () => {
+@@ -24,8 +24,14 @@ test("formats the model identity part", () => {
    ).toBe(["# Your Model", "- Name: GPT-4o mini", "- Provider ID: openai", "- Model ID: gpt-4o-mini"].join("\n"))
  })
  
 -const identity = (name: string, id: string) =>
 -  ["# Your Model", `- Name: ${name}`, "- Provider ID: test", `- Model ID: ${id}`].join("\n")
 +const identity = (name: string, id: string, version: string) =>
-+  ["# Your Model", `- Name: ${name}`, "- Provider ID: test", `- Model ID: ${id}`, `- OpenCode version: ${version}`].join("\n")
++  [
++    "# Your Model",
++    `- Name: ${name}`,
++    "- Provider ID: test",
++    `- Model ID: ${id}`,
++    `- OpenCode version: ${version}`,
++  ].join("\n")
  
  const context = (id: string): SessionHooks["context"] => ({
    sessionID: Session.ID.make("ses_model_identity"),
-@@ -37,6 +37,20 @@ const context = (id: string): SessionHooks["context"] => ({
+@@ -37,6 +43,20 @@ const context = (id: string): SessionHooks["context"] => ({
    options: {},
  })
  
@@ -3621,7 +3639,7 @@ index fe5aab2e43897058673b2b3373aef160c1ce9e9d..a64a5287acd053b48c3bfeb9a9341bc5
  it.effect("inserts the structured model block after the agent prompt", () =>
    Effect.gen(function* () {
      const catalog = yield* Provider.Service
-@@ -54,7 +68,7 @@ it.effect("inserts the structured model block after the agent prompt", () =>
+@@ -54,7 +74,7 @@ it.effect("inserts the structured model block after the agent prompt", () =>
      yield* hooks.trigger("session", "context", named)
      expect(named.system.map((part) => part.text)).toEqual([
        "Agent prompt",
@@ -3630,7 +3648,7 @@ index fe5aab2e43897058673b2b3373aef160c1ce9e9d..a64a5287acd053b48c3bfeb9a9341bc5
        "Initial context",
      ])
  
-@@ -62,7 +76,7 @@ it.effect("inserts the structured model block after the agent prompt", () =>
+@@ -62,7 +82,7 @@ it.effect("inserts the structured model block after the agent prompt", () =>
      yield* hooks.trigger("session", "context", fallback)
      expect(fallback.system.map((part) => part.text)).toEqual([
        "Agent prompt",
@@ -3639,100 +3657,6 @@ index fe5aab2e43897058673b2b3373aef160c1ce9e9d..a64a5287acd053b48c3bfeb9a9341bc5
        "Initial context",
      ])
    }),
-diff --git a/packages/core/test/plugin/models-dev.test.ts b/packages/core/test/plugin/models-dev.test.ts
-index 59c38eb6626124f01c0ea68e9fe9d49fa35b1113..7038d011422e42a508dd1e025ed93e14b2584013 100644
---- a/packages/core/test/plugin/models-dev.test.ts
-+++ b/packages/core/test/plugin/models-dev.test.ts
-@@ -624,7 +624,7 @@ describe("ModelsDevPlugin", () => {
-     }),
-   )
- 
--  it.effect("omits deprecated model definitions", () =>
-+  it.effect("omits deprecated and non-text model definitions", () =>
-     Effect.gen(function* () {
-       const integrations = yield* Integration.Service
-       const providers = yield* Provider.Service
-@@ -632,11 +632,13 @@ describe("ModelsDevPlugin", () => {
-       const providerID = Provider.ID.make("acme")
-       const activeID = Model.ID.make("current")
-       const deprecatedID = Model.ID.make("legacy")
-+      const videoID = Model.ID.make("video-gen")
-+      const sttID = Model.ID.make("transcribe")
-       const model = {
-         modelID: activeID,
-         providerID,
-         name: "Current",
--        capabilities: { tools: true, input: [], output: [] },
-+        capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
-         variants: [],
-         time: { released: Date.parse("2026-01-01") },
-         cost: [],
-@@ -662,6 +664,21 @@ describe("ModelsDevPlugin", () => {
-               name: "Legacy",
-               status: "deprecated" as const,
-             },
-+            {
-+              id: videoID,
-+              ...model,
-+              modelID: videoID,
-+              name: "Video Gen",
-+              capabilities: { tools: false, input: ["text", "image"], output: ["video"] },
-+              limit: { context: 1_024, output: 0 },
-+            },
-+            {
-+              id: sttID,
-+              ...model,
-+              modelID: sttID,
-+              name: "Transcribe",
-+              capabilities: { tools: false, input: ["audio"], output: ["text"] },
-+            },
-           ],
-         },
-       ] satisfies readonly ModelsDev.Snapshot[]
-@@ -684,6 +701,8 @@ describe("ModelsDevPlugin", () => {
-       yield* activate(providers)
-       expect(yield* modelState.get(providerID, activeID)).toBeDefined()
-       expect(yield* modelState.get(providerID, deprecatedID)).toBeUndefined()
-+      expect(yield* modelState.get(providerID, videoID)).toBeUndefined()
-+      expect(yield* modelState.get(providerID, sttID)).toBeUndefined()
-     }),
-   )
- 
-diff --git a/packages/core/test/plugin/provider-opencode.test.ts b/packages/core/test/plugin/provider-opencode.test.ts
-index 3ce2960dbb510dc355141d4593246582b94e4cc8..edb391975492bfd8a600e3e74368f1f573386457 100644
---- a/packages/core/test/plugin/provider-opencode.test.ts
-+++ b/packages/core/test/plugin/provider-opencode.test.ts
-@@ -1072,6 +1072,30 @@ describe("OpencodePlugin", () => {
-     ),
-   )
- 
-+  it.effect("releases unread Console config responses when the fetch completes", () =>
-+    Effect.gen(function* () {
-+      const credentials = yield* Credential.Service
-+      const signals: AbortSignal[] = []
-+      const state = { status: 404 }
-+      const http = HttpClient.make((request, _url, signal) => {
-+        signals.push(signal)
-+        return Effect.succeed(HttpClientResponse.fromWeb(request, new Response("unavailable", state)))
-+      })
-+      yield* credentials.create({
-+        integrationID: Integration.ID.make("opencode"),
-+        value: Credential.Key.make({ type: "key", key: "secret", metadata: { server: "https://console.test" } }),
-+      })
-+      yield* addPlugin().pipe(Effect.provideService(HttpClient.HttpClient, http))
-+      yield* drain
-+      state.status = 503
-+      yield* TestClock.adjust("1 minute")
-+      yield* drain
-+
-+      // An unreleased response is only aborted when garbage collected, which fails outside a request on workerd.
-+      expect(signals.map((signal) => signal.aborted)).toEqual([true, true])
-+    }),
-+  )
-+
-   it.effect("reports a rejected Console refresh token as signed out without removing the credential", () =>
-     Effect.acquireUseRelease(
-       Effect.sync(() =>
 diff --git a/packages/core/test/session-compaction.test.ts b/packages/core/test/session-compaction.test.ts
 index 93ff3d5fed311ebb2fd67e7d56dc50ffff447f7d..74c8b3f2992f7072fde9f1666cf955ade268a90f 100644
 --- a/packages/core/test/session-compaction.test.ts
@@ -5305,3 +5229,66 @@ index a57a0d4d9263bdd89918605a4684e98cc9915bb2..3ed2cc080b5c8ee7925a9cde19b751d2
  
              return undefined
            })
+diff --git a/packages/schema/src/model.ts b/packages/schema/src/model.ts
+index b52018f9271b724e5468db0dab20f179fe7b7cba..743cfc61fef080b0fd03ac8c24edeef3909d0691 100644
+--- a/packages/schema/src/model.ts
++++ b/packages/schema/src/model.ts
+@@ -80,6 +80,10 @@ export const Compatibility = Schema.Struct({
+   requireFinishReason: Schema.Boolean.pipe(optional),
+   requireAssistantAfterTool: Schema.Boolean.pipe(optional),
+   supportsPromptCacheKey: Schema.Boolean.pipe(optional),
++  /** Supports Anthropic's thinking-prefix mismatch controls. Overrides model-ID detection. */
++  supportsThinkingBlockBinding: Schema.Boolean.pipe(optional),
++  /** Supports per-message effort updates. Overrides model-ID detection. */
++  supportsEffortUpdates: Schema.Boolean.pipe(optional),
+ }).annotate({ identifier: "Model.Compatibility" })
+ 
+ export interface Capabilities extends Schema.Schema.Type<typeof Capabilities> {}
+diff --git a/packages/schema/test/model.test.ts b/packages/schema/test/model.test.ts
+index 560ab62e0df92dd1bf24b24ced6d22775f6eb202..8fdfc675a4b693ecc7e367a9f4cf856d20ade329 100644
+--- a/packages/schema/test/model.test.ts
++++ b/packages/schema/test/model.test.ts
+@@ -53,6 +53,43 @@ describe("Model.Compatibility", () => {
+       requireAssistantAfterTool: true,
+     })
+   })
++
++  test("keeps capability overrides that gate protocol features", () => {
++    const decode = Schema.decodeUnknownSync(Model.Compatibility)
++
++    for (const supportsEffortUpdates of [false, true]) {
++      expect(decode({ supportsEffortUpdates, supportsThinkingBlockBinding: true })).toEqual({
++        supportsEffortUpdates,
++        supportsThinkingBlockBinding: true,
++      })
++    }
++  })
++
++  test("omits undefined protocol capability overrides when encoded", () => {
++    expect(
++      Schema.encodeSync(Model.Compatibility)({
++        supportsEffortUpdates: undefined,
++        supportsThinkingBlockBinding: undefined,
++      }),
++    ).toEqual({})
++  })
++
++  test("decodes and encodes the optional protocol capability override matrix", () => {
++    const decode = Schema.decodeUnknownSync(Model.Compatibility)
++    const encode = Schema.encodeSync(Model.Compatibility)
++
++    expect(decode({})).toStrictEqual({})
++    for (const supportsEffortUpdates of [false, true, undefined]) {
++      for (const supportsThinkingBlockBinding of [false, true, undefined]) {
++        const wireCompatibility = {
++          ...(supportsEffortUpdates === undefined ? {} : { supportsEffortUpdates }),
++          ...(supportsThinkingBlockBinding === undefined ? {} : { supportsThinkingBlockBinding }),
++        }
++        expect(decode(wireCompatibility)).toStrictEqual(wireCompatibility)
++        expect(encode({ supportsEffortUpdates, supportsThinkingBlockBinding })).toStrictEqual(wireCompatibility)
++      }
++    }
++  })
+ })
+ 
+ describe("Model.Info", () => {

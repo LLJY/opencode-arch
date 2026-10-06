@@ -1,6 +1,6 @@
 pkgbase = opencode
 	pkgdesc = The open source coding agent (V2 native CLI with bundled web UI)
-	pkgver = 2.0.23
+	pkgver = 2.0.24
 	pkgrel = 1
 	url = https://github.com/anomalyco/opencode
 	arch = x86_64
@@ -18,13 +18,13 @@ pkgbase = opencode
 	optdepends = xclip: clipboard support on X11
 	options = !debug
 	options = !strip
-	source = opencode-2.0.23.tar.gz::https://codeload.github.com/anomalyco/opencode/tar.gz/0fd7e2829449b052abf0078666669302923d77af
-	source = downstream-2.0.23.patch
+	source = opencode-2.0.24.tar.gz::https://codeload.github.com/anomalyco/opencode/tar.gz/e7a34f09bfd9134dfade5a8ddb843f7030bc9a69
+	source = downstream-2.0.24.patch
 	source = release.json
 	source = packaging.py
-	sha256sums = b2af2db700690328f5a9382124cfc63bda4821f3fc9e79c0edbb614acdee46a9
-	sha256sums = 76c84f496c6b8bcdf999b0e6988a5796fb7aae948c653ddaaa1ff39c2545b4a6
-	sha256sums = ff87ce034da890652e0e75f83f67e252cbe7a24e695e017865ce3d83cb031528
+	sha256sums = a045e473e92a75956585d1957a06707e6757f3da5a3010ef0f4e679f569920de
+	sha256sums = f767dc47095c7d3e49316b692ee9f09cfe9902a41d1f647cca7a66f6485e4059
+	sha256sums = 0908e621a09d2f53f0df361cedc44c89d29f62667d991316dfbd05d18830b31f
 	sha256sums = 9286d36f67ab08014cad2ab7037bd948b52b053d49072dfac953b86e11dde073
 
 pkgname = opencode

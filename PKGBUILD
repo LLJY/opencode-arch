@@ -1,8 +1,8 @@
-# Independent downstream V2 MAIN-only recipe. Canonical source gate: PASS.
+# Independent downstream V2 MAIN-only recipe. Canonical source gate: PASS with baseline exceptions.
 # Packaging checker and explicit build authorization are still required.
 # Upstream Arch maintainers: Carl Smedstad, Sven-Hendrik Haase
 pkgname=opencode
-pkgver=2.0.23
+pkgver=2.0.24
 pkgrel=1
 pkgdesc='The open source coding agent (V2 native CLI with bundled web UI)'
 arch=('x86_64')
@@ -15,7 +15,7 @@ optdepends=(
   'xclip: clipboard support on X11'
 )
 options=('!debug' '!strip')
-_commit=0fd7e2829449b052abf0078666669302923d77af
+_commit=e7a34f09bfd9134dfade5a8ddb843f7030bc9a69
 _srcname=opencode-$_commit
 source=(
   "opencode-$pkgver.tar.gz::https://codeload.github.com/anomalyco/opencode/tar.gz/$_commit"
@@ -24,9 +24,9 @@ source=(
   'packaging.py'
 )
 sha256sums=(
-  'b2af2db700690328f5a9382124cfc63bda4821f3fc9e79c0edbb614acdee46a9'
-  '76c84f496c6b8bcdf999b0e6988a5796fb7aae948c653ddaaa1ff39c2545b4a6'
-  'ff87ce034da890652e0e75f83f67e252cbe7a24e695e017865ce3d83cb031528'
+  'a045e473e92a75956585d1957a06707e6757f3da5a3010ef0f4e679f569920de'
+  'f767dc47095c7d3e49316b692ee9f09cfe9902a41d1f647cca7a66f6485e4059'
+  '0908e621a09d2f53f0df361cedc44c89d29f62667d991316dfbd05d18830b31f'
   '9286d36f67ab08014cad2ab7037bd948b52b053d49072dfac953b86e11dde073'
 )
 
